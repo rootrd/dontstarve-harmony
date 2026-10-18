@@ -1,0 +1,47 @@
+# NOTICE
+
+## Provenance
+
+The HLE host layer in `dm/host`, `dm/gfx/nvn` (the service side) and `dm/third_party`
+originates from **[d2r-mobile](https://github.com/jhaizhou-ops/d2r-mobile)** — the same
+author's HarmonyOS-preceding iOS/macOS port of the Switch release of *Diablo II:
+Resurrected*, published under the MIT licence.
+
+What this repository adds, none of which exists upstream:
+
+- `dm/ohos/` — the HarmonyOS port: NAPI module entry, XComponent surface, OHAudio
+  renderer, touch/gamepad capture, the force-include compatibility layer, and the
+  cross-build Makefile.
+- `dm/gfx/nvn/nvn_vulkan.c` — an NVN→**Vulkan** replay layer (upstream replays into
+  Metal). This is where the texture pack/upload chain, the shader program keying, and
+  the presentation path live.
+- `dm/host/hle_net.c` — rewritten from "always fail" to real BSD sockets, because the
+  game's offline mode runs a dedicated server against `127.0.0.1` inside its own process.
+- `dm/host/hle_fs.c` — the three-tier path resolution and the lazy basename index.
+- `dm/host/hle_thread.c` — the pre-4.0 semaphore/condvar behaviour, the spurious-wake
+  fallback, and the thread dumper.
+- `dm/host/crash.c`, `dm/host/hle_svc.c`, `dm/host/diag.c` — the forensics work: crash
+  scenes to file, hardened `Break` handling, per-thread last-SVC reporting.
+
+The upstream MIT licence text and copyright notice are retained verbatim in
+[LICENSE](LICENSE).
+
+## Third-party components
+
+| Component | Licence | Where |
+|---|---|---|
+| NVN API declarations | MIT (author credited in the file header) | `dm/gfx/nvn/include/nvn.h` |
+| libdeflate | zlib | `dm/third_party/libdeflate/` |
+| bcdec | MIT | `dm/third_party/bcdec/` |
+| flip, stb_image, tinyexr | MIT / public domain (per file) | `dm/third_party/flip/` |
+| Ryujinx shader decoder (subset) | MIT | `dm/third_party/ryujinx/` |
+
+Each retains its own licence file in place. If you redistribute this tree, keep them.
+
+## Trademarks and content
+
+*Don't Starve Together* is a work of Klei Entertainment. *Nintendo Switch* is a
+trademark of Nintendo. This project is affiliated with neither and endorses neither.
+
+**This repository contains no game content.** See [docs/CONTENTS.md](docs/CONTENTS.md)
+for the item-by-item statement of what was deliberately left out.

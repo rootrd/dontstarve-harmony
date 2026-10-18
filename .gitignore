@@ -1,0 +1,39 @@
+# Build products
+dm/ohos/build/
+*.o
+*.so
+*.dylib
+.iosdd*/
+build/
+.hvigor/
+oh_modules/
+entry/build/
+ds2/build/
+
+# Game content — never commit any of these (see docs/CONTENTS.md)
+*.patched.bin
+*.nso
+*.nca
+*.nsp
+*.nsz
+*.xci
+*.keys
+prod.keys
+title.keys
+resfile/romfs/
+rawfile/romfs/
+*.rgba
+crash_*.txt
+thr.txt
+miss.txt
+
+# Signing material
+*.p12
+*.p7b
+*.cer
+*.keystore
+
+# Editor / OS
+.DS_Store
+__pycache__/
+*.pyc

@@ -1,0 +1,16 @@
+{
+  "string": [
+    {
+      "name": "module_desc",
+      "value": "RedAlert G1 module"
+    },
+    {
+      "name": "EntryAbility_desc",
+      "value": "RedAlert G1 ability"
+    },
+    {
+      "name": "EntryAbility_label",
+      "value": "RA-G1"
+    }
+  ]
+}

@@ -1,0 +1,43 @@
+{
+  // Sanitised on purpose. The real file carries a `signingConfigs` block with certificate
+  // paths, a key alias and two encrypted passwords — none of which belong in a repository.
+  // Either let DevEco Studio's "Automatically generated signature" fill this in, or point
+  // it at your own material. The `bundleName` in AppScope/app.json5 must match the profile:
+  // a HarmonyOS profile is pinned to one bundle name, so a profile from another project
+  // simply will not work here.
+  "app": {
+    "signingConfigs": [],
+    "products": [
+      {
+        "name": "default",
+        "signingConfig": "default",
+        "targetSdkVersion": "26.0.0",
+        "compatibleSdkVersion": "6.1.1(24)",
+        "compileSdkVersion": "26.0.0(26.0.0)",
+        "runtimeOS": "HarmonyOS",
+        "buildOption": {
+          "strictMode": {
+            "caseSensitiveCheck": true,
+            "useNormalizedOHMUrl": true
+          }
+        }
+      }
+    ],
+    "buildModeSet": [
+      { "name": "debug" },
+      { "name": "release" }
+    ]
+  },
+  "modules": [
+    {
+      "name": "entry",
+      "srcPath": "./entry",
+      "targets": [{ "name": "default", "applyToProducts": ["default"] }]
+    },
+    {
+      "name": "ds2",
+      "srcPath": "./ds2",
+      "targets": [{ "name": "default", "applyToProducts": ["default"] }]
+    }
+  ]
+}
