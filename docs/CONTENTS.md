@@ -6,7 +6,7 @@ The front page says the project "contains none and distributes none" of the game
 
 - **The game program.** Not one byte of `main`, `sdk` or `subsdk0`, nor any patched variant of them.
 - **Art, audio, video, fonts, text tables, data tables** — i.e. the entire romfs (21,310 files, 5.18 GB across two layers).
-- **Shaders** — neither the original packages nor anything translated from them, including the 222-key shader library this port built.
+- **Shaders** — neither the original packages nor anything translated from them, including the shader library this port built (40 entries on the current key chain; 222 and 233 on the superseded one).
 - **Keys.** No `prod.keys`, no title keys, no console-specific material.
 - **The instruction-level patch tables** for this title (`*.sites.tsv`, `*.fixups.tsv`, …). They are derived from the game binary, so they are game-derived data by the same rule; how to regenerate them is in [UNPACKING.md](UNPACKING.md).
 - **Signing material** — certificates, profiles, keystores, and the `signingConfigs` block that references them.

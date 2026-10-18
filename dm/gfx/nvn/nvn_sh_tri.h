@@ -1,5 +1,5 @@
 // 由 tri.vert/tri.frag 用 glslang.exe -V --target-env vulkan1.0 编出，别手改
-// Generated: glslang.exe -V --target-env vulkan1.0 on tri.vert / tri.frag. Regenerate, do not hand-edit.
+// Generated: glslang.exe -V --target-env vulkan1.0 on tri.vert / tri.frag . Regenerate, do not hand-edit.
 #pragma once
 #include <stdint.h>
 static const uint32_t sh_tri_vert_len = 360;

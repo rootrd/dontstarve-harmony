@@ -51,6 +51,9 @@ hdc shell aa start -a EntryAbility -b <bundleName> \
 | `DM_RAW` | frame count | dump that many whole presented frames as `p<serial>_f<present>_<w>x<h>.rgba` (RGBA8). Convert with `scripts/rgbapng.ps1` |
 | `DM_RAWDIR` | directory | where those frames go. Must be outside `DM_SAVE` |
 | `DM_VK_SKIP` | bitmask | skip selected Vulkan work — used to force all sampling to mip level 0 when testing texture hypotheses |
+| `DM_VK_TEXTRACE` | `1` | opt-in bounded descriptor/upload correlation; default off; see [TEXTURE-DIAGNOSTICS.md](TEXTURE-DIAGNOSTICS.md) |
+| `DM_VK_TEXTRACE_SERIAL` | serial or `0` | optionally restrict correlation to one logical texture serial; not a texture id |
+| `DM_VK_TEXTRACE_FROM` | present count | optional start frame, default 0; budgets renew every 60 presents |
 | `DM_TEXDUMP` | `0`/`1` | per-texture upload dump (turn off in diagnostic rounds; it is verbose) |
 | `DM_RBIMG` | `0`/`1` | readback image capture |
 | `DM_3D_SCALE`, `DM_3D_SCALE_DYN` | float | internal resolution scaling experiments |
@@ -72,9 +75,10 @@ The host's log lines are bilingual and terse by design; the statistics lines are
 | Line | Meaning |
 |---|---|
 | `[vk] 上屏绑定 真N 哑M` | bindings on the on-screen pass: real / dummy |
-| `[vk] 真绑但没传过 N` | bound N times but never uploaded — the terrain-atlas signature |
-| `[vk] 打包:排A 上B 重C 成D MB BC层E 卡arenaF …` | pack queue: queued / uploaded / re-uploaded / MB / BC layers / **arena rejections** / out-of-range / decode queue / format / depth / 3D / too-large / huge-image successes |
+| `[vk] 已画未上传绑定 N` | bindings with uploaded=0 AND drawn=1; includes normal render targets; not an empty-atlas count |
+| `[vk] ｜打包:尝试图A 上B 重C 成D MB BC层E 卡环F 越界G 解排H 格式I 深度J 三维K 环拒L 环成M` | pack upload: distinct textures that reached `pkg_upload` / uploads / re-uploads / MB moved / BC decode layers / **staging-ring refusals** / out-of-range / decode queue / format / depth / 3D / ring refusal reports (first 8 logged) / textures staged on the ring |
+| `[vk] ｜哑因:没图A 空图B 深度非影C 影子给颜色D 强退哑图E｜影子真深度F 已画未上传绑定G｜采空时兄弟有货H 谁都没货I` | why a sample read a dummy: no image / empty texture / depth misuse / shadow-to-colour / forced dummy / shadow real depth / drawn-not-uploaded bindings / sibling had content at sample time / nobody did |
 | `[vk] 源图 s<S> 图<I> 格<G> WxH 画过D 传过U` | one-time identity line per texture serial |
 | `[vk] 程序首绑 <key> 绑定: …` | first binding set of each shader program, with `w/h/fmt/uploaded/drawn/bad/tried/range/L/pool` per image |
-| `[vk] 排队上传 s=…` / `[vk] 槽全空 …` | the two probes that split the current blocker |
+| `[vk] 排队上传 s=…` / `[vk] 槽全空 …` | the two older probes, capped at the first 40 and 24 events **per process**; `DM_VK_TEXTRACE=1` replaces them with windowed, renewing events |
 | `svc=0x1c` on a sample line | that thread's last syscall — 0x1C/0x1D are the pre-4.0 semaphore wait/signal pair |

@@ -60,3 +60,15 @@ HLE_FORCE("_ZN2nn4pctl20EndFreeCommunicationEv", "家长控制·与他人通信"
 
 // swkbd 软键盘：见 hle_swkbd.c
 // swkbd software keyboard: see hle_swkbd.c
+// 默认异常栈：客体（SDK）要一块自己的异常处理栈。原先这条是未实现桩返回 0 —— 客体拿到 0 当栈用。
+// Default exception stack: the guest (SDK) asks for its own exception-handling stack; this used to be an
+// unimplemented stub returning 0, and the guest then used a null stack.
+static uint8_t g_excstack[64 << 10] __attribute__((aligned(16)));
+HLE_FORCE("nnosGetDefaultUserExceptionStackForApplication", "默认异常栈：给一块宿主静态缓冲（客体异常处理用）", uint64_t, h_nnos_excstack,
+          void **stack, uint64_t a1, uint64_t *size) {
+    (void)a1;
+    if (stack) *stack = g_excstack;
+    if (size) *size = sizeof g_excstack;
+    LOG("默认异常栈 %p（%zu 字节）→ 客体", (void *)g_excstack, sizeof g_excstack);
+    return (uint64_t)g_excstack;
+}

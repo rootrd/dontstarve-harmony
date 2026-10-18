@@ -8,11 +8,24 @@ Written so that whoever picks this up does not re-walk the paths that are alread
 
 **Symptom.** In world, everything renders except the terrain: grass tufts, the character, lighting, the day dial, the inventory bar, interaction labels ("常青树" = evergreen) are all correct; the ground is one flat green field.
 
-**Measurements.**
+**Historical measurements (not a confirmed root cause).**
 
-- The terrain atlases are `t311`/`t310` (2048×2048) and `t302`/`t277` (1024×512). At bind time each reports `u0 d0 b0 t0 r0 m1 p1 L16384`: never uploaded, never drawn, never queued for packing, never attempted — but the pool memory and the range **are** present.
-- Across a whole in-world round: `真绑但没传过 266425` (266,425 binds of textures that were never uploaded) against `上传像素有内容 235 张` (235 that really got pixels).
-- The pack queue for the same round: `排62 上65` — 62 queued, 65 uploaded. So the terrain atlas is not "queued and lost", it is **never queued**.
+The recorded run reported 266,425 `真绑但没传过` bindings and candidate images
+`t311`/`t310` (2048×2048), `t302`/`t277` (1024×512), with `u0 d0 b0 t0 r0 m1 p1 L16384`.
+Static review found that these are different observations and must not be conflated:
+
+- `真绑但没传过` incremented only when `tex_has_content(v)` was true and `uploaded` was false.
+  Since content means `uploaded || drawn`, this population has **drawn=1**. Render targets
+  can legitimately contribute. The counter is now named `已画未上传绑定`.
+- `程序首绑` lists occupied `S.tex` slots, not necessarily the shader's selected descriptors.
+  It is capped at six slots per stage and 32 vertex-key identities.
+- `打包:排` / `pkg_tried` was updated in `pkg_upload`, not `pkg_queue`. The counter is now
+  `打包:尝试图`: distinct texture records that reached the upload function.
+- Queue logs were limited to the first 40 events and empty-slot logs to the first 24 events
+  in the process. Missing lines, especially after menu/world generation, prove nothing.
+
+The historical missing-asset audit and mip-zero experiment remain useful prior evidence;
+this patch does not repeat or change either experiment. The ground's root cause is still open.
 
 **Ruled out (do not re-test these).**
 
@@ -22,22 +35,30 @@ Written so that whoever picks this up does not re-walk the paths that are alread
 | Mips clamped so the atlas is sampled at an empty level | Ran a round forcing every sample to mip level 0 (`DM_VK_SKIP 16777216`): no change. |
 | "No shader library" for these draws | The HUD and characters use the same library; the missing-library share is 10%, and it does not correlate with the terrain draws. |
 | The pool memory is not mapped | `m1 p1` in the bind dump: memory and pool both present, `L16384` range registered. |
-
-**The two-way split, already coded.** Two probes are in the tree:
-
-- `[vk] 排队上传 s=… %ux%u 格… 级… 传过…` in `pkg_queue()` ([nvn_vulkan.c:4851](../dm/gfx/nvn/nvn_vulkan.c#L4851), first 40) — *does the terrain atlas ever enter the upload queue?*
-- `[vk] 槽全空 key0=… st… bank=… binding=… reg=…｜槽内 b=… d=… r=…` in the all-candidates-empty branch of `set_fill()` ([nvn_vulkan.c:3959](../dm/gfx/nvn/nvn_vulkan.c#L3959), first 24) — *does the shader even look at the slot where the handle sits?*
-
-Reading the result:
-
-- If a 2048×2048 / 1024×512 image **appears** in `排队上传`, the queue is entered and the loss is downstream: read the counters `打包:排/上/成/卡arena/BC层/格式` and follow `stage_take` rejections and decode failures.
-- If there is **no** `排队上传` line but there **are** `槽全空` lines, the descriptor is being filled from the wrong bank/binding/register. Compare against the `程序首绑` line ([nvn_vulkan.c:4187](../dm/gfx/nvn/nvn_vulkan.c#L4187)), which dumps the first six bound images per program with `w/h/fmt/uploaded/drawn/pkg_bad/pkg_tried/range/L/pool`.
+| The installed `shaders.bin` is too small and needs a full re-pack | Offline key-coverage check against the device-reported keys: the installed 40-entry library covers **all 27** of them, and the older 222/233-entry libraries share **zero** keys with the current chain (`e6ff54a2620e`) — they are a different key scheme, not a bigger version of this one. `SHB_MAXE` is 512, so headroom is not the constraint either. |
 
 **Traps in this area, learned the hard way.**
 
 - A combined NVN handle's **low 20 bits** are the texture id (`texh & 0xfffff`) — the same split `set_fill` uses. Passing the whole handle prints "(no image)" and sends you chasing a phantom.
-- The program key is on `progrec`, not `prog_t`; reaching for `g_cur_prog->key` from the wrong type is a compile error that wastes a build.
-- The `没传过就绑` probe ([nvn_vulkan.c:4028](../dm/gfx/nvn/nvn_vulkan.c#L4028)) already exists and prints the first 24 such textures with tid/size/format/serial — start there before adding anything new.
+- The program key lives on `progrec`, not `prog_t`; reaching for `g_cur_prog->key` from the wrong type is a compile error that wastes a build.
+- A count in a stats line is not a population. `已画未上传绑定` (formerly `真绑但没传过`) only fires on the branch that requires `tex_has_content()`, so every one of those bindings had `drawn=1`; and the per-texture dumps are capped at the first 40 / 24 events **per process**, which the menu and world generation consume before the world is even entered.
+
+**Next evidence: actual descriptors, correlated to upload events.**
+
+See [TEXTURE-DIAGNOSTICS.md](TEXTURE-DIAGNOSTICS.md). `DM_VK_TEXTRACE=1` adds bounded,
+renewing-window events with shader key, stage, descriptor binding, chosen NVN slot,
+candidate handles, texture id/serial, and VkImage identity. Queue acceptance, refusal,
+upload attempt and result are separate events. Rendering and slot fallback are unchanged.
+
+Use `(serial,image)` to join descriptor and upload events within one resource lifetime;
+`tid` is meaningful at descriptor selection and is `-1` in upload-only events. An image
+handle may be reused after destruction, so frame/lifetime context still matters. Never
+identify an atlas by dimensions alone. Rate-limited or missing events remain inconclusive.
+
+If a correct selected descriptor queues but fails to record a copy, inspect packing. If
+metadata says texture register T but the chosen fallback samples another nonempty slot,
+compare the actual shader reflection and packed binding record before changing selection.
+A missing shader draw also remains possible until the relevant shader key is established.
 
 ---
 
@@ -53,9 +74,25 @@ Reading the result:
 
 ---
 
-## 3. `卡arena` — pack staging fights the vertex stream
+## 3. Pack staging vs. the vertex stream — code fixed, round pending
 
-`卡arena` (arena rejections) went **0 → 479 → 246** across rounds. Re-upload and the vertex stream share one 64 MB arena, so a single submission containing a few 16 MB-class images exhausts the staging buffer and `stage_take` is refused. Fix: give texture packing its own ring. Related: see the `nvn_dirty_since()` item in [STATUS.md](STATUS.md#technical-debt-does-not-block-features-must-be-paid-before-done).
+The old routing sent an image to the 64 MB arena when its size fitted `ARENA_PKG_CAP` (a third of
+the arena) **without checking the arena's remaining headroom**, and to a one-shot 160 MB buffer
+otherwise. The W24 round measured **`卡arena 539`, `巨图成 0`**: once dirty-page re-uploads and the vertex
+stream had eaten the arena, the 8–16 MB terrain atlases (`s311`/`t310`/`t277`/`t302`) were all routed
+onto a full arena and died on the first `stage_take` — and because exhaustion was treated as a hard
+failure, `pkg_bad` was set and those textures were never retried. Terrain drew `u0` flat green.
+
+Now in the tree: packaged staging always uses the dedicated 160 MB ring (`BIG_STAGE_SZ`), the arena
+keeps only the vertex stream and `BufferToTexture`, and `stag_exh` separates "this submission has no
+room" (retry next submission, when the cursor resets) from a real decode error. Whole-image-or-nothing
+is unchanged: a texture reserves its full footprint or moves nothing. Stats fields are renamed
+`卡环 / 环拒 / 环成`.
+
+What the next device round has to answer: whether `环成` now counts the terrain atlases through, and
+whether `环拒` stays near zero. If `环拒` climbs instead, the ring is the constraint and the fix is
+the per-submission cursor policy, not the decode path. Related: the `pkg_tracked` item in
+[STATUS.md](STATUS.md#technical-debt-does-not-block-features-must-be-paid-before-done).
 
 ---
 

@@ -16,6 +16,7 @@
 #include "dmsh_chain.h"
 #include "nvn_sh_tri.h"
 #include "nvn_shbin.h"      // 构建机折出的着色器二进制库（shaders.bin）的布局 | layout of the binary shader library packed by the build box
+#include "nvn_diag.h"
 #include "nvn_dirty.h"      // 客体内存写保护脏页：打包贴图上传后要能察觉游戏又写了它 | guest write-protect dirty tracking, so a packaged upload can notice the game rewrote it
 #include <CommonCrypto/CommonDigest.h>   // OHOS 替身：oc_sha256（compat/sha256.c），与 nvn_mtl.m 的 CC_SHA256 同一门 | compat shim, same call site as nvn_mtl.m
 #include "../ohos/xcomp_ohos.h"
@@ -81,7 +82,7 @@ static void dm_logfmt(const char *fmt, ...)
     va_end(ap);
     if (n <= 0) return;
     pthread_mutex_lock(&g_lfm);
-    if (g_lf) { fwrite(buf, 1, (size_t)n, g_lf); fputc('\n', g_lf); fflush(g_lf); }
+    if (g_lf) { fwrite(buf, 1, nvn_log_length(n, sizeof buf), g_lf); fputc('\n', g_lf); fflush(g_lf); }
     pthread_mutex_unlock(&g_lfm);
 }
 
@@ -176,9 +177,10 @@ typedef struct {
     int soft_bc;                         // NVN 是 BC 块、设备一个 BC 都不认（第 81 轮实测）：像素要在 CPU 解码后上传，Vk 图按格式是 R8/RG8/RGBA8/RGBA16F
     int uploaded;                        // 已经把池里的内容送进显卡（后续刀次用）| pool content has been pushed to the device (later cuts)
     int pkg_bad;                         // 打包上传试过但失败（格式不认 / 越界 / arena 满）：不再反复排队 | packaged upload attempted and refused - stop re-queuing it
-    int pkg_tried;                       // 量过一张（用来把「排队次数」和「张数」分开）| counted once per texture so the queue counter means textures
+    int pkg_tried;                       // entered pkg_upload at least once; NOT proof of queue entry
     uint64_t pkg_stamp, pkg_seen;        // 上传时客体内存池的写代号 / 上次查脏时代号（代号没动就不逐页查）| generation at upload, and the generation last inspected (no page scan while it stands still)
     uint64_t pkg_range;                  // 这张图在池里占的字节数（级 0 起点算起，脏检查与设只读的范围）| bytes this texture occupies in the pool - the range the dirty check and the write-protect cover
+    int pkg_tracked;                     // 上传时这段池页在脏页跟踪表内：不在就不查脏（旧口径「未跟踪当脏」⇒ MAX_RANGE 一满每绑必重传）| the pool range sits in the dirty table: untracked means clean (untracked used to mean dirty => re-upload on every bind once MAX_RANGE fills)
     int pkg_dirty;                       // 池里这张图的页在上传后被动过：等通道外重传 | the pool pages moved after the upload - re-upload outside the pass
     int pkg_stale;                       // 这张在池里的位置上一世传过，游戏又在同一块字节上重新 Initialize：显存里那份是旧数据，用之前得重传
                                          // This pool spot was uploaded in a previous life and the game re-initialized over it: the device copy is stale
@@ -192,6 +194,63 @@ typedef struct {
                                          // Whether a sibling VkImage sharing this serial had content: the draw-into-A / sample-B signature, resolved once
 } vktex;
 #define VTN 16384            // 4096 装不下：按需建图的光要 1 万多个槽（游戏登记 10491 张贴图），一张格 ~120 字节，抬到 16384 才 2 MB
+// Optional descriptor-to-upload correlation. This diagnoses selection; it does
+// not change bank/binding/reg fallback, upload policy, or guest memory.
+static pthread_once_t g_textrace_once = PTHREAD_ONCE_INIT;
+static pthread_mutex_t g_textrace_lock = PTHREAD_MUTEX_INITIALIZER;
+static nvn_trace_budget g_textrace_budget;
+static int g_textrace_on;
+static uint64_t g_textrace_serial, g_textrace_from;
+static void textrace_init(void)
+{
+    const char *s = getenv("DM_VK_TEXTRACE");
+    g_textrace_on = s && !strcmp(s, "1");
+    s = getenv("DM_VK_TEXTRACE_SERIAL");
+    if (s && *s) {
+        char *end; errno = 0;
+        g_textrace_serial = strtoull(s, &end, 0);
+        if (errno || *end || s[0] == '-') g_textrace_on = 0;
+    }
+    s = getenv("DM_VK_TEXTRACE_FROM");
+    if (s && *s) {
+        char *end; errno = 0;
+        g_textrace_from = strtoull(s, &end, 0);
+        if (errno || *end || s[0] == '-') g_textrace_on = 0;
+    }
+}
+static void textrace(unsigned event, const vktex *v, int tid, const char *detail)
+{
+    pthread_once(&g_textrace_once, textrace_init);
+    uint64_t serial = v ? v->serial : 0, frame = g_presents;
+    if (!g_textrace_on || frame < g_textrace_from ||
+        (g_textrace_serial && serial != g_textrace_serial)) return;
+    // Hash diagnostic fields, not pointers or texture dimensions. Collisions can
+    // only suppress a diagnostic; they never affect rendering or queue state.
+    uint64_t image = v ? (uint64_t)(uintptr_t)v->img : 0;
+    uint64_t signature = 1469598103934665603ull ^ serial ^ image ^ (uint64_t)(unsigned)tid;
+    for (const unsigned char *p = (const unsigned char *)detail; *p; p++)
+        signature = (signature ^ *p) * 1099511628211ull;
+    pthread_mutex_lock(&g_textrace_lock);
+    nvn_trace_budget *b = &g_textrace_budget;
+    if (b->started && b->window != frame / NVN_TRACE_WINDOW) {
+        unsigned long long sent = 0, suppressed = 0;
+        for (int i = 0; i < NVN_TRACE_KINDS; i++) {
+            sent += b->emitted[i]; suppressed += b->suppressed[i];
+        }
+        GVL("[textrace] window=%{public}llu emitted=%{public}llu suppressed=%{public}llu (absence is inconclusive)",
+            (unsigned long long)b->window, sent, suppressed);
+    }
+    nvn_trace_rotate(b, frame);
+    if (nvn_trace_allow(b, event, signature)) {
+        static const char *names[] = { "descriptor", "queue", "attempt", "result", "drop" };
+        GVL("[textrace] frame=%{public}llu event=%{public}s tid=%{public}d serial=%{public}llu image=%{public}llx u=%{public}d d=%{public}d bad=%{public}d tried=%{public}d %{public}s",
+            (unsigned long long)frame, names[event], tid, (unsigned long long)serial, (unsigned long long)image,
+            v ? v->uploaded : -1, v ? v->drawn : -1, v ? v->pkg_bad : -1,
+            v ? v->pkg_tried : -1, detail);
+    }
+    pthread_mutex_unlock(&g_textrace_lock);
+}
+
 static vktex g_tex[VTN];
 static int g_tex_n;
 static uint64_t g_tex_new, g_tex_hit, g_tex_noformat;
@@ -336,12 +395,10 @@ static _Atomic uint64_t g_samp_reg, g_samp_use, g_samp_none, g_samp_bad;
 // 哑的三种来源分开记 + 影子采样绑上真深度视图的次数（判据在绑定那节，声明放这里给统计块先用）
 // The three flavours of dummy counted apart, plus how many shadow reads got a real depth view.
 static _Atomic uint64_t g_b_noimg, g_b_depth_plain, g_b_sh_color, g_b_shadow;
-// 真绑上一张从没传过像素的图（v->uploaded 为 0）：第 90 轮出图读回 RGB 全 0、alpha 却有 34% 落笔，
-// 说明着色器确实画了，只是采到的纹理是空的——这一条数它到底占多少真绑。
-// A real bind onto an image that never had pixels uploaded (uploaded == 0). Round 90's readback of the present source had
-// RGB exactly 0 while 34% of the alpha was written, so the shaders drew but sampled empty textures; this counts how much of
-// the real binding is that.
-static _Atomic uint64_t g_b_neverup;
+// 只统计 uploaded=0 且 drawn=1 的绑定；正常渲染目标也在内，不能当作空图总数。
+// Bindings with uploaded=0 AND drawn=1; normal render targets may contribute.
+// This does not measure the uninitialized-atlas (uploaded=0, drawn=0) population.
+static _Atomic uint64_t g_b_drawn_not_uploaded;
 // 图建好了但还没有任何来源（既没传过也没画过）⇒ 只能继续用哑图
 // Image exists but has no source yet (never uploaded, never an attachment) - the dummy stays.
 static _Atomic uint64_t g_b_empty;
@@ -2660,11 +2717,11 @@ static void vk_probe_dump(void)
                      (unsigned long long)atomic_load(&g_samp_reg), (unsigned long long)atomic_load(&g_samp_use),
                      (unsigned long long)atomic_load(&g_samp_none), (unsigned long long)atomic_load(&g_samp_bad));
         GVL("%{public}s", rs);
-        p = snprintf(rs, sizeof rs, "[vk] 哑因:没图%llu 空图%llu 深度非影%llu 影子给颜色%llu 强退哑图%llu｜影子真深度%llu 真绑但没传过%llu｜采空时兄弟有货%llu 谁都没货%llu",
+        p = snprintf(rs, sizeof rs, "[vk] 哑因:没图%llu 空图%llu 深度非影%llu 影子给颜色%llu 强退哑图%llu｜影子真深度%llu 已画未上传绑定%llu｜采空时兄弟有货%llu 谁都没货%llu",
                      (unsigned long long)atomic_load(&g_b_noimg), (unsigned long long)atomic_load(&g_b_empty),
                      (unsigned long long)atomic_load(&g_b_depth_plain),
                      (unsigned long long)atomic_load(&g_b_sh_color), (unsigned long long)atomic_load(&g_b_forced),
-                     (unsigned long long)atomic_load(&g_b_shadow), (unsigned long long)atomic_load(&g_b_neverup),
+                     (unsigned long long)atomic_load(&g_b_shadow), (unsigned long long)atomic_load(&g_b_drawn_not_uploaded),
                      (unsigned long long)atomic_load(&g_dy_sib), (unsigned long long)atomic_load(&g_dy_nosib));
         GVL("%{public}s", rs);
         p = snprintf(rs, sizeof rs, "[vk] 按需新建%llu 张（上限%d，撞顶%llu 次）｜贴图表%llu/%d",
@@ -2770,6 +2827,7 @@ static unsigned shb_slot(uint64_t k) { return (unsigned)((k * 0x9E3779B97F4A7C15
 
 static int shb_get(uint64_t k, int stage)
 {
+    if (!g_shb_ready) return -1;
     unsigned s = shb_slot(k);
     for (int t = 0; t < 32; t++) {
         int v = g_shb_idx[(s + t) & 1023u];
@@ -2782,6 +2840,7 @@ static int shb_get(uint64_t k, int stage)
 
 static int shb_has(uint64_t k)
 {
+    if (!g_shb_ready) return 0;
     unsigned s = shb_slot(k);
     for (int t = 0; t < 32; t++) { int v = g_shb_idx[(s + t) & 1023u]; if (!v) return 0; if (k8v(g_shb_e[v - 1].key) == k) return 1; }
     return 0;
@@ -2834,13 +2893,28 @@ static int shb_load(void)
     // spv_total / c1_total are byte counts (that is what shbin_gen.py writes); nvis is an entry count at 4 bytes each
     size_t need = sizeof *h + (size_t)h->nentries * sizeof(shb_entry) + (size_t)h->nbinds * sizeof(shb_bind)
                 + (size_t)h->nvis * 4 + (size_t)h->c1_total + (size_t)h->spv_total;
-    if (h->magic != SHB_MAGIC || h->ver != SHB_VER || h->nentries > SHB_MAXE || need > (size_t)st.st_size) {
+    if (h->magic != SHB_MAGIC || h->ver != SHB_VER || h->nentries > SHB_MAXE || need > (size_t)st.st_size
+        || (h->c1_total & 3u) || (h->spv_total & 3u)) {
         GRED("着色器库不符：magic %{public}#x 版 %{public}u 条目 %{public}u 需要 %{public}zu 文件 %{public}lld",
              h->magic, h->ver, h->nentries, need, (long long)st.st_size);
         munmap(m, (size_t)st.st_size); g_shb_fail = 1; return 0;
     }
+    // Validate the entire mapped table before publishing pointers or hash entries.
+    // Otherwise a bad later entry leaves indexed pointers into an unmapped file.
+    const shb_entry *entries = (const shb_entry *)(h + 1);
+    for (uint32_t i = 0; i < h->nentries; i++) {
+        const shb_entry *e = &entries[i];
+        if (e->stage > 2 || !nvn_range_valid(e->bind_off, e->nb, h->nbinds)
+            || !nvn_range_valid(e->vi_off, e->nvi, h->nvis)
+            || !nvn_range_valid(e->spv_off, e->spv_words, h->spv_total / 4)
+            || !nvn_range_valid(e->c1_off, e->c1_len, h->c1_total)) {
+            GRED("着色器库第 %{public}d 条越界：绑定 %{public}u+%{public}u 顶 %{public}u+%{public}u spv %{public}u+%{public}u/%{public}u c1 %{public}u+%{public}u/%{public}u",
+                 (int)i, e->bind_off, e->nb, e->vi_off, e->nvi, e->spv_off, e->spv_words, h->spv_total / 4, e->c1_off, e->c1_len, h->c1_total);
+            munmap(m, (size_t)st.st_size); g_shb_fail = 1; return 0;
+        }
+    }
     g_shb_map = (uint8_t *)m; g_shb_h = h;
-    g_shb_e = (const shb_entry *)(h + 1);
+    g_shb_e = entries;
     g_shb_b = (const shb_bind *)(g_shb_e + h->nentries);
     g_shb_vi = (const shb_vi *)(g_shb_b + h->nbinds);
     g_shb_c1 = (const uint8_t *)(g_shb_vi + h->nvis);
@@ -2848,12 +2922,6 @@ static int shb_load(void)
     g_shb_n = (int)h->nentries;
     for (int i = 0; i < g_shb_n; i++) {
         const shb_entry *e = &g_shb_e[i];
-        if (e->bind_off + e->nb > h->nbinds || e->vi_off + e->nvi > h->nvis
-            || e->spv_off + e->spv_words > h->spv_total / 4 || e->c1_off + e->c1_len > h->c1_total) {
-            GRED("着色器库第 %{public}d 条越界：绑定 %{public}u+%{public}u 顶 %{public}u+%{public}u spv %{public}u+%{public}u/%{public}u c1 %{public}u+%{public}u/%{public}u",
-                 i, e->bind_off, e->nb, e->vi_off, e->nvi, e->spv_off, e->spv_words, h->spv_total / 4, e->c1_off, e->c1_len, h->c1_total);
-            munmap(m, (size_t)st.st_size); g_shb_fail = 1; g_shb_n = 0; return 0;
-        }
         unsigned s = shb_slot(k8v(e->key));
         for (int t = 0; t < 32; t++) { unsigned q = (s + t) & 1023u; if (!g_shb_idx[q]) { g_shb_idx[q] = i + 1; break; } }
     }
@@ -3945,11 +4013,12 @@ static int set_fill(VkDescriptorSet set, int ei, int stage)
             // leaving the fallback of using s as a texture slot. All three candidates are tallied so the new library's
             // hit rate is visible rather than assumed.
             int tslot = reg;
+            const char *slot_source = b->nvn_kind == SHB_N_SAMP ? "reg-fallback" : "reg";
             if (stage >= 0 && stage < 6 && b->nvn_kind == SHB_N_SAMP) {
                 int hb = b->bank > 0 && b->bank - 1 < 128 && S.tex[stage][b->bank - 1];
                 int hd = b->binding < 128 && S.tex[stage][b->binding];
-                if (hb) { atomic_fetch_add(&g_cand_bank, 1); tslot = b->bank - 1; }
-                else if (hd) { atomic_fetch_add(&g_cand_bind, 1); tslot = b->binding; }
+                if (hb) { atomic_fetch_add(&g_cand_bank, 1); tslot = b->bank - 1; slot_source = "bank"; }
+                else if (hd) { atomic_fetch_add(&g_cand_bind, 1); tslot = b->binding; slot_source = "binding-fallback"; }
                 else if (reg >= 0 && reg < 128 && S.tex[stage][reg]) atomic_fetch_add(&g_cand_reg, 1);
                 else atomic_fetch_add(&g_cand_none, 1);
                 // 三个候选全空：点名一次这个程序的槽号/库里的 bank/binding/reg，看地面那笔到底找的是哪个槽
@@ -3984,7 +4053,7 @@ static int set_fill(VkDescriptorSet set, int ei, int stage)
                     uint64_t now = nvn_dirty_now();
                     if (now != v->pkg_seen) {
                         v->pkg_seen = now;
-                        if (nvn_dirty_since(v->d.mem, v->pkg_range, v->pkg_stamp)) { v->pkg_dirty = 1; pkg_queue(v); }
+                        if (v->pkg_tracked && nvn_dirty_since(v->d.mem, v->pkg_range, v->pkg_stamp)) { v->pkg_dirty = 1; pkg_queue(v); }
                     }
                     // 缺页没响过（代号没动）不等于池里没写：本机一轮只缺页两次，这里按内容比对补上这条判据
                     // A silent generation is not proof the bytes stood still - this device faults twice a round, so compare content too.
@@ -4019,13 +4088,12 @@ static int set_fill(VkDescriptorSet set, int ei, int stage)
                 if (stage >= 0 && stage < 6) atomic_fetch_add(&g_bind_real_st[stage], 1);
                 if (v->layout != VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL) atomic_fetch_add(&g_bind_lay, 1);
                 if (!v->uploaded) {
-                    atomic_fetch_add(&g_b_neverup, 1);
-                    // 点名：进世界后地面整片纯绿，怀疑地表 atlas 属于「绑了但没传」。前 24 张逐张打身份。
-                    // Name them: the world's ground is flat green and the terrain atlases may be these bind-but-never-uploaded
-                    // images. Print the identity of the first 24.
+                    atomic_fetch_add(&g_b_drawn_not_uploaded, 1);
+                    // This branch has drawn=1: render-target bindings, not evidence of an uninitialized atlas.
+                    // uploaded=0 alone is normal for a render target. See textrace for actual descriptors.
                     static _Atomic int nu; int k = atomic_fetch_add(&nu, 1);
                     if (k < 24)
-                        GVL("[vk] 没传过就绑 tid=%{public}d %{public}ux%{public}u 格%{public}d 级%{public}u serial=%{public}llu 画过%{public}d 传过%{public}d 建过%{public}llu",
+                        GVL("[vk] 已画未上传绑定 tid=%{public}d %{public}ux%{public}u 格%{public}d 级%{public}u serial=%{public}llu 画过%{public}d 传过%{public}d 建过%{public}llu",
                             tid, v->w, v->h, (int)v->fmt, v->levels, (unsigned long long)v->serial, v->drawn,
                             v->uploaded, (unsigned long long)atomic_load(&g_tex_make));
                 }
@@ -4137,6 +4205,23 @@ static int set_fill(VkDescriptorSet set, int ei, int stage)
             ii[ni].sampler = sm ? sm : (sh ? g_smp_cmp : g_smp_lin);
             ii[ni].imageView = iv;
             ii[ni].imageLayout = lay;   // 真深度视图停在 DEPTH_READ_ONLY（通道终态），哑图停在 SHADER_READ_ONLY：两套布局按来源分别声明
+            // This is the descriptor actually written, unlike 程序首绑's
+            // inventory of S.tex. Queue events join via serial (tid=-1 there).
+            pthread_once(&g_textrace_once, textrace_init);
+            if (g_textrace_on) {
+                char key[17], detail[384];
+                for (int k = 0; k < 8; k++) snprintf(key + 2*k, 3, "%02x", e->key[k]);
+                int valid_stage = stage >= 0 && stage < 6;
+                uint64_t hb = valid_stage && b->bank > 0 && b->bank <= 128 ? S.tex[stage][b->bank - 1] : 0;
+                uint64_t hd = valid_stage && b->binding < 128 ? S.tex[stage][b->binding] : 0;
+                uint64_t hr = valid_stage && reg >= 0 && reg < 128 ? S.tex[stage][reg] : 0;
+                snprintf(detail, sizeof detail,
+                    "shader=%s stage=%d binding=%u kind=%u bank=%u reg=%d slot=%d source=%s handle=%llu candidates=%llu/%llu/%llu dummy=%d dim=%d shadow=%d",
+                    key, stage, b->binding, b->nvn_kind, b->bank, reg, tslot, slot_source,
+                    (unsigned long long)texh, (unsigned long long)hb, (unsigned long long)hd,
+                    (unsigned long long)hr, dmy, dim, sh);
+                textrace(NVN_TRACE_BIND, v, tid, detail);
+            }
             wr[nw].pImageInfo = &ii[ni++];
         } else {
             VkBuffer buf = g_zero; uint64_t off = 0, range = 4096;
@@ -4607,26 +4692,30 @@ static void tex_dump_raw(const nvn_texdesc *d, uint64_t serial, const void *mem,
 // under 1 MB while dummy binds were still 2.09M, so packaged textures are a real gap but NOT the cause of the flat white frame.
 // The next round's verdict lives in the EMP line (see below tex_has_content): the top six empty images by bind count.
 static _Atomic uint64_t g_pkg_up, g_pkg_bytes, g_pkg_arena, g_pkg_range, g_pkg_dz, g_pkg_fmt, g_pkg_3d,
-                        g_pkg_bc, g_pkg_dep, g_pkg_big, g_pkg_bigok, g_pkg_q, g_pkg_re;
+                        g_pkg_bc, g_pkg_dep, g_pkg_big, g_pkg_bigok, g_pkg_attempted_textures, g_pkg_re;
 #define PKG_PEND 512   // 加了重传之后排队的不只新建的图，一帧里被游戏改写的那几张也要挤进同一批，256 会饿住新图
 static vktex *g_pkg_pend[PKG_PEND];
 static int g_pkg_pend_n;
 
-// 巨图暂存缓冲：arena 只有 64 MB，还要留给顶点流与 BufferToTexture，所以超过 ARENA_SZ/3 的打包贴图整张被拒
-// （第 111 轮「太大3」= s311 2048x2048 NVN 0x37，池里 8 KB 采样有 4164 个非零字节，像素确实在）。
-// 这一块按「整张一次圈够」用：圈不到就整张不搬，绝不留下半张贴图（游标与 arena 一样每次提交清零——
+// 打包暂存环（原「巨图暂存」）：W24 定案——arena 与顶点流共用，脏页重传一上量就把余量吃光，
+// 而 stage_begin 旧判序只看「整张需求 ≤ 64 MB/3」不看余量，s311/t310/t277/t302 这批 8~16 MB 的地形图
+// 全被指到 arena 上、首层圈不到即死（W24 实测 卡arena 539、巨图成 0、地形 u0 平绿）。
+// 现在打包暂存整体搬到这块 160 MB 独立环，arena 只留顶点流与 BufferToTexture，两边互不抢。
+// 「整张一次圈够」原则不变：圈不到就整张不搬，绝不留半张贴图（游标与 arena 一样每次提交清零——
 // 提交末尾等完栅栏，上一批拷贝早已跑完，所以同一提交内不复用、不折叠）。首次需要时才建，平时不占这 160 MB。
-// Big staging buffer: the 64 MB arena must also serve the vertex stream and BufferToTexture, so packaged textures above
-// ARENA_SZ/3 were refused whole (round 111's "太大3" = s311 2048x2048 NVN 0x37, whose pool bytes demonstrably hold content).
-// One texture reserves its entire footprint here or moves nothing - never half an image. The cursor resets with the arena per
-// submission, which is safe because mtl_sub_commit waits its fence before the next submission starts. Built lazily on first need.
+// Package staging ring (the former "big staging buffer"): the W24 verdict - the arena is shared with the vertex stream, dirty-page
+// re-uploads eat its headroom, and the old stage_begin routed by static size (need <= 64 MB/3) without checking that headroom,
+// so the 8-16 MB terrain atlases (s311/t310/t277/t302) all landed on a full arena and died on the first take (W24 measured
+// 卡arena 539, 巨图成 0, terrain u0 flat green). Package staging now lives entirely on this dedicated 160 MB ring; the arena
+// keeps only the vertex stream and BufferToTexture. The whole-image-or-nothing rule stands: reserve the full footprint or move
+// nothing, never half an image (the cursor resets per submission like the arena's - safe because mtl_sub_commit waits its fence
+// before the next submission starts). Built lazily on first need.
 #define BIG_STAGE_SZ (160ull << 20)
-#define ARENA_PKG_CAP (ARENA_SZ / 3)
 static VkBuffer g_bigs; static VkDeviceMemory g_bigs_mem; static uint8_t *g_bigs_map;
 static uint64_t g_bigs_off;
 static _Atomic int g_birs_bad;   // 建这块失败过就别每次重试 | once the allocation failed, do not retry every texture
 
-typedef struct { VkBuffer buf; uint8_t *map; uint64_t off, cap; int big; } pkg_stage;
+typedef struct { VkBuffer buf; uint8_t *map; uint64_t off, cap; } pkg_stage;
 
 static int bigs_build(void)
 {
@@ -4642,28 +4731,23 @@ static int bigs_build(void)
     return 1;
 }
 
-// 为一张图圈暂存：能进 arena 就用 arena（游标共享、逻辑与原来一致），否则走巨图块
-// Reserve staging for one image: the arena when it fits (shared cursor, exactly the old behaviour), the big buffer otherwise.
+// 为一张图圈暂存：一律走独立环，整张一次圈够；圈不到返回 0，交由上层下次提交（游标清零）再试
+// Reserve staging for one image: always the dedicated ring, whole-image-or-nothing; 0 means retry next submission.
 static int stage_begin(pkg_stage *s, uint64_t need)
 {
     s->off = 0;
-    if (need <= ARENA_PKG_CAP) { s->buf = g_arena; s->map = g_arena_map; s->cap = ARENA_PKG_CAP; s->big = 0; return 1; }
     if (!bigs_build()) return 0;
-    s->buf = g_bigs; s->map = g_bigs_map; s->cap = BIG_STAGE_SZ; s->big = 1;
-    if (g_bigs_off + need > s->cap) return 0;   // 本次提交里巨图块满了：下次提交（游标清零）再来 | full for this submission: retry after the cursor resets
+    s->buf = g_bigs; s->map = g_bigs_map; s->cap = BIG_STAGE_SZ;
+    if (g_bigs_off + need > s->cap) return 0;   // 本次提交里环满了：下次提交（游标清零）再来 | full for this submission: retry after the cursor resets
     s->off = g_bigs_off;
     return 1;
 }
-static uint64_t stage_take(pkg_stage *s, uint64_t len)   // 返回 UINT64_MAX = 没圈到 | UINT64_MAX = nothing left
+static uint64_t stage_take(pkg_stage *s, uint64_t len)   // 返回 UINT64_MAX = 没圈到（begin 已整张圈够，走到这里只可能是算量 bug）| UINT64_MAX = nothing left (unreachable while begin reserved the whole image)
 {
     uint64_t need = (len + 15) & ~(uint64_t)15;
-    if (s->big) {
-        if (s->off + need > s->cap) return ~(uint64_t)0;
-        uint64_t o = s->off; s->off += need; g_bigs_off = s->off;
-        return o;
-    }
-    uint32_t a = arena_take(len);
-    return a == 0xFFFFFFFFu ? ~(uint64_t)0 : (uint64_t)a;
+    if (s->off + need > s->cap) return ~(uint64_t)0;
+    uint64_t o = s->off; s->off += need; g_bigs_off = s->off;
+    return o;
 }
 void mtl_sub_reset_bigstage(void);
 void mtl_sub_reset_bigstage(void) { g_bigs_off = 0; }
@@ -4673,16 +4757,17 @@ static void pkg_big_said(const vktex *v, uint64_t tot, uint64_t cmax)
     static int said;
     if (said >= 8) return;
     said++;
-    GVL("[vk] 太大%{public}d s=%{public}llu NVN%{public}d %{public}u x %{public}u 层%{public}u 级%{public}u 软解%{public}d 要%{public}llu MB arena上限%{public}llu MB",
+    GVL("[vk] 环拒%{public}d s=%{public}llu NVN%{public}d %{public}u x %{public}u 层%{public}u 级%{public}u 软解%{public}d 要%{public}llu MB 环余%{public}llu MB",
         said, (unsigned long long)v->serial, (int)v->d.d.format, v->w, v->h, v->layers, v->levels, v->soft_bc,
-        (unsigned long long)((tot + cmax) >> 20), (unsigned long long)(ARENA_PKG_CAP >> 20));
+        (unsigned long long)((tot + cmax) >> 20), (unsigned long long)((BIG_STAGE_SZ - g_bigs_off) >> 20));
 }
 
 static void pkg_upload(vktex *v)
 {
     const tex_t *t = &v->d;
     if (!g_cb || g_in_pass || !v->img) return;   // 通道里发不了 transfer，也不是失败：留着下次冲刷
-    if (!v->pkg_tried) { v->pkg_tried = 1; atomic_fetch_add(&g_pkg_q, 1); }
+    textrace(NVN_TRACE_ATTEMPT, v, -1, "entered-upload");
+    if (!v->pkg_tried) { v->pkg_tried = 1; atomic_fetch_add(&g_pkg_attempted_textures, 1); }
     // has_layout 不再当闸门（第 109 轮实测）：饥荒一张图都没调 TextureBuilderSetLayout ⇒ EMP pk=0 nopk=53676，
     // 可像素确实躺在池里（8 KB 采样非零 4164~7659，m1）。这条路的排布每步都按描述符现算（nvn_deswizzle_geom /
     // nvn_deswizzle），has_layout 只说明「打包贴图自带布局描述」，用它把关等于把上传整条锁在没人用的那半边。
@@ -4733,7 +4818,8 @@ static void pkg_upload(vktex *v)
     }
     to_layout(g_cb, v, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
     uint64_t asc = 0;
-    if (st.big) atomic_fetch_add(&g_pkg_bigok, 1);
+    atomic_fetch_add(&g_pkg_bigok, 1);   // 每张打包上传都走独立环 | every packaged upload now stages on the ring
+    int stag_exh = 0;   // 圈不到属于「这次提交放不下」，可重试；只有真正的错才许置 pkg_bad | staging exhaustion is retryable; only real errors may set pkg_bad
     if (soft) {
         asc = stage_take(&st, cmax ? cmax : 16);   // 压缩块的暂存按最大那一级算，逐层复用同一块
         if (asc == ~(uint64_t)0) { atomic_fetch_add(&g_pkg_arena, 1); return; }
@@ -4756,14 +4842,14 @@ static void pkg_upload(vktex *v)
             uint64_t drow = (((uint64_t)ew * (uint64_t)bpp) + 15) & ~(uint64_t)15;
             blen = drow * eh * slices;
             ao = stage_take(&st, blen);
-            if (ao == ~(uint64_t)0) { atomic_fetch_add(&g_pkg_arena, 1); l = lv; break; }
+            if (ao == ~(uint64_t)0) { atomic_fetch_add(&g_pkg_arena, 1); stag_exh = 1; l = lv; break; }
             if (nvn_bc_decode((uint32_t)t->d.format, st.map + asc, (size_t)rb, ew, eh, st.map + ao, (size_t)drow)) {
                 atomic_fetch_add(&g_pkg_fmt, 1); v->pkg_bad = 1; l = lv; break;
             }
             reg.bufferRowLength = (uint32_t)(drow / (uint64_t)bpp); reg.bufferImageHeight = eh;
         } else {
             ao = stage_take(&st, need);
-            if (ao == ~(uint64_t)0) { atomic_fetch_add(&g_pkg_arena, 1); l = lv; break; }
+            if (ao == ~(uint64_t)0) { atomic_fetch_add(&g_pkg_arena, 1); stag_exh = 1; l = lv; break; }
             if (nvn_deswizzle(&t->d, (unsigned)l, (unsigned)la, t->mem, st.map + ao, (size_t)rb)) {
                 atomic_fetch_add(&g_pkg_dz, 1); l = lv; break;
             }
@@ -4796,7 +4882,7 @@ static void pkg_upload(vktex *v)
         }
     }
     to_layout(g_cb, v, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
-    if (!ok) { v->pkg_bad = 1; return; }
+    if (!ok) { if (!stag_exh) v->pkg_bad = 1; return; }   // 圈不到不置坏：下次提交再试（W24 之前这里把饿死当坏图，地形一次没传上就永死）
     if (v->uploaded) atomic_fetch_add(&g_pkg_re, 1);   // 重传（游戏又写了这张）| a re-upload: the game wrote this one again
     v->uploaded = 1;
     v->pkg_dirty = 0;
@@ -4805,7 +4891,8 @@ static void pkg_upload(vktex *v)
     // After the upload, set the pages this texture occupies read-only: the next guest write faults and bumps the generation, which
     // is what the before-use check turns into a re-upload.
     v->pkg_range = pend; v->pkg_stamp = st0; v->pkg_seen = st0;
-    if (pend && !(g_skip & 67108864)) nvn_dirty_protect(t->mem, (size_t)pend);
+    v->pkg_tracked = pend ? nvn_dirty_tracked(t->mem, (size_t)pend) : 0;   // 未跟踪的池：绑定处不查脏，别每绑必重传 | untracked pool: treat clean at bind, no per-bind re-upload
+    if (v->pkg_tracked && !(g_skip & 67108864)) nvn_dirty_protect(t->mem, (size_t)pend);
     atomic_fetch_add(&g_pkg_up, 1);
     static int saidp;
     if (saidp < 8) {
@@ -4829,9 +4916,14 @@ static void pkg_flush(void)
         vktex *v = g_pkg_pend[i];
         // 排队存的是数组里的指针，中途有图被释放会把末尾那张换位、把这一槽清成 0：img 空了就不能再搬
         // The queue holds pointers into the texture array; a release mid-frame swaps the last entry down and zeroes the vacated slot.
-        if (!v || !v->img || v->pkg_bad) continue;
+        if (!v || !v->img || v->pkg_bad) {
+            textrace(NVN_TRACE_DROP, v, -1, "flush:no-image-or-bad"); continue;
+        }
         if (v->uploaded && !v->pkg_dirty && !v->pkg_stale) continue;
         pkg_upload(v);
+        textrace(NVN_TRACE_RESULT, v, -1,
+                 v->pkg_bad ? "bad" : v->uploaded && !v->pkg_dirty && !v->pkg_stale
+                 ? "copy-recorded" : "deferred-or-incomplete");
         if (v->uploaded) did++;
     }
     if (did) g_sets_valid = 0;   // 下一趟绘制重新绑：这些槽该换成真视图 | rebind next pass: these slots now hold real views
@@ -4839,11 +4931,20 @@ static void pkg_flush(void)
 
 static void pkg_queue(vktex *v)
 {
-    if (!v || !v->img || v->pkg_bad) return;
-    if (v->uploaded && !v->pkg_dirty && !v->pkg_stale) return;
-    if (g_pkg_pend_n >= PKG_PEND) return;
-    for (int i = 0; i < g_pkg_pend_n; i++) if (g_pkg_pend[i] == v) return;
+    if (!v || !v->img || v->pkg_bad) {
+        textrace(NVN_TRACE_DROP, v, -1, "queue:no-image-or-bad"); return;
+    }
+    if (v->uploaded && !v->pkg_dirty && !v->pkg_stale) {
+        textrace(NVN_TRACE_DROP, v, -1, "queue:already-current"); return;
+    }
+    if (g_pkg_pend_n >= PKG_PEND) {
+        textrace(NVN_TRACE_DROP, v, -1, "queue:capacity"); return;
+    }
+    for (int i = 0; i < g_pkg_pend_n; i++) if (g_pkg_pend[i] == v) {
+        textrace(NVN_TRACE_DROP, v, -1, "queue:duplicate"); return;
+    }
     g_pkg_pend[g_pkg_pend_n++] = v;
+    textrace(NVN_TRACE_QUEUE, v, -1, "accepted");
     // 点名前 40 张进队的图：地面图集到底有没有来过这里（进队=会尝试上传；没进队=绑定路径都没走到）
     // Name the first 40 queued images: did the terrain atlases ever get here? (queued = an upload will be attempted;
     // never queued = the bind path never even reached this point)
@@ -5114,10 +5215,9 @@ static void draw_stats_line(char *line, int m, int cap)
                   (unsigned long long)atomic_load(&g_bind_lay), (unsigned long long)atomic_load(&g_tex_reg),
                   (unsigned long long)atomic_load(&g_tex_rereg));
     // 打包上传（M2-3f）：搬了几张、多少字节、各自卡在哪一环 | the packaged upload path: how many moved, how many bytes, and where each refusal came from
-    m += snprintf(line + m, (size_t)(cap - m), "｜打包:排%llu 上%llu 重%llu 成%llu MB BC层%llu 卡arena%llu 越界%llu 解排%llu 格式%llu 深度%llu 三维%llu 太大%llu 巨图成%llu",
-                  (unsigned long long)atomic_load(&g_pkg_q), (unsigned long long)atomic_load(&g_pkg_up),
+    m += snprintf(line + m, (size_t)(cap - m), "｜打包:尝试图%llu 上%llu 重%llu 成%llu MB BC层%llu 卡环%llu 越界%llu 解排%llu 格式%llu 深度%llu 三维%llu 环拒%llu 环成%llu",
+                  (unsigned long long)atomic_load(&g_pkg_attempted_textures), (unsigned long long)atomic_load(&g_pkg_up),
                   (unsigned long long)atomic_load(&g_pkg_re),
-                  (unsigned long long)(atomic_load(&g_pkg_bytes) >> 20),
                   (unsigned long long)(atomic_load(&g_pkg_bytes) >> 20),
                   (unsigned long long)atomic_load(&g_pkg_bc),
                   (unsigned long long)atomic_load(&g_pkg_arena), (unsigned long long)atomic_load(&g_pkg_range),

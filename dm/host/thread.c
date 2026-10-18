@@ -6,6 +6,7 @@
 #define TLS_SIZE 8192
 #define TLR_SIZE 0x200
 #define THREAD_OBJ_SIZE 0x400
+#define TLS_MOD_SIZE (64u << 10)   // 每模块 TLS 块（零初始化；初值由客体自己的 _ZTH/__tls_init 填）| per-module TLS block
 extern void dm_gate(void);            // entry.S：门公共入口 | entry.S: common gate entry
 #include "front.h"
 #include "dm_uiscreen.h"
@@ -29,8 +30,24 @@ void guest_thread_init(void) {
         if (g_keyaspectui) { memcpy(&bits, &ui, 4); pthread_setspecific(g_keyaspectui, (void *)(uintptr_t)bits); }
     }
     pthread_setspecific(g_key18, 0);
-    pthread_setspecific(g_keytls, calloc(1, TLS_SIZE));
+    // Horizon TLS：客体代码用 mrs tpidr_el0 拿「线程本地区」，再从 +8 取「按模块索引的 TLS 块指针表」，
+    // 然后 tls_table[module] + 偏移 访问自己的 thread_local 变量（C++ 的 _ZTH 初始化函数也走这条路）。
+    // 所以 tpidr_el0 与 tpidrro_el0 必须指向同一个区域，且 +8 要有表；原先 KTLS 给的是另一块零缓冲 ⇒
+    // 客体读到 0 再按 0 索引（饥荒的 cApplicationBase 一上来就用 thread_local，撞的就是这里）。
+    // Horizon TLS: guest code reads the thread-local region through `mrs tpidr_el0`, then takes the per-module TLS block
+    // pointer table from +8 and accesses its thread_local variables as tls_table[module] + offset (the C++ _ZTH initializers
+    // go the same way). So tpidr_el0 and tpidrro_el0 must point at the same region and +8 must hold that table; the old code
+    // gave KTLS a different zeroed buffer, so the guest read 0 and indexed from 0.
     uint8_t *tlr = calloc(1, TLR_SIZE);
     *(void **)(tlr + 0x1f8) = calloc(1, THREAD_OBJ_SIZE);   // 当前线程对象 | current thread object
+    extern int g_nmod;
+    {
+        unsigned n = (unsigned)(g_nmod > 0 ? g_nmod : 4) + 4;   // 多给几槽余量 | a few spare slots
+        void **tab = calloc(n, sizeof *tab);
+        for (unsigned i = 0; i < n; i++) tab[i] = calloc(1, TLS_MOD_SIZE);
+        *(void **)(tlr + 8) = tab;
+        LOG("客体 TLS：区域 %p，模块表 %p（%u 槽 × %u 字节，模块数 %d）", (void *)tlr, (void *)tab, n, TLS_MOD_SIZE, g_nmod);
+    }
+    pthread_setspecific(g_keytls, tlr);
     pthread_setspecific(g_keytlr, tlr);
 }
