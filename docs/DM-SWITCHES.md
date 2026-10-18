@@ -54,10 +54,14 @@ hdc shell aa start -a EntryAbility -b <bundleName> \
 | `DM_VK_TEXTRACE` | `1` | opt-in bounded descriptor/upload correlation; default off; see [TEXTURE-DIAGNOSTICS.md](TEXTURE-DIAGNOSTICS.md) |
 | `DM_VK_TEXTRACE_SERIAL` | serial or `0` | optionally restrict correlation to one logical texture serial; not a texture id |
 | `DM_VK_TEXTRACE_FROM` | present count | optional start frame, default 0; budgets renew every 60 presents |
-| `DM_TEXDUMP` | `0`/`1` | per-texture upload dump (turn off in diagnostic rounds; it is verbose) |
-| `DM_RBIMG` | `0`/`1` | readback image capture |
-| `DM_TEXREAD` | absolute directory | after a texture is uploaded, copy the **VkImage itself** back off the GPU into this directory. This is the switch that distinguishes "the bytes landed wrong in the image" from "the bytes are right and the binding/UV is wrong". Must be outside `DM_SAVE`; output is capped (400 images, 4 per frame) |
+| `DM_TEXDUMP` | **absolute directory**, not `1` | Texture forensics, two artifacts per subresource: `…_A.bin` = the deswizzled **compressed blocks**, `…_B.bin` = what our CPU soft-decoder made of them (RGBA8). A correct B and a wrong A mean our geometry is wrong; a wrong A means the decode is. Round B38 wrote `1` here, saw all 16 log lines, and got an empty directory — the value is a path, and a relative one is reported and refused. Whole-image line too: `raw_s<serial>_v<stamp>.bin` is the block-linear store as the game wrote it, for brute-forcing per-level offsets offline. Caps: 400 pairs (1100 MB), 100 raw images (600 MB), 32 MB each. Must be outside `DM_SAVE`. See [P3-LOCALIZATION.md](P3-LOCALIZATION.md) |
+| `DM_TEXDUMP_MIN` / `_MAX` | serial floor / ceiling | Aim the budget at one serial range. The ceiling stops the whole round once passed (serials are monotone) — do not set it above what this round reaches, and never use serials to compare two rounds |
+| `DM_TEXDUMP_AT` | present count | Floor on frames presented instead: the world art is uploaded after the menu, and serials overlap between the two |
+| `DM_TEXDUMP_LAYER` | layer index | Which layer of an array texture to dump (default 0). `A`/`B` are written for levels 0–1 of that layer only |
+| `DM_RBIMG` | `0`/`1` | readback image capture (`rb_tga` of the present target) |
+| `DM_TEXREAD` | absolute directory | after a texture is uploaded, copy the **VkImage itself** back off the GPU into this directory. This is the switch that distinguishes "the bytes landed wrong in the image" from "the bytes are right and the binding/UV is wrong". Must be outside `DM_SAVE`; output is capped (400 images, 4 per frame, 128 MB ring) |
 | `DM_TEXREAD_MIN` | pixel count | ignore textures under this many pixels — serial numbers are per-process, so without a floor the budget is spent on menu icons before the world is entered |
+| `DM_TEXREAD_LAYER` | layer index | Which layer to read back (default 0). Set it equal to `DM_TEXDUMP_LAYER` or the two sides never describe the same subresource |
 | `DM_3D_SCALE`, `DM_3D_SCALE_DYN` | float | internal resolution scaling experiments |
 | `DM_FLK` | mask | flicker/flat-fill detector — the line `[vk] 闪 …` fires on content change and reports brightness, source, and whether the texture was attached/uploaded/drawn |
 

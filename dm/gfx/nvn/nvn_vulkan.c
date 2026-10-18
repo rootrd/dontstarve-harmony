@@ -4787,6 +4787,53 @@ static void do_copy_b2t(const p_copy_b2t *c)
     }
 }
 
+// ---- P3 取证的三份产物共用的记账 ----
+// 只按 serial+级 命名不够：同一张图重传会把上一版的证据原地覆盖，层号也没进名字，离线就没法说
+// 「这两份是同一版本、同一层」。名字里补上池写代号与层，落盘那一趟顺带算整幅哈希和精确非零字节数，
+// 再往同目录 p3_manifest.tsv 追加一行——离线那份联判脚本只读这张表，不猜文件名。
+// An artifact name carries the pool write generation it was made from and its layer, so a re-upload cannot overwrite the
+// evidence of the version it replaces. The hash and the exact non-zero byte count come from the same pass that writes it,
+// and one TSV line per artifact lets the offline join read a table instead of guessing file names.
+static void p3_layers(unsigned *dl, unsigned *rl)
+{
+    static int tried; static unsigned a, b;
+    if (!tried) {
+        tried = 1;
+        const char *m = getenv("DM_TEXDUMP_LAYER"); a = m ? (unsigned)strtoul(m, NULL, 0) : 0u;
+        m = getenv("DM_TEXREAD_LAYER"); b = m ? (unsigned)strtoul(m, NULL, 0) : 0u;
+    }
+    *dl = a; *rl = b;
+}
+
+// 清单一列一列写死，头一行给出列名：换字段只会改这张表，不会让日志与产物各自漂移
+static void p3_note(const char *dir, const char *kind, const char *file, uint64_t serial, uint64_t stamp,
+                    unsigned lvl, unsigned la, uint32_t w, uint32_t h, uint64_t pitch, const void *p, size_t n)
+{
+    if (!dir || !p || !n) return;
+    unsigned char md[32]; char hex[65];
+    CC_SHA256(p, (CC_LONG)n, md);
+    for (int i = 0; i < 32; i++) snprintf(hex + i * 2, 3, "%02x", md[i]);
+    uint64_t nz = 0; const uint8_t *b = (const uint8_t *)p;
+    for (size_t i = 0; i < n; i++) nz += (b[i] != 0);
+    char mp[512];
+    snprintf(mp, sizeof mp, "%s/p3_manifest.tsv", dir);
+    // 表头跟着「这张清单文件」走，不跟着进程走：两份产物分文两目录时（DM_TEXDUMP 与 DM_TEXREAD 分开指），
+    // 第二个目录也必须自己写一遍列名，否则离线那份联判拿到的是一张没有表头的表。
+    static char last_mp[512];
+    int fresh = strcmp(last_mp, mp) != 0;
+    FILE *f = fopen(mp, fresh ? "wb" : "ab");
+    if (!f) return;                       // 清单写不出不算错：产物本身已经落下去了
+    if (fresh) {
+        snprintf(last_mp, sizeof last_mp, "%s", mp);
+        fprintf(f, "kind\tserial\tstamp\tmip\tlayer\tw\th\tpitch\tbytes\tsha256\tnonzero\tdraws\tpresents\tpath\n");
+    }
+    fprintf(f, "%s\t%llu\t%llu\t%u\t%u\t%u\t%u\t%llu\t%zu\t%s\t%llu\t%llu\t%llu\t%s\n",
+            kind, (unsigned long long)serial, (unsigned long long)stamp, lvl, la, w, h,
+            (unsigned long long)pitch, n, hex, (unsigned long long)nz,
+            (unsigned long long)atomic_load(&g_draws), (unsigned long long)g_presents, file);
+    fclose(f);
+}
+
 // 贴图两级落盘（DM_TEXDUMP = 绝对输出目录，例：/data/storage/el2/base/haps/entry/files/tex）：
 // A = 解完排布的**压缩块**，B = 我们 CPU 软解出来的 RGBA。
 // 第 113 轮 B37 的现场：版面、文字、位置全对，但 UI 面板被平涂的横条纹占掉。这既可能是「排布/行距算错」，
@@ -4796,7 +4843,8 @@ static void do_copy_b2t(const p_copy_b2t *c)
 // either stage, so both are written for the same serial; decoding A offline with a known-good BC decoder says which half is wrong.
 // 开关的值本身就是目录（第 114 轮 B38：值写 1、落盘到 DM_SAVE 时 16 行日志全打了、目录里一个文件都没有，
 // 而 DM_VK_KEYDUMP 往 files/ 写 ctl.bin 是成的 ⇒ 存档目录那条路不能当输出用，失败必须当场报 errno 并停手）。
-static void tex_dump(uint64_t serial, unsigned lvl, unsigned nlv, const void *a, size_t an, const void *b, size_t bn,
+static void tex_dump(uint64_t serial, uint64_t stamp, unsigned lvl, unsigned la, unsigned nlv,
+                     const void *a, size_t an, const void *b, size_t bn,
                      uint32_t w, uint32_t h, uint32_t rb, int nvnfmt, int vkfmt, int soft)
 {
     static int n; static size_t tot;
@@ -4830,16 +4878,30 @@ static void tex_dump(uint64_t serial, unsigned lvl, unsigned nlv, const void *a,
     n++; tot += an + bn;
     char p[512];
     FILE *f;
-    snprintf(p, sizeof p, "%s/tex%u_s%llu_L%u_A.bin", d, n, (unsigned long long)serial, lvl);
+    char nm[128];
+    snprintf(nm, sizeof nm, "tex%u_s%llu_v%llu_L%u_D%u_A.bin", n, (unsigned long long)serial,
+             (unsigned long long)stamp, lvl, la);
+    snprintf(p, sizeof p, "%s/%s", d, nm);
     f = fopen(p, "wb");
     if (f) { fwrite(a, 1, an, f); fclose(f); }
     else { GVL("[vk] 贴图落盘写不出 %{public}s errno=%{public}d（停手）", p, errno); n = 400; return; }
+    p3_note(d, "A", nm, serial, stamp, lvl, la, w, h, rb, a, an);
+    // B 的行距按「软解后每像素字节」算，不写死 4：BC4 / BC5 / BC6H 软解出来是 1 / 2 / 8 字节一格，
+    // 清单里报成 RGBA8 的行距，离线剔 padding 就按错行去剔——产物本身没错、表错了，比出来的差异全是假的。
+    // The B row pitch uses the unpacked bytes-per-texel: BC4/BC5/BC6H decode to 1, 2 or 8 bytes, and a pitch labelled
+    // as if it were RGBA makes the offline join strip padding at the wrong stride, inventing differences.
+    uint32_t upf; int ubpp = 4; if (!nvn_bc_unpacked((uint32_t)nvnfmt, &upf, &ubpp) || ubpp <= 0) ubpp = 4;
+    uint32_t pb = (uint32_t)((((uint64_t)w * (uint64_t)ubpp) + 15) & ~(uint64_t)15);
     if (b && bn) {
-        snprintf(p, sizeof p, "%s/tex%u_s%llu_L%u_B.bin", d, n, (unsigned long long)serial, lvl);
+        snprintf(nm, sizeof nm, "tex%u_s%llu_v%llu_L%u_D%u_B.bin", n, (unsigned long long)serial,
+                 (unsigned long long)stamp, lvl, la);
+        snprintf(p, sizeof p, "%s/%s", d, nm);
         f = fopen(p, "wb"); if (f) { fwrite(b, 1, bn, f); fclose(f); }
+        p3_note(d, "B", nm, serial, stamp, lvl, la, w, h, pb, b, bn);
     }
-    GVL("[vk] 贴图落盘%{public}u serial=%{public}llu 级%{public}u 共%{public}u NVN%{public}d→Vk%{public}d 软%{public}d %{public}u x %{public}u 块行%{public}u A=%{public}zu B=%{public}zu",
-        n, (unsigned long long)serial, lvl, nlv, nvnfmt, vkfmt, soft, w, h, rb, an, bn);
+    GVL("[vk] 贴图落盘%{public}u serial=%{public}llu 版%{public}llu 级%{public}u 层%{public}u 共%{public}u NVN%{public}d→Vk%{public}d 软%{public}d %{public}u x %{public}u 块行%{public}u A行%{public}u A=%{public}zu B=%{public}zu",
+        n, (unsigned long long)serial, (unsigned long long)stamp, lvl, la, nlv, nvnfmt, vkfmt, soft,
+        w, h, rb, pb, an, bn);
 }
 
 // 整张块线性存储原样落盘一份（raw_s<serial>.bin）+ 把描述符、本层算出的总大小/每级起点/每级块高块深打进日志。
@@ -4847,7 +4909,7 @@ static void tex_dump(uint64_t serial, unsigned lvl, unsigned nlv, const void *a,
 // 整张取一次样本，离线把「tileH 各档 × 起点各算法」全穷举一遍，哪档能解出连续美术，答案就是它。
 // Dump the whole block-linear image once, plus the descriptor and our per-level offsets/tiling: the per-level layout
 // hypotheses then get brute-forced offline instead of costing one device round each.
-static void tex_dump_raw(const nvn_texdesc *d, uint64_t serial, const void *mem, size_t avail)
+static void tex_dump_raw(const nvn_texdesc *d, uint64_t serial, uint64_t stamp, const void *mem, size_t avail)
 {
     static int n; static size_t tot;
     const char *dir = getenv("DM_TEXDUMP");
@@ -4867,9 +4929,12 @@ static void tex_dump_raw(const nvn_texdesc *d, uint64_t serial, const void *mem,
     size_t sz = L.size < (uint64_t)avail ? (size_t)L.size : avail;
     if (!sz || sz > (32u << 20)) return;                 // 单张 32 MB 封顶，100 张 600 MB 封顶
     char p[512];
-    FILE *f = fopen((snprintf(p, sizeof p, "%s/raw_s%llu.bin", dir, (unsigned long long)serial), p), "wb");
+    char nm[128];
+    snprintf(nm, sizeof nm, "raw_s%llu_v%llu.bin", (unsigned long long)serial, (unsigned long long)stamp);
+    FILE *f = fopen((snprintf(p, sizeof p, "%s/%s", dir, nm), p), "wb");
     if (!f) { GVL("[vk] 整张贴落盘写不出 %{public}s errno=%{public}d（停手）", p, errno); n = 100; return; }
     fwrite(mem, 1, sz, f); fclose(f);
+    p3_note(dir, "pool", nm, serial, stamp, 0u, 0u, d->width, d->height, 0ull, mem, sz);
     n++; tot += sz;
     int bw = 1, bh = 1; uint32_t bp2 = (uint32_t)nvn_fmt_bpb(d->format, &bw, &bh);
     unsigned lv = (unsigned)(d->levels ? d->levels : 1);
@@ -5049,7 +5114,7 @@ static uint64_t g_tr_off;
 #define TR_STAGE_SZ (128ull << 20)
 #define TR_MAX 400   // 120 张在第 119 轮正好截了号，元凶压根没进窗口 | the old cap cut the list off before the culprit
 #define TR_PER_FRAME 4   // 一趟 4 张：2048² RGBA8 一张就 16 MB，4 张刚好在 128 MB 环里周转
-typedef struct { uint64_t serial, off; uint32_t w, h, lvl; uint64_t bytes; } tr_ent;
+typedef struct { uint64_t serial, stamp, off; uint32_t w, h, lvl, la; uint64_t bytes; } tr_ent;
 static tr_ent g_tr_q[TR_MAX]; static int g_tr_qn; static int g_tr_total; static int g_tr_bad_fmt;
 static uint64_t g_tr_lost;   // 环满/建缓冲失败而没读成的张数 | images skipped because the stage was full
 static uint64_t g_tr_small;  // 按像素数筛掉的（DM_TEXREAD_MIN 以下）| skipped for being under DM_TEXREAD_MIN
@@ -5069,15 +5134,23 @@ static int tex_gate(uint64_t serial)
     return 1;
 }
 
-static void tex_read_arm(VkCommandBuffer cb, vktex *v, unsigned lvl)
+static void tex_read_arm(VkCommandBuffer cb, vktex *v, unsigned lvl, unsigned la, uint64_t stamp)
 {
     const char *dir = getenv("DM_TEXREAD");
-    if (!dir || dir[0] == '0' || dir[0] != '/') return;
+    // 开关给了值但不是绝对目录：这条路上原先一声不吭，第 114 轮 DM_TEXDUMP=1 那种「日志满屏、目录空着」的坑就是这么来的。
+    // A wrong value used to be silent here; the dump side already shouts, so this side has to as well.
+    if (!dir || dir[0] == '0' || dir[0] != '/') {
+        static int said;
+        if (dir && dir[0] && dir[0] != '0' && !said++)
+            GVL("[vk] 读回没开：DM_TEXREAD 要给绝对目录，现在是 %{public}s", dir);
+        return;
+    }
     if (g_tr_total >= TR_MAX || g_tr_qn >= TR_PER_FRAME) return;
     if (!tex_gate(v->serial)) return;
     // 只读 RGBA8：软解后的打包美术全在这一档，别的格式（R8、深度…）字节宽度不同，混进同一份比对只会添乱。
     // RGBA8 only: every soft-decoded packaged image lands here, and other formats would need their own pitch rules.
-    if (v->fmt != VK_FORMAT_R8G8B8A8_UNORM || v->layers != 1 || lvl >= v->levels) { g_tr_bad_fmt++; return; }
+    // 层也认：多层的图集要读第几层由 DM_TEXREAD_LAYER 指哪一层，读回就按那一个子资源建。
+    if (v->fmt != VK_FORMAT_R8G8B8A8_UNORM || la >= v->layers || lvl >= v->levels) { g_tr_bad_fmt++; return; }
     uint32_t w = (v->w >> lvl) ? (v->w >> lvl) : 1u, h = (v->h >> lvl) ? (v->h >> lvl) : 1u;
     // DM_TEXREAD_MIN = 像素数下限。第 119 轮的教训：斜切面板那两张落在 serial 10951/10952，可 serial 是进程内计数，
     // 每一轮走到的深度不同（这一轮跑到 serial 4300 还没进世界），拿 serial 当靶子会一整轮空手。
@@ -5101,11 +5174,16 @@ static void tex_read_arm(VkCommandBuffer cb, vktex *v, unsigned lvl)
     rc.bufferOffset = off;
     rc.bufferRowLength = (uint32_t)(pitch / 4u);
     rc.bufferImageHeight = h;
-    rc.imageSubresource = (VkImageSubresourceLayers){ VK_IMAGE_ASPECT_COLOR_BIT, lvl, 0, 1 };
+    rc.imageSubresource = (VkImageSubresourceLayers){ VK_IMAGE_ASPECT_COLOR_BIT, lvl, la, 1 };
     rc.imageExtent = (VkExtent3D){ w, h, 1 };
     vkCmdCopyImageToBuffer(cb, v->img, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, g_tr_buf, 1, &rc);
+    // 录完立刻把布局还原回可采样态：取证不能改变被取证对象的状态。留着 TRANSFER_SRC 虽然下次绑定会自己转回去，
+    // 但那一趟依赖是「读回之后才补的」，等于让这一轮的采样走了一条平时不走的路。
+    // Restore the layout in the same command buffer: an instrumented read must not leave the sampled image in a
+    // transfer layout, because the next bind would then take a transition path the un-instrumented round never took.
+    to_layout(cb, v, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
     rb_host_dep(cb, g_tr_buf, need);
-    g_tr_q[g_tr_qn++] = (tr_ent){ v->serial, off, w, h, lvl, need };
+    g_tr_q[g_tr_qn++] = (tr_ent){ v->serial, stamp, off, w, h, lvl, la, need };
 }
 
 // 出图栅栏之后：那条队列里排在栅栏前的拷贝一定执行完了（同队列按提交序）
@@ -5122,15 +5200,20 @@ static void tex_read_report(void)
     for (int i = 0; i < g_tr_qn; i++) {
         tr_ent *e = &g_tr_q[i];
         char p[512];
-        snprintf(p, sizeof p, "%s/rd_s%llu_L%u.bin", dir, (unsigned long long)e->serial, e->lvl);
+        char nm[128];
+        snprintf(nm, sizeof nm, "rd_s%llu_v%llu_L%u_D%u.bin", (unsigned long long)e->serial,
+                 (unsigned long long)e->stamp, e->lvl, e->la);
+        snprintf(p, sizeof p, "%s/%s", dir, nm);
         FILE *f = fopen(p, "wb");
         if (!f) { GVL("[vk] 读回写不出 %{public}s errno=%{public}d（停手）", p, errno); g_tr_total = TR_MAX; break; }
         fwrite(g_tr_map + e->off, 1, (size_t)e->bytes, f); fclose(f);
         g_tr_total++;
-        GVL("[vk] 读回%{public}d serial=%{public}llu 级%{public}u %{public}u x %{public}u 行%{public}llu 字节%{public}llu 拍%{public}llu",
-            g_tr_total, (unsigned long long)e->serial, e->lvl, e->w, e->h,
-            (unsigned long long)((((uint64_t)e->w * 4u) + 15) & ~(uint64_t)15),
-            (unsigned long long)e->bytes, (unsigned long long)g_presents);
+        uint64_t tp = (((uint64_t)e->w * 4u) + 15) & ~(uint64_t)15;
+        p3_note(dir, "rd", nm, e->serial, e->stamp, e->lvl, e->la, e->w, e->h, tp, g_tr_map + e->off, (size_t)e->bytes);
+        GVL("[vk] 读回%{public}d serial=%{public}llu 版%{public}llu 级%{public}u 层%{public}u %{public}u x %{public}u 行%{public}llu 字节%{public}llu 拍%{public}llu 画%{public}llu",
+            g_tr_total, (unsigned long long)e->serial, (unsigned long long)e->stamp, e->lvl, e->la, e->w, e->h,
+            (unsigned long long)tp,
+            (unsigned long long)e->bytes, (unsigned long long)g_presents, (unsigned long long)atomic_load(&g_draws));
     }
     g_tr_qn = 0; g_tr_off = 0;
     if (g_tr_total >= TR_MAX) {
@@ -5246,6 +5329,7 @@ static int pkg_upload(vktex *v)
         pkg_big_said(v, tot, cmax, sg);
         return PKG_UP_RETRY;
     }
+    unsigned dl, rl; p3_layers(&dl, &rl);
     to_layout(g_cb, v, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
     uint64_t asc = 0;
     atomic_fetch_add(&g_pkg_bigok, 1);   // 每张打包上传都走独立环 | every packaged upload now stages on the ring
@@ -5293,11 +5377,12 @@ static int pkg_upload(vktex *v)
         // 未压缩那类只有一份线性字节，就只落 A。
         // Levels 0 and 1: full-size art reads correctly while the small UI quads come out flat, and those quads sample mip>0,
         // so "level 0 good, level 1 broken" is exactly the split this dump can decide. Uncompressed images have one buffer, so only A.
-        if (la == 0 && l <= 1)
-            tex_dump(v->serial, (unsigned)l, (unsigned)lv, soft ? st.map + asc : st.map + ao, (size_t)need,
+        // 层由 DM_TEXDUMP_LAYER 指：默认第 0 层（旧行为）。指到第几层，A/B 就落第几层，名字里也带第几层。
+        if ((unsigned)la == dl && l <= 1)
+            tex_dump(v->serial, st0, (unsigned)l, (unsigned)la, (unsigned)lv, soft ? st.map + asc : st.map + ao, (size_t)need,
                      soft ? st.map + ao : NULL, soft ? (size_t)blen : 0,
                      ew, eh, rb, (int)t->d.format, (int)v->fmt, soft);
-        if (la == 0 && l == 0) tex_dump_raw(&t->d, v->serial, t->mem, (size_t)avail);   // 整张 + 描述符：离线穷举每级几何
+        if ((unsigned)la == dl && l == 0) tex_dump_raw(&t->d, v->serial, st0, t->mem, (size_t)avail);   // 整张 + 描述符：离线穷举每级几何
         subs[nsub++] = (pkg_sub){ ao, blen, ew, eh, slices, (uint32_t)l, (uint32_t)la, brl, bih };
         if (l == 0 && la == 0) {
             // 探针行得带上格式对与行字节数：第 110 轮同是 1280x720 的两次上传，一次 3 686 400 B（4 B/像素，软解）一次 921 600 B
@@ -5330,7 +5415,7 @@ static int pkg_upload(vktex *v)
     }
     // 读回放在拷贝之后：循环里转布局会把下一级的拷贝留在错态上（vkCmdCopyBufferToImage 传的是 TRANSFER_DST）。
     // Arm the readback after every copy is recorded: transitioning inside the loop would leave a copy in the wrong layout.
-    tex_read_arm(g_cb, v, 0u); tex_read_arm(g_cb, v, 1u);
+    tex_read_arm(g_cb, v, 0u, rl, st0); tex_read_arm(g_cb, v, 1u, rl, st0);
     to_layout(g_cb, v, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
     if (v->uploaded) atomic_fetch_add(&g_pkg_re, 1);   // 重传（游戏又写了这张）| a re-upload: the game wrote this one again
     v->uploaded = 1;

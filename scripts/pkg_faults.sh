@@ -102,7 +102,16 @@ if [ "$OLD" = 0 ]; then
   for p in "VkResult er = vkEndCommandBuffer" "VkResult cr = vkQueueSubmit" "VkResult wr = vkWaitForFences" "VkResult rr = vkResetFences"; do
     [ "$(grep -Fc "$p" commit.inc)" = 1 ] || { echo "【红】mtl_sub_commit 少了「$p」这条返回值判据"; exit 1; }
   done
-  echo "静态判据：sub_begin 闸门在位｜提交四条返回值都接住"
+  # ③ B 那半的行距不许写死 4 字节/像素：BC4/BC5/BC6H 软解出来是 1/2/8 字节，清单按 RGBA8 报行距，
+  #    离线剔 padding 就按错行去剔——产物没错、表错了，比出来的差异全是编的。
+  awk '/^static void tex_dump\(/{f=1}
+       f&&/uint32_t pb =/{ if ($0 ~ /\(uint64_t\)w \* 4u/) { print "【红】tex_dump 里 B 的行距写死成 4 字节/像素：非 RGBA8 的软解图清单会标错行距"; exit 1 } exit 0 }
+       f&&/^\}$/{exit}' "$S" || exit 1
+  # ④ 清单表头跟着「这张清单文件」走，不能跟着进程走：两个采集目录分开指时，第二个也得有自己的列名。
+  awk '/^static void p3_note\(/{f=1}
+       f&&/static int hdr_done/{print "【红】p3_note 的表头旗子又变回进程级：第二个目录的清单会没有列名"; exit 1}
+       f&&/^\}$/{exit}' "$S" || exit 1
+  echo "静态判据：sub_begin 闸门在位｜提交四条返回值都接住｜B 行距按 bpp 算｜清单表头按文件走"
 fi
 
 mkdir -p inc

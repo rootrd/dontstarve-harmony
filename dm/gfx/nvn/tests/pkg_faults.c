@@ -102,12 +102,36 @@ static int nvn_bc_decode(uint32_t f, const uint8_t *src, size_t pitch, uint32_t 
     if (dst) dst[0] = 0x5A;                  // 解码写出一个字节就够：这里判的是结局不是像素
     (void)w; (void)h; return 0;
 }
+// 取证三探针（A/B 落盘、整张落盘、读回挂账）：桩把「版本代号 / 层」记下来，C6 就判这两个身份
+// 在两条探针里是不是同一个（P3 的「同一版本、同一层」全靠这两个字段，名字错了整轮证据就作废）。
+// OLD 版还没有这些参数，桩跟着源码分两套：反例跑必须编得过，才能拿同一套断言判它红。
+static int n_dump, n_raw;
+static uint64_t d_stamp; static unsigned d_la, d_lvl;
+static uint64_t r_stamp; static unsigned r_la;
+#ifdef OLD
 static void tex_dump(uint64_t s, unsigned l, unsigned n, const void *a, size_t an, const void *b, size_t bn,
                      uint32_t w, uint32_t h, uint32_t rb, int nf, int vf, int soft) {
-    (void)s; (void)l; (void)n; (void)a; (void)an; (void)b; (void)bn; (void)w; (void)h; (void)rb; (void)nf; (void)vf; (void)soft;
+    (void)n; (void)a; (void)an; (void)b; (void)bn; (void)w; (void)h; (void)rb; (void)nf; (void)vf; (void)soft;
+    n_dump++; d_stamp = 0; d_la = 0; d_lvl = l; (void)s;
 }
-static void tex_dump_raw(const nvn_texdesc *d, uint64_t s, const void *m, size_t a) { (void)d; (void)s; (void)m; (void)a; }
-static void tex_read_arm(VkCommandBuffer cb, void *v, unsigned lvl) { (void)cb; (void)v; (void)lvl; n_readarm++; }
+static void tex_dump_raw(const nvn_texdesc *d, uint64_t s, const void *m, size_t a) { (void)d; (void)s; (void)m; (void)a; n_raw++; }
+static void tex_read_arm(VkCommandBuffer cb, void *v, unsigned lvl) { (void)cb; (void)v; (void)lvl; n_readarm++; r_stamp = 0; r_la = 0; }
+#else
+static unsigned g_dump_layer, g_read_layer;     // DM_TEXDUMP_LAYER / DM_TEXREAD_LAYER 的替身
+static void p3_layers(unsigned *dl, unsigned *rl) { *dl = g_dump_layer; *rl = g_read_layer; }
+static void tex_dump(uint64_t s, uint64_t stamp, unsigned l, unsigned la, unsigned n,
+                     const void *a, size_t an, const void *b, size_t bn,
+                     uint32_t w, uint32_t h, uint32_t rb, int nf, int vf, int soft) {
+    (void)s; (void)n; (void)a; (void)an; (void)b; (void)bn; (void)w; (void)h; (void)rb; (void)nf; (void)vf; (void)soft;
+    n_dump++; d_stamp = stamp; d_la = la; d_lvl = l;
+}
+static void tex_dump_raw(const nvn_texdesc *d, uint64_t s, uint64_t stamp, const void *m, size_t a) {
+    (void)d; (void)s; (void)stamp; (void)m; (void)a; n_raw++;
+}
+static void tex_read_arm(VkCommandBuffer cb, void *v, unsigned lvl, unsigned la, uint64_t stamp) {
+    (void)cb; (void)v; (void)lvl; n_readarm++; r_stamp = stamp; r_la = la;
+}
+#endif
 static void up_probe(const char *t, const uint8_t *p, uint64_t n, uint32_t w, uint32_t h, int tally) {
     (void)t; (void)p; (void)n; (void)w; (void)h; (void)tally;
 }
@@ -190,6 +214,10 @@ static void mk(vktex *v, uint64_t ser, uint64_t img, uint32_t w, uint32_t h, uin
 static void clearday(void) {
     memset(g_pkg_pend, 0, sizeof g_pkg_pend); g_pkg_pend_n = 0;
     ncopy = n_enter = n_drop = n_result = n_queued = n_layout = n_readarm = n_protect = n_mkbuf = 0;
+    n_dump = n_raw = 0; d_stamp = r_stamp = 0; d_la = d_lvl = r_la = 0;
+#ifndef OLD
+    g_dump_layer = g_read_layer = 0;   // 探针默认第 0 层：上一条指到别层的，到这儿得擦回去
+#endif
     g_geom_fail_lvl = g_dz_fail_lvl = g_geom_fail_layer = g_dz_fail_layer = -1; g_dec_fail = 0;
     g_bcok = 1; g_tracked = 1; g_skip = 0;
     g_rowb = 1024; g_rows = 8; g_sl = 1; g_base_step = 1024 * 8; g_bpb = 4; g_bw = g_bh = 1;
@@ -619,6 +647,39 @@ int main(void) {
     }
 #else
     { checks++; fails++; printf("【红】旧版没有逐项映射表：统计全靠位置一一对应，第 40 轮那次串位就是这么漏的\n"); }
+#endif
+
+    // ⑯ P3 取证身份：CPU 落盘、整张落盘、GPU 读回三条证据必须钉在「同一个版本、同一层」上。
+    // 版本代号或层号只要有一条错，离线联判就会把上一世的 CPU 字节配到这一世的读回上——四张产物看着齐全，结论全是假的。
+    // The three capture probes must agree on which version and which layer they sampled; one wrong tag pairs a CPU buffer
+    // from one upload with a GPU readback from another and the whole round's evidence is silently void.
+    casebeg("P3-1 落盘/读回带同一个版本代号，重传后代号前进，层号两边一致");
+    clearday(); mk(&g_v, 80, 0x800, 256, 128, 2, 1, 0); g_v.uploaded = 1; g_v.pkg_dirty = 1;
+    pkg_queue(&g_v); pkg_flush();
+    ck("A/B 落了盘", n_dump, 2);                       // 级 0、1 各一次，第 2 级不留（省盘，也免得离线误配对）
+    ck("整张落了盘", n_raw, 1);
+    ck("落盘带版本代号", d_stamp != 0, 1);
+    ck("读回带版本代号", r_stamp != 0, 1);
+    ck("两条探针同一个版本", d_stamp == r_stamp, 1);
+    ck("产物代号=资源在册的那一世", d_stamp == g_v.pkg_stamp, 1);
+    ck("默认落第 0 层（落盘）", d_la, 0);
+    ck("默认落第 0 层（读回）", r_la, 0);
+    ck("落盘到最高那级为止", d_lvl, 1);
+    uint64_t first_stamp = d_stamp;
+    clearday(); g_v.pkg_dirty = 1;                     // 游戏又写了这页 ⇒ 再来一世，代号必须前进
+    pkg_queue(&g_v); pkg_flush();
+    ck("重传后代号变了", (long long)(d_stamp != first_stamp && d_stamp != 0), 1);
+#ifndef OLD
+    {
+        clearday(); mk(&g_v, 81, 0x810, 256, 128, 2, 2, 0); g_v.uploaded = 1; g_v.pkg_dirty = 1;
+        g_dump_layer = 1; g_read_layer = 1;            // DM_TEXDUMP_LAYER=1 DM_TEXREAD_LAYER=1
+        pkg_queue(&g_v); pkg_flush();
+        ck("开关指到哪层就落哪层（落盘）", d_la, 1);
+        ck("开关指到哪层就采哪层（读回）", r_la, 1);
+        ck("指层后只落那一层", n_dump, 2);
+    }
+#else
+    { checks++; fails++; printf("【红】旧版探针不带版本代号/层号：ATLAS 之外没人知道这四张产物是不是同一世\n"); }
 #endif
 
     printf("\n== 断言 %d 条｜红 %d 条\n", checks, fails);
