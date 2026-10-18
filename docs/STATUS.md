@@ -22,7 +22,10 @@ old labels:
 ```
 
 The `246` in the old line was `BC层` (soft-decode layer count), not arena rejections; `卡arena`
-was 0 in that round. [BLOCKERS.md](BLOCKERS.md#1-the-flat-green-ground-the-only-functional-blocker)
+was 0 in that round. The pack line has since been rebuilt as a 24-entry label table (see
+[DM-SWITCHES.md](DM-SWITCHES.md#reading-the-output) for the current field list), so **do not decode a
+round taken before that change with today's labels, or a round taken after it with the sample above**.
+[BLOCKERS.md](BLOCKERS.md#1-the-flat-green-ground-the-only-functional-blocker)
 lists what each probe can and cannot prove.
 
 World generation takes **2m20s** on the phone (`00:05:34` shard start → `00:07:54 Done forest map gen!`) against roughly 20–40 s on the original. That is the global-lock serialisation of SVCs, i.e. the performance branch, not a blocker.
@@ -51,7 +54,10 @@ World generation takes **2m20s** on the phone (`00:05:34` shard start → `00:07
 ## Technical debt (does not block features, must be paid before "done")
 
 - The lost-wakeup **root cause** is unfixed; a spurious-wake fallback (`DM_SPUR`) stands in for it. Removing that fallback today returns you to "stuck on starting server".
-- Pack staging **solved in the tree, not yet device-measured**: packaged textures stage on their own 160 MB ring (`BIG_STAGE_SZ`), the arena keeps only the vertex stream and `BufferToTexture`, and a ring that is full for this submission is a *retryable* exhaustion instead of a permanent `pkg_bad`. The old failure mode was pack staging and the vertex stream sharing one 64 MB arena.
+- Pack staging **solved in the tree, not yet device-measured**: packaged textures stage on their own 160 MB ring (`BIG_STAGE_SZ`), the arena keeps only the vertex stream and `BufferToTexture`, and a refusal is now one of four graded outcomes (`STG_HEAD` / `STG_OVER` / `STG_NOBUF` / `STG_OK`) with a backoff window behind it — none of them may set `pkg_bad`, so a texture that does not fit this submission waits instead of being written off forever. Size arithmetic is checked (`pkg_mul_ok` / `pkg_add_ok`); an overflow is a counted FATAL, never a wrapped number. The old failure mode was pack staging and the vertex stream sharing one 64 MB arena, and the old code treated any refusal as permanent.
+- Upload request identity and lifetime **solved in the tree, same caveat**: the queue holds a ticket (pointer + serial + image handle + generation it was born in), so a swap-remove in `g_tex` cannot make one texture's request land on another; a revive resets the previous life's upload accounting; `tex_release` hands handles to a deferred-destroy graveyard and only frees them once a submission has passed them. "Success" now means every mip and layer was reserved and copied — a partial plan records nothing.
+- Evidence chain **solved in the tree, same caveat**: readback got the missing layout transitions/ barriers and a per-chunk TGA offset fix, the pack statistics are label-adjacent, and `DM_TEXREAD` reads an uploaded `VkImage` back off the GPU so "bytes landed wrong" and "binding/UV wrong" are separable on the phone.
+- Verified offline, not yet on the phone: the three items above were checked by a fault-injection harness (`scripts/pkg_faults.sh` + `dm/gfx/nvn/tests/pkg_faults.c`) that `awk`-extracts the production bodies verbatim and runs them against stubs on the host — **176 assertions, 0 red** under ASan+UBSan, and the same assertions against the pre-fix commit `6a4def6` give **46 red**, so they bite the defects. Details in [BLOCKERS.md](BLOCKERS.md#3-pack-staging-vs-the-vertex-stream--code-fixed-round-pending).
 - Untracked-range dirty reporting **solved in the tree, same caveat**: `pkg_tracked` records at upload whether the pool range is inside the dirty table, and the bind-time check skips untracked ranges. With `MAX_RANGE 4096` really being hit, the old behaviour meant re-uploading on every bind.
 - No `lstat` fast path in the path mapper: the first lookup walks a whole directory.
 - The HarmonyOS port layer (`dm/ohos/`, `dm/gfx/nvn/nvn_vulkan.c`, `hle_ipc.c`, `hle_stdio.c`) had **never been committed** until this repository was created. If you fork from here, that is the moment the history starts. Until 2026-10-18 the published file was an older snapshot than the build that runs on the phone; the tree now matches the device build modulo comment sanitisation.

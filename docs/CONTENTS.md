@@ -25,6 +25,7 @@ These are records of **facts about** a console API or about our own code — not
 | `dm/gfx/nvn/nvn_shbin.h`, `nvn_sh_tri.h` | 6 KB | SPIR-V for **our own** full-screen present triangle | Generated with `glslang` from our own GLSL; nothing to do with the game |
 | `dm/third_party/**` | 4.8 MB | `libdeflate`, `bcdec`, `flip`, `stb`, and a subset of Ryujinx's shader decoder | Third-party open source, each with its own licence file in place |
 | `dm/host/*.c`, `dm/gfx/**/*.c`, `dm/ohos/*` | ~5 MB | our code | the port |
+| `scripts/**`, `dm/gfx/nvn/tests/pkg_faults.c` | ~110 KB | build/pack helpers plus the host-side fault-injection test for the upload path | `scripts/pkg_faults.sh` extracts the production bodies and asserts them on a plain Linux host — it is how the "verified offline" numbers in [STATUS.md](STATUS.md) can be re-produced without a phone |
 | `docs/screens/*.jpg` | ~300 KB | two screenshots of this port running | they are the status. Everything else about the state is text |
 
 ### About the inherited documentation and tools

@@ -56,6 +56,8 @@ hdc shell aa start -a EntryAbility -b <bundleName> \
 | `DM_VK_TEXTRACE_FROM` | present count | optional start frame, default 0; budgets renew every 60 presents |
 | `DM_TEXDUMP` | `0`/`1` | per-texture upload dump (turn off in diagnostic rounds; it is verbose) |
 | `DM_RBIMG` | `0`/`1` | readback image capture |
+| `DM_TEXREAD` | absolute directory | after a texture is uploaded, copy the **VkImage itself** back off the GPU into this directory. This is the switch that distinguishes "the bytes landed wrong in the image" from "the bytes are right and the binding/UV is wrong". Must be outside `DM_SAVE`; output is capped (400 images, 4 per frame) |
+| `DM_TEXREAD_MIN` | pixel count | ignore textures under this many pixels — serial numbers are per-process, so without a floor the budget is spent on menu icons before the world is entered |
 | `DM_3D_SCALE`, `DM_3D_SCALE_DYN` | float | internal resolution scaling experiments |
 | `DM_FLK` | mask | flicker/flat-fill detector — the line `[vk] 闪 …` fires on content change and reports brightness, source, and whether the texture was attached/uploaded/drawn |
 
@@ -76,7 +78,7 @@ The host's log lines are bilingual and terse by design; the statistics lines are
 |---|---|
 | `[vk] 上屏绑定 真N 哑M` | bindings on the on-screen pass: real / dummy |
 | `[vk] 已画未上传绑定 N` | bindings with uploaded=0 AND drawn=1; includes normal render targets; not an empty-atlas count |
-| `[vk] ｜打包:尝试图A 上B 重C 成D MB BC层E 卡环F 越界G 解排H 格式I 深度J 三维K 环拒L 环成M` | pack upload: distinct textures that reached `pkg_upload` / uploads / re-uploads / MB moved / BC decode layers / **staging-ring refusals** / out-of-range / decode queue / format / depth / 3D / ring refusal reports (first 8 logged) / textures staged on the ring |
+| `[vk] ｜打包:尝试图A 上B 重C 成MBD BCE 卡环F 越界G 解排H 格式I 深度J 三维K 环拒L 环成M 队满N 换位O 超表P 溢出Q 余不R 超容S 无环T 退避U 队龄V 重开W 串线X` | pack upload path. Every label is printed from one table entry that sits next to its own counter (`g_pkg_stat`), so a field cannot take its neighbour's number — the old hand-written argument list is what let round 40 publish a mis-read statistic. `余不` = no headroom left in this submission (retryable, and the only refusal that stops the whole flush), `超容` = this image is larger than the entire ring, `无环` = the ring could not be allocated, `退避` = skipped while parked in a backoff window, `队龄` = queued 32 generations without landing, `重开` = `sub_begin` re-entered while a buffer was still open, `串线` = begin and commit ran on different threads |
 | `[vk] ｜哑因:没图A 空图B 深度非影C 影子给颜色D 强退哑图E｜影子真深度F 已画未上传绑定G｜采空时兄弟有货H 谁都没货I` | why a sample read a dummy: no image / empty texture / depth misuse / shadow-to-colour / forced dummy / shadow real depth / drawn-not-uploaded bindings / sibling had content at sample time / nobody did |
 | `[vk] 源图 s<S> 图<I> 格<G> WxH 画过D 传过U` | one-time identity line per texture serial |
 | `[vk] 程序首绑 <key> 绑定: …` | first binding set of each shader program, with `w/h/fmt/uploaded/drawn/bad/tried/range/L/pool` per image |

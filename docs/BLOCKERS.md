@@ -84,13 +84,29 @@ onto a full arena and died on the first `stage_take` — and because exhaustion 
 failure, `pkg_bad` was set and those textures were never retried. Terrain drew `u0` flat green.
 
 Now in the tree: packaged staging always uses the dedicated 160 MB ring (`BIG_STAGE_SZ`), the arena
-keeps only the vertex stream and `BufferToTexture`, and `stag_exh` separates "this submission has no
-room" (retry next submission, when the cursor resets) from a real decode error. Whole-image-or-nothing
-is unchanged: a texture reserves its full footprint or moves nothing. Stats fields are renamed
-`卡环 / 环拒 / 环成`.
+keeps only the vertex stream and `BufferToTexture`, and `stage_begin` returns four distinct outcomes
+instead of a bool — `STG_HEAD` (this submission has no room left: stop the batch, retry when the
+cursor resets), `STG_OVER` (this one image is bigger than the whole ring), `STG_NOBUF` (the ring could
+not be allocated at all), `STG_OK`. None of them may become a permanent `pkg_bad`: `pkg_backoff` parks
+the texture for `1 << min(rej, 6)` submissions (x16 for `STG_OVER`/`STG_NOBUF`) and records why in
+`pkg_why`, so a transient refusal costs a delay, not the texture. `pkg_flush` additionally caps one
+pass at 256 textures and applies a fairness valve (age >= 128 drops a ticket so it cannot starve the
+rest of the queue), keeps the un-flushed tail on refusal, and every size computation goes through
+`pkg_mul_ok` / `pkg_add_ok` so an overflow is counted (`ovfl`) and fatal instead of silently wrapping.
+Whole-image-or-nothing is unchanged: a texture reserves its full footprint or moves nothing.
+Stats moved to a 24-entry label table (`g_pkg_stat`), printed as `head=… over=… nobuf=… bkoff=…`
+per item — read the label of the field you quote, the previous `卡环 / 环拒 / 环成` line is gone.
 
-What the next device round has to answer: whether `环成` now counts the terrain atlases through, and
-whether `环拒` stays near zero. If `环拒` climbs instead, the ring is the constraint and the fix is
+**Host receipt for this batch** — reproducible with `scripts/pkg_faults.sh` (it `awk`-extracts the
+production bodies out of `nvn_vulkan.c` verbatim, compiles them against the injectable stubs in
+`dm/gfx/nvn/tests/pkg_faults.c`, and runs the matrix on the host): 176 assertions, 0 red under
+ASan+UBSan; `NEG=6a4def6 scripts/pkg_faults.sh` runs the same assertions against the pre-fix commit and
+gives 125 assertions, 46 red, so the tests demonstrably bite the defects rather than the stubs.
+`make -f dm/ohos/Makefile sweep` = `ok=89 fail=0`, and
+`-Werror=format -Werror=format-extra-args` is clean.
+
+What the next device round has to answer: whether `bigok` now counts the terrain atlases through, and
+whether `head` stays near zero. If `head` climbs instead, the ring is the constraint and the fix is
 the per-submission cursor policy, not the decode path. Related: the `pkg_tracked` item in
 [STATUS.md](STATUS.md#technical-debt-does-not-block-features-must-be-paid-before-done).
 
