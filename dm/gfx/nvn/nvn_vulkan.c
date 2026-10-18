@@ -106,6 +106,9 @@ static int g_skip;            // DM_VK_SKIP 位图（定位驱动侧故障用，
                               // 1024 = the present pass only clears - no full-screen triangle draw
 static int g_red_once;
 static int g_sub_tid, g_pres_tid;   // 现场：游戏提交与出图各自的 OS 线程号（-1 = 该入口在多个线程上出现过）
+static int g_cb_tid;                 // 当前这条命令缓冲是哪个线程开的：命令池不是线程安全对象
+static _Atomic int g_dead;           // device lost / 栅栏等不完 ⇒ 明确停机，不再录也不再装作提交成功
+static _Atomic uint64_t g_sub_reenter, g_sub_race;   // 重复 begin（游标本不该清）｜跨线程接手同一条缓冲
                                     // Tids of the game submission path and the present path (-1 = seen on more than one thread)
 #define GRED_MAX 200          // 红线上限：一次真机排查要打现场，12 条不够用 | fault lines: 12 was too few to see the whole scene
 // 标记用 ASCII 的 [red]：hilog 落盘后中文串在本机 grep 不可靠，纯 ASCII 才捞得到
@@ -115,6 +118,12 @@ static void tri_invalidate(void);   // 定义在下面：交换链重建会让 g
 static int host_writable(const void *p);   // 定义在下面：mincore 逐页判可读（探针要读游戏给的控制段）| defined below: per-page mincore readability, the probe reads control segments handed over by the game
 static void vk_probe_dump(void);   // 定义在下面：op 直方图 + 着色器键汇总 | defined below: op histogram + shader key summary
 static int vk_ensure(void);   // 见文件末尾：惰性起层 | see the bottom of the file: lazy boot
+
+// 圈暂存的结局要分档：「本提交余量不足」等游标清零就有救（也是唯一该让整趟冲刷停手的一种，因为后面的每张只会更挤）；
+// 「单图比整条环还大」不是等一代能解的，但没有实测证据前既扩环也不判死；「环建不起来」是分配失败，重试得更慢。
+// Four distinct outcomes; only headroom says "stop the whole flush", and none of them may turn into a permanent pkg_bad.
+// 定义在文件最前：C 的 enum 不能前置声明，而 tex_get 的复活点（本文件靠前处）与暂存环那一节都要读它。
+enum { STG_OK = 0, STG_HEAD = 1, STG_OVER = 2, STG_NOBUF = 3 };
 static void vk_read_limits(void);        // 定义在 M2-3b 段：起层后读实测上限 | defined in the M2-3b block: read the measured limits after boot
 static void mtl_sub_reset_draw(void);    // 定义在 M2-3b 段：换提交清 arena / 描述符 / 顶点流 | defined in the M2-3b block: a new submission starts empty
 static void draw_stats_line(char *line, int m, int cap);   // 定义在 M2-3b 段：绘制重放计数 | defined in the M2-3b block: replay counters
@@ -184,7 +193,10 @@ typedef struct {
     int pkg_dirty;                       // 池里这张图的页在上传后被动过：等通道外重传 | the pool pages moved after the upload - re-upload outside the pass
     int pkg_stale;                       // 这张在池里的位置上一世传过，游戏又在同一块字节上重新 Initialize：显存里那份是旧数据，用之前得重传
                                          // This pool spot was uploaded in a previous life and the game re-initialized over it: the device copy is stale
-    int pkg_rej;                         // 暂存圈不到几次了：连拒 8 次就不再排队（不置 pkg_bad 是为了让「下次提交游标清零」有机会救它）| staging refusals - after 8 give up, while still allowing a later submission to win
+    int pkg_rej;                         // 圈不到的次数：只用来定退避步长，不再是判死门槛（P1 已拆掉「拒 8 次置 bad」）
+                                         // Refusals now only size the backoff - it is no longer a give-up threshold
+    uint64_t pkg_next;                   // 退避到哪一代提交才再试：窗口里连几何都不量（P2「长期无空间不忙等」）
+    int pkg_why;                         // 最近一次圈不到属于哪一档（STG_*）：环满就整趟停手、队尾请求原样留着
     uint64_t ph_st, ph_last;             // 比池内容是在第几拍出图 / 那次的哈希：缺页钩子在 OHOS 上不响，改按内容比对判脏
                                          // Which present we last compared this texture's pool bytes, and that hash: the write-protect fault stays silent on OHOS, so dirtiness comes from comparing content
     uint64_t vk_bytes;                   // vkGetImageMemoryRequirements 给的这块显存大小（回收站按它算预算）
@@ -309,14 +321,46 @@ static int tex_same_store(const vktex *v, const tex_t *t)
            memcmp(&v->d.d, &t->d, sizeof t->d) == 0 && v->d.L.layers == t->L.layers;
 }
 
-// 只销毁 Vulkan 对象，槽位由调用方摘（memset 与 g_tex_n 收缩都得由知道自己在表哪一格的人做）
-// Destroys only the Vulkan objects; the caller removes the slot, since only it knows where the entry sits
-static void tex_destroy(vktex *v)
+// 延迟销毁：释放发生在「命令还在录」的中间，这张图可能还挂在尚未提交的 g_cb 里，Vulkan 不许销毁被未跑完的
+// 提交引用的对象。本层每条提交都在 mtl_sub_commit 里 vkWaitForFences 等完，所以「进坟场时那一代号被等过」
+// 就等于引用它的命令全跑完了——晚一代再毁，不引入 DXVK 那套引用计数。
+// Retire one submission generation behind: mtl_sub_commit waits every fence, so a smaller generation means the
+// submission that recorded the reference has already completed.
+typedef struct { VkImage img; VkImageView view; VkDeviceMemory mem; uint64_t gen; } grave_t;
+#define GRAVE_N 512
+static grave_t g_grave[GRAVE_N];
+static int g_grave_n;
+
+static void grave_kill(const grave_t *g)
 {
-    if (v->view) vkDestroyImageView(g_dev, v->view, NULL);
-    if (v->img) vkDestroyImage(g_dev, v->img, NULL);
-    if (v->mem) vkFreeMemory(g_dev, v->mem, NULL);
-    v->view = (VkImageView)0; v->img = (VkImage)0; v->mem = (VkDeviceMemory)0;
+    if (g->view) vkDestroyImageView(g_dev, g->view, NULL);
+    if (g->img) vkDestroyImage(g_dev, g->img, NULL);
+    if (g->mem) vkFreeMemory(g_dev, g->mem, NULL);
+}
+
+// vk_bytes 不动：回收站按它算预算（调用方自己会减），这里只把句柄的所有权接过来
+static void tex_retire(vktex *v)
+{
+    if (!v->img && !v->view && !v->mem) return;
+    if (g_grave_n >= GRAVE_N) {   // 堆到顶还没等过一次提交：先毁最老的（它等得最久，多半早跑完了）
+        static int said;
+        if (!said++) GVL("[vk] 坟场堆满 %{public}d 张，开始提前销毁（说明这一代号迟迟没等完提交）", GRAVE_N);
+        grave_kill(&g_grave[0]);
+        memmove(g_grave, g_grave + 1, (size_t)(GRAVE_N - 1) * sizeof g_grave[0]);
+        g_grave_n--;
+    }
+    g_grave[g_grave_n++] = (grave_t){ v->img, v->view, v->mem, g_fence_val };
+    v->img = (VkImage)0; v->view = (VkImageView)0; v->mem = (VkDeviceMemory)0;
+}
+
+static void grave_reap(void)
+{
+    int k = 0;
+    for (int i = 0; i < g_grave_n; i++) {
+        if (g_grave[i].gen < g_fence_val) grave_kill(&g_grave[i]);   // 那一代已等完栅栏
+        else g_grave[k++] = g_grave[i];
+    }
+    g_grave_n = k;
 }
 
 // 回收站进：这一世的状态整份搬进去（含已上传的像素、脏页戳与只读保护范围），下一世同身份拿来就能用
@@ -329,7 +373,7 @@ static int recy_put(const vktex *v)
         uint64_t best = ~(uint64_t)0;
         for (int i = 0; i < g_recy_n; i++) if (g_recy[i].recy_seq < best) { best = g_recy[i].recy_seq; k = i; }
         if (k < 0) return 0;                       // 这张自己就超预算：不收，照旧销毁
-        tex_destroy(&g_recy[k]);
+        tex_retire(&g_recy[k]);
         g_recy_bytes -= g_recy[k].vk_bytes;
         g_recy_lost++;
         g_recy[k] = g_recy[--g_recy_n];
@@ -1092,6 +1136,12 @@ static vktex *tex_get(const tex_t *t)
         g_recy[i] = g_recy[--g_recy_n];
         memset(&g_recy[g_recy_n], 0, sizeof g_recy[g_recy_n]);
         v->serial = t->serial; v->d = *t; v->recy_seq = 0; v->sibchk = v->sib = 0;
+        // 回收站搬来的是上一世整个结构体：bad/rej/tried 是那一世的失败与尝试账，留着它这张新世一上来就被
+        // pkg_queue 挡在门外（uploaded=0 且 bad=1 从此不再试）。脏/陈旧也归零，由 tex_new_life 按新身份重判。
+        // Revival copies the previous life's whole struct: clear its failure bookkeeping or pkg_bad carries over and
+        // this life never attempts an upload again.
+        v->pkg_bad = 0; v->pkg_rej = 0; v->pkg_tried = 0; v->pkg_next = 0; v->pkg_why = STG_OK;
+        v->pkg_dirty = 0; v->pkg_stale = 0;
         tex_new_life(v);
         g_tex_revive++;
         g_tex_gen++; g_sets_valid = 0;   // 缓存的集子里这一槽还指着哑图：作废，下一笔重新绑真视图
@@ -1451,7 +1501,7 @@ void mtl_tex_release(tex_t *t)
         // Park it in the bin instead of destroying: DST finalizes and re-initializes the same pool storage every frame, so keeping the
         // allocation and its pixels lets the next life with the same identity come back already filled, not empty-on-its-first-frame.
         if (!(g_skip & 65536) && recy_put(v)) { /* 句柄归回收站 */ }
-        else tex_destroy(v);
+        else tex_retire(v);   // 不当场销毁：本条提交里已录的命令还指着它
         g_tex_n--;
         if (i != g_tex_n) g_tex[i] = g_tex[g_tex_n];
         memset(&g_tex[g_tex_n], 0, sizeof g_tex[g_tex_n]);
@@ -1482,6 +1532,8 @@ static void to_layout(VkCommandBuffer cb, vktex *v, VkImageLayout want)
     case VK_IMAGE_LAYOUT_DEPTH_ATTACHMENT_OPTIMAL:
                                            src_stage = VK_PIPELINE_STAGE_EARLY_FRAGMENT_TESTS_BIT | VK_PIPELINE_STAGE_LATE_FRAGMENT_TESTS_BIT;
                                            src_acc   = VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_READ_BIT | VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT; break;
+    case VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL:
+                                           src_stage = VK_PIPELINE_STAGE_TRANSFER_BIT; src_acc = VK_ACCESS_TRANSFER_READ_BIT; break;
     case VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL:
                                            src_stage = VK_PIPELINE_STAGE_TRANSFER_BIT; src_acc = VK_ACCESS_TRANSFER_WRITE_BIT; break;
     case VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL:
@@ -1494,6 +1546,7 @@ static void to_layout(VkCommandBuffer cb, vktex *v, VkImageLayout want)
     }
     switch (want) {
     case VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL:
+                                           dst_stage = VK_PIPELINE_STAGE_TRANSFER_BIT; dst_acc = VK_ACCESS_TRANSFER_READ_BIT; break;
     case VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL:
                                            dst_stage = VK_PIPELINE_STAGE_TRANSFER_BIT; dst_acc = VK_ACCESS_TRANSFER_WRITE_BIT; break;
     case VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL:
@@ -1845,36 +1898,80 @@ static void cb_begin(void)
     vkBeginCommandBuffer(g_cb, &bi);
 }
 
+// 一提交一命令缓冲：只有手上没有开着的缓冲时，才允许开新的并清游标。
 void mtl_sub_begin(void)
 {
-    if (!vk_ensure()) return;
+    if (!vk_ensure() || atomic_load(&g_dead)) return;   // 停机中：不再录，也不再清游标、推进代号
+    int tid = (int)syscall(SYS_gettid);
+    if (g_cb) {
+        // 一提交一命令缓冲：缓冲还开着就又 begin，说明上一趟没 commit。这时候绝不能清游标——
+        // arena 与 160 MB 环里那些字节已经被录进这条缓冲的 copy 了，清零就是让下一张贴图覆盖它们。
+        // A re-entrant begin must NOT rewind the staging/arena cursors: recorded copies still point into them.
+        atomic_fetch_add(&g_sub_reenter, 1);
+        if (g_cb_tid && g_cb_tid != tid) atomic_fetch_add(&g_sub_race, 1);
+        static int said;
+        if (!said++) GVL("[vk] 重复 sub_begin：开缓冲 tid=%{public}d 这次 tid=%{public}d｜游标保持不清", g_cb_tid, tid);
+        return;
+    }
+    g_cb_tid = tid;
+    if (!g_sub_tid) g_sub_tid = tid;
+    else if (g_sub_tid != tid) g_sub_tid = -1;
     memset(g_buf_ops, 0, sizeof g_buf_ops);
     cb_begin();
-    mtl_sub_reset_draw();   // 一次提交 = arena 换一代、描述符池清空 | one submission = a fresh arena generation and an emptied descriptor pool
+    mtl_sub_reset_draw();   // 只有真开出一条新缓冲才算换一代：游标随这条命令缓冲一起作废 | a fresh generation needs a fresh buffer
 }
 
 void mtl_sub_index(const uint64_t *h, int n) { (void)h; (void)n; }
 void mtl_exec_rest(const uint64_t *handles, int n) { (void)handles; (void)n; }
 
+// device lost / 栅栏等不完：明确停机。这里不实现整套恢复（那是外层重建实例与设备的事），但绝不许
+// 「照常释放命令缓冲、照常清环、照常把代号当成已完成」——那会把一次设备丢失变成整轮解释不清的错。
+static void vk_dead(const char *where)
+{
+    if (atomic_exchange(&g_dead, 1)) return;
+    GRED("Vulkan 设备丢失（%{public}s）：重放层停机，不再录也不再提交，恢复要由外层重建设备", where);
+}
+
 uint64_t mtl_sub_commit(void)
 {
-    if (!vk_ensure()) return ++g_fence_val;
+    if (!vk_ensure() || atomic_load(&g_dead)) return g_fence_val;
     // 谁在提交：命令池 g_cp 不是线程安全对象，出图和游戏若落在两个线程上，同池分配就是竞争
     // Who submits: the command pool g_cp is not thread-safe, so allocating from it on two threads (game + present) is a race.
     int tid = (int)syscall(SYS_gettid);
     if (!g_sub_tid) g_sub_tid = tid;
     else if (g_sub_tid != tid) { g_sub_tid = -1; }
+    // 命令池 g_cp 不是线程安全对象：开缓冲的和提交的不是同一个线程，就是同一个池被两个人动。
+    if (g_cb && g_cb_tid && g_cb_tid != tid) {
+        atomic_fetch_add(&g_sub_race, 1);
+        static int rsaid;
+        if (!rsaid++) GVL("[vk] 提交线程 %{public}d 与开缓冲线程 %{public}d 不同", tid, g_cb_tid);
+    }
     pass_end();
     if (g_skip & 256) { if (!g_cb) return ++g_fence_val;   // 位 256 = 游戏这条提交整个不上 GPU：连空缓冲都不飞（出图单独背锅时用）
-        vkEndCommandBuffer(g_cb); vkFreeCommandBuffers(g_dev, g_cp, 1, &g_cb); g_cb = NULL; return ++g_fence_val; }
+        vkEndCommandBuffer(g_cb); vkFreeCommandBuffers(g_dev, g_cp, 1, &g_cb); g_cb = NULL; g_cb_tid = 0; return ++g_fence_val; }
     if (!g_in_pass && g_cb) pkg_flush();   // 没有通道收尾时也要冲刷：这批图不搬就永远停在哑图 | flush even when no pass closed - otherwise these images stay dummies forever
     if (!g_cb) return ++g_fence_val;
-    if (vkEndCommandBuffer(g_cb) != VK_SUCCESS) { GRED("vkEndCommandBuffer 失败"); g_cb = NULL; return ++g_fence_val; }
+    VkResult er = vkEndCommandBuffer(g_cb);
+    if (er != VK_SUCCESS) {
+        // 这条缓冲根本没录成，也没有栅栏被等过：代号不许前进（前进就意味着坟场可以收尸、环可以复用）
+        GRED("vkEndCommandBuffer = %{public}d (%{public}s)：这条缓冲作废", (int)er, vr(er));
+        if (er == VK_ERROR_DEVICE_LOST) vk_dead("vkEndCommandBuffer");
+        vkFreeCommandBuffers(g_dev, g_cp, 1, &g_cb); g_cb = NULL; g_cb_tid = 0;
+        return g_fence_val;
+    }
     VkSubmitInfo si = { VK_STRUCTURE_TYPE_SUBMIT_INFO };
     si.commandBufferCount = 1;
     si.pCommandBuffers = &g_cb;
     VkResult cr = vkQueueSubmit(g_q, 1, &si, g_fence);
-    if (cr != VK_SUCCESS) { GRED("游戏提交 = %{public}d (%{public}s)｜tid %{public}d", (int)cr, vr(cr), g_sub_tid); buf_ops_dump("游戏提交"); }
+    if (cr != VK_SUCCESS) {
+        // 栅栏压根没被递交出去：再等它就是无条件无限等一个永远不会 signaled 的对象。
+        // 改前这里只打一行红字就继续往下等——第 49 轮那类挂死就是这个形状。
+        GRED("游戏提交 = %{public}d (%{public}s)｜tid %{public}d：不等这条栅栏，作废缓冲", (int)cr, vr(cr), g_sub_tid);
+        buf_ops_dump("游戏提交");
+        if (cr == VK_ERROR_DEVICE_LOST) vk_dead("vkQueueSubmit");
+        vkFreeCommandBuffers(g_dev, g_cp, 1, &g_cb); g_cb = NULL; g_cb_tid = 0;
+        return g_fence_val;
+    }
     g_submits++;
     // 先等栅栏、再 reset、最后才回收命令缓冲。两条都是硬规定：
     //   · 缓冲还在飞就 vkFreeCommandBuffers（VUID-vkFreeCommandBuffers-pCommandBuffers-00065）会把池里正在用的内存放回空闲链，
@@ -1884,11 +1981,25 @@ uint64_t mtl_sub_commit(void)
     // hands memory the driver is using back to the pool's free list, and the next allocation reuses it - invisible while only one stream
     // runs, fatal once the game and the present both do (that is rounds 49/51/57/58/59's present = -4). And g_fence had never been reset,
     // so every submit after the first reused a signaled fence.
-    vkWaitForFences(g_dev, 1, &g_fence, VK_TRUE, UINT64_MAX);
-    vkResetFences(g_dev, 1, &g_fence);
+    VkResult wr = vkWaitForFences(g_dev, 1, &g_fence, VK_TRUE, UINT64_MAX);
+    if (wr != VK_SUCCESS) {
+        // 等不完就什么都不许做：命令还在这条缓冲里飞，free 它（VUID-vkFreeCommandBuffers-pCommandBuffers-00065）
+        // 比慢一帧严重得多；代号也不许前进，前进在这层里等于「上面那批拷贝都落地了」。
+        GRED("vkWaitForFences = %{public}d (%{public}s)：不释放缓冲、不清环、不标完成", (int)wr, vr(wr));
+        if (wr != VK_TIMEOUT) vk_dead("vkWaitForFences");
+        return g_fence_val;
+    }
+    VkResult rr = vkResetFences(g_dev, 1, &g_fence);
+    if (rr != VK_SUCCESS) {   // 还能 reset 掉才说明这条栅栏真的空了；reset 不掉就是有人在用，下一次提交会撞上 00064
+        GRED("vkResetFences = %{public}d (%{public}s)：栅栏状态不干净，停机", (int)rr, vr(rr));
+        vk_dead("vkResetFences");
+        return g_fence_val;
+    }
     vkFreeCommandBuffers(g_dev, g_cp, 1, &g_cb);
     g_cb = NULL;
+    g_cb_tid = 0;
     g_fence_val++;
+    grave_reap();   // 上一代的命令这下都跑完了：把坟场里那一代的句柄真销毁
     return g_fence_val;
 }
 
@@ -1907,6 +2018,39 @@ static uint64_t g_rb_cap; static uint32_t g_rb_w, g_rb_h; static uint64_t g_rb_s
 static int g_rb_skip_said;
 
 static int mk_hostbuf(uint64_t size, uint32_t usage, VkBuffer *b, VkDeviceMemory *m, void **map);   // 定义在下面 | defined below
+static void tex_read_report(void);   // 同上：上传后读回的 VkImage 落盘 | same, see the DM_TEXREAD block below
+
+// 读回缓冲的执行依赖：这次 transfer 写要排在 CPU 读之前。等栅栏只证明提交跑完了，缓冲屏障才是
+// 把「传输写 → 主机读」这条依赖声明给驱动；HOST_COHERENT 免的是显式缓存维护，不免这条。
+// A fence proves the submission finished; the buffer barrier is what orders the transfer write ahead of the host read.
+// Coherent memory skips the cache flush, not this dependency.
+static void rb_host_dep(VkCommandBuffer cb, VkBuffer b, uint64_t size)
+{
+    VkBufferMemoryBarrier bb = { VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER };
+    bb.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+    bb.dstAccessMask = VK_ACCESS_HOST_READ_BIT;
+    bb.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    bb.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    bb.buffer = b; bb.offset = 0; bb.size = size;
+    vkCmdPipelineBarrier(cb, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_HOST_BIT, 0, 0, NULL, 1, &bb, 0, NULL);
+}
+
+// 逐段建目录：每轮真机写进自己的子目录。设备端 app 沙箱里的旧产物 hdc shell 删不掉（属主是应用 uid，
+// rm 静默失败），上一轮 332 MB 读回会混进这一轮的额度里，判读卡拿错世的字节配对。
+// Every round gets its own directory: the host shell cannot delete the app's stale dumps, and mixed generations poison pairing.
+static int mkdirs(const char *path)
+{
+    char buf[512];
+    snprintf(buf, sizeof buf, "%s", path);
+    for (char *s = buf + 1; *s; s++) {
+        if (*s != '/') continue;
+        *s = 0;
+        if (mkdir(buf, 0755) && errno != EEXIST) return -1;
+        *s = '/';
+    }
+    if (mkdir(buf, 0755) && errno != EEXIST) return -1;
+    return 0;
+}
 
 static int rb_arm(VkCommandBuffer cb, vktex *v)
 {
@@ -1931,6 +2075,7 @@ static int rb_arm(VkCommandBuffer cb, vktex *v)
     rc.imageSubresource = (VkImageSubresourceLayers){ VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 };
     rc.imageExtent = (VkExtent3D){ v->w, v->h, 1 };
     vkCmdCopyImageToBuffer(cb, v->img, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, g_rb_buf, 1, &rc);
+    rb_host_dep(cb, g_rb_buf, need);
     g_rb_w = v->w; g_rb_h = v->h; g_rb_serial = v->serial;
     return 1;
 }
@@ -1987,7 +2132,7 @@ static void rb_tga(void)
     // 只存最后一张会把有现场的帧全冲掉）
     // Keep only the first 3 dumps per serial: the early frames are the ones with content (round 116 measured the present
     // target's checksum frozen from ~frame 540, so overwriting one slot would erase every frame that had anything to show).
-    static int tga_n[8]; static unsigned tga_ser[8]; static int tga_cnt;
+    static int tga_n[8]; static uint64_t tga_ser[8]; static int tga_cnt;
     int slot = -1;
     for (int i = 0; i < tga_cnt; i++) if (tga_ser[i] == g_rb_serial) { slot = i; break; }
     if (slot < 0 && tga_cnt < 8) { slot = tga_cnt; tga_ser[slot] = g_rb_serial; tga_n[slot] = 0; tga_cnt++; }
@@ -2002,10 +2147,11 @@ static void rb_tga(void)
     fwrite(hdr, 1, sizeof hdr, f);
     uint8_t row[4096];
     for (uint32_t y = 0; y < h; y++) {
-        const uint8_t *q = g_rb_map + (uint64_t)y * w * 4u;
+        const uint8_t *rowb = g_rb_map + (uint64_t)y * w * 4u;
         uint32_t x = 0;
         while (x < w) {
             uint32_t c = w - x; if (c > 512u) c = 512u;
+            const uint8_t *q = rowb + (uint64_t)x * 4u;   // 拷贝按紧打包写（bufferRowLength=0），块源指针必须跟着 x 走 | the copy is tightly packed, so advance the source by x
             for (uint32_t i = 0; i < c; i++) {
                 row[i * 4 + 0] = q[i * 4 + 2];
                 row[i * 4 + 1] = q[i * 4 + 1];
@@ -2084,7 +2230,7 @@ static void raw_save(vktex *v, unsigned w, unsigned h)
         const char *d = getenv("DM_RAWDIR");
         if (!d || !*d) { const char *s = getenv("DM_SAVE"); if (!s || !*s) return; snprintf(dir, sizeof dir, "%s/raw", s); }
         else snprintf(dir, sizeof dir, "%s", d);
-        if (mkdir(dir, 0755) && errno != EEXIST) { GVL("[vk] 回传目录建不出来 %{public}s errno=%{public}d", dir, errno); return; }
+        if (mkdirs(dir) && errno != EEXIST) { GVL("[vk] 回传目录建不出来 %{public}s errno=%{public}d", dir, errno); return; }
         GVL("[vk] 回传整帧写到 %{public}s", dir);
     }
     if (!dir[0] || !g_flk_map) return;
@@ -2129,6 +2275,7 @@ static int flk_arm(VkCommandBuffer cb, vktex *v)
     rc.imageSubresource = (VkImageSubresourceLayers){ VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 };
     rc.imageExtent = (VkExtent3D){ v->w, v->h, 1 };
     vkCmdCopyImageToBuffer(cb, v->img, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, g_flk_buf, 1, &rc);
+    rb_host_dep(cb, g_flk_buf, need);
     g_flk_pend = 1;
     return 1;
 }
@@ -2345,7 +2492,11 @@ uint64_t mtl_present(const tex_t *t, double period_s, const int crop[4])
                 (unsigned long long)(src_i >= 0 ? atomic_load(&g_src_pres[src_i]) : 0ULL),
                 v->drawn, v->uploaded, (int)v->layout,
                 rbtag, (unsigned long long)rbv->serial, rbv->w, rbv->h, (int)rbv->fmt);
-            rb_arm(pcb, rbv);                                       // 里已经把源图转到 TRANSFER_SRC，随后 tri_prep 再转到可采样
+            // 读回把「实际读的那张」转到 TRANSFER_SRC，而 tri_prep 只恢复上屏那张 v：rbv != v 时必须自己还原，
+            // 否则输入图停在传输态、描述符却还按可采样绑定（三拍里中两次）。原来记的是 UNDEFINED 就还原成可采样，别把内容整体声明成未定义。
+            // rb_arm transitions the image it really reads, while tri_prep only fixes v, so restore rbv ourselves.
+            VkImageLayout lay0 = rbv->layout == VK_IMAGE_LAYOUT_UNDEFINED ? VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL : rbv->layout;
+            if (rb_arm(pcb, rbv) && rbv != v) to_layout(pcb, rbv, lay0);
         }
         // 闪屏探针：DM_FLK=<拍数> 逐拍出图整帧读回（16x9 网格一行 + 变化周期）；DM_RAW=<帧数> 每 500 拍一轮 4 帧，整帧裸文件落盘
         // Flicker probe: DM_FLK=<n> reads the whole presented image back per present (a 16x9 hex grid line + the blink period);
@@ -2420,6 +2571,7 @@ uint64_t mtl_present(const tex_t *t, double period_s, const int crop[4])
     // the driver is using back to the pool. This cut makes present synchronous, so g_pfence is also idle when it is reused next frame.
     if (g_pfence && sr == VK_SUCCESS) vkWaitForFences(g_dev, 1, &g_pfence, VK_TRUE, UINT64_MAX);
     rb_report();          // 栅栏落地 = 那条拷贝执行完了（同一队列）| the fence means the copy ran: same queue
+    tex_read_report();    // 同一把栅栏覆盖打包上传那趟提交里的读回拷贝 | the same fence covers the readback in the upload submission
     flk_report(v, src_i);
     vkFreeCommandBuffers(g_dev, g_cp, 1, &pcb);
     if ((g_presents % DUMP_EVERY) == 1) GVL("[vk] 出图 %{public}llu 帧（通道 %{public}llu、清 %{public}llu、贴图 %{public}llu 张、提交 %{public}llu）tid 出图 %{public}d 游戏 %{public}d",
@@ -2963,8 +3115,26 @@ static int mk_hostbuf(uint64_t size, uint32_t usage, VkBuffer *b, VkDeviceMemory
     if (vkCreateBuffer(g_dev, &bi, NULL, b) != VK_SUCCESS) { GRED("建缓冲 %{public}llu 字节失败", (unsigned long long)size); return 0; }
     VkMemoryRequirements rq; vkGetBufferMemoryRequirements(g_dev, *b, &rq);
     int ti = find_type(rq, VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
+    uint32_t ti_sel = ti >= 0 ? (uint32_t)ti : g_mem_host_visible;
+    VkPhysicalDeviceMemoryProperties mp;
+    vkGetPhysicalDeviceMemoryProperties(g_pd, &mp);
+    VkMemoryPropertyFlags pf = ti_sel < mp.memoryTypeCount ? mp.memoryTypes[ti_sel].propertyFlags : 0;
+    if (ti_sel >= mp.memoryTypeCount || !(pf & VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT) || !(rq.memoryTypeBits & (1u << ti_sel))) {
+        GRED("建缓冲 %{public}llu 字节：类型 %{public}u 不能做 host 映射（属性 %{public}u 需求位 %{public}x），拒用",
+             (unsigned long long)size, ti_sel, (unsigned)pf, (unsigned)rq.memoryTypeBits);
+        vkDestroyBuffer(g_dev, *b, NULL); *b = NULL; return 0;
+    }
+    static uint32_t seen[8]; static int seen_n; int known = 0;
+    for (int i = 0; i < seen_n; i++) if (seen[i] == ti_sel) { known = 1; break; }
+    if (!known && seen_n < 8) { seen[seen_n++] = ti_sel;
+        VkPhysicalDeviceProperties pp;
+        vkGetPhysicalDeviceProperties(g_pd, &pp);
+        GVL("[vk] host 缓冲内存类型 %{public}u 属性 %{public}u：VISIBLE %{public}d COHERENT %{public}d CACHED %{public}d，nonCoherentAtomSize=%{public}u，%{public}s",
+            ti_sel, (unsigned)pf, !!(pf & VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT), !!(pf & VK_MEMORY_PROPERTY_HOST_COHERENT_BIT),
+            !!(pf & VK_MEMORY_PROPERTY_HOST_CACHED_BIT), (unsigned)pp.limits.nonCoherentAtomSize, pp.deviceName);
+    }
     VkMemoryAllocateInfo ai = { VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO };
-    ai.allocationSize = rq.size; ai.memoryTypeIndex = ti >= 0 ? (uint32_t)ti : g_mem_host_visible;
+    ai.allocationSize = rq.size; ai.memoryTypeIndex = ti_sel;
     if (vkAllocateMemory(g_dev, &ai, NULL, m) != VK_SUCCESS) { GRED("建缓冲内存 %{public}llu 失败", (unsigned long long)rq.size); vkDestroyBuffer(g_dev, *b, NULL); *b = NULL; return 0; }
     if (vkBindBufferMemory(g_dev, *b, *m, 0) != VK_SUCCESS) { GRED("绑缓冲内存失败"); vkDestroyBuffer(g_dev, *b, NULL); *b = NULL; vkFreeMemory(g_dev, *m, NULL); *m = NULL; return 0; }
     void *p = NULL;
@@ -4047,8 +4217,13 @@ static int set_fill(VkDescriptorSet set, int ei, int stage)
             // 60 s / 100 s screenshots hashed the same, i.e. frozen on frame one). NVN's semantics are "the descriptor points at pool
             // memory and the GPU reads the current content", so the covered pages go read-only after the upload and a write faults and
             // bumps the generation. Here only the generation is compared (one atomic load); pages are scanned once it moved.
-            if (v && v->uploaded && v->pkg_range && !v->pkg_dirty && !(g_skip & 67108864)) {
-                if (v->pkg_stale) { v->pkg_stale = 0; pkg_queue(v); }   // 新生命：不查脏，直接按「游戏重写过这块」补一次搬运
+            if (v && v->uploaded && v->pkg_range && !(g_skip & 67108864)) {
+                // 请求得活到真传成为止。改前先清 stale 再排，而 pkg_queue 见「uploaded 且不带脏/陈旧」就当已经是新的直接丢
+                // ——新生命的陈旧标志就这么被白吃掉，显存里那份旧像素再没人搬。队满/环满同理：标志留在资源身上，
+                // 下一趟绑定接着排（进队自带去重，不会排两遍）。
+                // The old code consumed pkg_stale, then pkg_queue's own "already current" test dropped the request, so the
+                // stale device copy was never re-uploaded. A request now lives until an upload actually lands.
+                if (v->pkg_dirty || v->pkg_stale) pkg_queue(v);
                 else {
                     uint64_t now = nvn_dirty_now();
                     if (now != v->pkg_seen) {
@@ -4626,20 +4801,39 @@ static void tex_dump(uint64_t serial, unsigned lvl, unsigned nlv, const void *a,
 {
     static int n; static size_t tot;
     const char *d = getenv("DM_TEXDUMP");
-    // 张数与总量双闸：一张带 mip 的要占两格（级 0 + 级 1），40 格 ≈ 20 张，够把开局那批 UI 图集全带出来。
-    // Slots are per level, so 40 covers roughly 20 mipmapped textures - the boot-time UI atlases are the ones to compare.
-    if (!d || d[0] == '0' || n >= 40 || tot > (128u << 20)) return;
+    // DM_TEXDUMP_MIN = 序列号下限：开局那几百张 UI 图集会把额度吃光，进世界的美术一张都落不下来。
+    // 世界贴图实测序列在几千以上（第 118 轮 textrace：6549/6575/6658/6786），按序列设门槛就能只留后面那批。
+    // A floor on the serial: the boot UI atlases consume the whole budget, so in-world art never gets dumped. In-world serials
+    // measured in the thousands, so a floor selects them without needing a frame-window guess.
+    static uint64_t smin; static int smin_try;
+    if (!smin_try) { smin_try = 1; const char *m = getenv("DM_TEXDUMP_MIN"); smin = m ? strtoull(m, NULL, 0) : 0; }
+    if (smin && serial < smin) return;
+    // DM_TEXDUMP_AT = 出图拍数下限：世界美术是在主菜单之后才上传的，而序列号两边重叠，按拍设门槛更准。
+    // A floor on presents: the world art is uploaded after the menu, so this is the sharper gate.
+    static uint64_t pat; static int pat_try;
+    if (!pat_try) { pat_try = 1; const char *m = getenv("DM_TEXDUMP_AT"); pat = m ? strtoull(m, NULL, 0) : 0; }
+    if (pat && g_presents < pat) return;
+    // DM_TEXDUMP_MAX = 序列号上限：和第 119 轮的教训配对——上一轮额度正好卡在 120 张截了号，
+    // 出问题的可能是没排进窗口的那几张。有了上限就能只圈一段序列，把额度全花在可疑的那批上。
+    // A ceiling on the serial: round T7 stopped exactly at its 120-image budget, so the culprit may simply have missed the
+    // window. With a ceiling the whole budget can be aimed at one serial range.
+    static uint64_t smax; static int smax_try;
+    if (!smax_try) { smax_try = 1; const char *m = getenv("DM_TEXDUMP_MAX"); smax = m ? strtoull(m, NULL, 0) : 0; }
+    if (smax && serial > smax) return;
+    // 张数与总量双闸：一张带 mip 的要占两格（级 0 + 级 1）。额度按「只留世界那批」重新放大：
+    // 一张 2048² 软解后就是 16 MB，单张 8 MB 的旧上限会把最大的那几张直接跳过。
+    if (!d || d[0] == '0' || n >= 400 || tot > (1100u << 20)) return;
     if (d[0] != '/') { GVL("[vk] 贴图落盘没开：DM_TEXDUMP 要给绝对目录，现在是 %{public}s", d); return; }
-    if (an > (8u << 20) || bn > (8u << 20)) return;   // 单张 8 MB 封顶
+    if (an > (32u << 20) || bn > (32u << 20)) return;   // 单张 32 MB 封顶 | per-image cap
     static int dir_made;
-    if (!dir_made) { dir_made = 1; if (mkdir(d, 0755) && errno != EEXIST) GVL("[vk] 贴图落盘目录建不出来 %{public}s errno=%{public}d", d, errno); }
+    if (!dir_made) { dir_made = 1; if (mkdirs(d) && errno != EEXIST) GVL("[vk] 贴图落盘目录建不出来 %{public}s errno=%{public}d", d, errno); }
     n++; tot += an + bn;
     char p[512];
     FILE *f;
     snprintf(p, sizeof p, "%s/tex%u_s%llu_L%u_A.bin", d, n, (unsigned long long)serial, lvl);
     f = fopen(p, "wb");
     if (f) { fwrite(a, 1, an, f); fclose(f); }
-    else { GVL("[vk] 贴图落盘写不出 %{public}s errno=%{public}d（停手）", p, errno); n = 40; return; }
+    else { GVL("[vk] 贴图落盘写不出 %{public}s errno=%{public}d（停手）", p, errno); n = 400; return; }
     if (b && bn) {
         snprintf(p, sizeof p, "%s/tex%u_s%llu_L%u_B.bin", d, n, (unsigned long long)serial, lvl);
         f = fopen(p, "wb"); if (f) { fwrite(b, 1, bn, f); fclose(f); }
@@ -4657,13 +4851,24 @@ static void tex_dump_raw(const nvn_texdesc *d, uint64_t serial, const void *mem,
 {
     static int n; static size_t tot;
     const char *dir = getenv("DM_TEXDUMP");
-    if (!dir || dir[0] == '0' || dir[0] != '/' || n >= 8 || tot > (64u << 20)) return;
+    static uint64_t smin; static int smin_try;
+    if (!smin_try) { smin_try = 1; const char *m = getenv("DM_TEXDUMP_MIN"); smin = m ? strtoull(m, NULL, 0) : 0; }
+    if (smin && serial < smin) return;
+    // DM_TEXDUMP_AT = 出图拍数下限：世界美术是在主菜单之后才上传的，而序列号两边重叠，按拍设门槛更准。
+    // A floor on presents: the world art is uploaded after the menu, so this is the sharper gate.
+    static uint64_t pat; static int pat_try;
+    if (!pat_try) { pat_try = 1; const char *m = getenv("DM_TEXDUMP_AT"); pat = m ? strtoull(m, NULL, 0) : 0; }
+    if (pat && g_presents < pat) return;
+    static uint64_t smax; static int smax_try;
+    if (!smax_try) { smax_try = 1; const char *m = getenv("DM_TEXDUMP_MAX"); smax = m ? strtoull(m, NULL, 0) : 0; }
+    if (smax && serial > smax) return;
+    if (!dir || dir[0] == '0' || dir[0] != '/' || n >= 100 || tot > (600u << 20)) return;
     nvn_texlayout L; nvn_tex_layout(d, &L);
     size_t sz = L.size < (uint64_t)avail ? (size_t)L.size : avail;
-    if (!sz || sz > (8u << 20)) return;                 // 单张 8 MB 封顶，8 张 64 MB 封顶
+    if (!sz || sz > (32u << 20)) return;                 // 单张 32 MB 封顶，100 张 600 MB 封顶
     char p[512];
     FILE *f = fopen((snprintf(p, sizeof p, "%s/raw_s%llu.bin", dir, (unsigned long long)serial), p), "wb");
-    if (!f) { GVL("[vk] 整张贴落盘写不出 %{public}s errno=%{public}d（停手）", p, errno); n = 8; return; }
+    if (!f) { GVL("[vk] 整张贴落盘写不出 %{public}s errno=%{public}d（停手）", p, errno); n = 100; return; }
     fwrite(mem, 1, sz, f); fclose(f);
     n++; tot += sz;
     int bw = 1, bh = 1; uint32_t bp2 = (uint32_t)nvn_fmt_bpb(d->format, &bw, &bh);
@@ -4692,9 +4897,59 @@ static void tex_dump_raw(const nvn_texdesc *d, uint64_t serial, const void *mem,
 // under 1 MB while dummy binds were still 2.09M, so packaged textures are a real gap but NOT the cause of the flat white frame.
 // The next round's verdict lives in the EMP line (see below tex_has_content): the top six empty images by bind count.
 static _Atomic uint64_t g_pkg_up, g_pkg_bytes, g_pkg_arena, g_pkg_range, g_pkg_dz, g_pkg_fmt, g_pkg_3d,
-                        g_pkg_bc, g_pkg_dep, g_pkg_big, g_pkg_bigok, g_pkg_attempted_textures, g_pkg_re;
+                        g_pkg_bc, g_pkg_dep, g_pkg_big, g_pkg_bigok, g_pkg_attempted_textures, g_pkg_re,
+                        g_pkg_qfull, g_pkg_tk_moved, g_pkg_sub_over, g_pkg_ovfl,
+                        g_pkg_head, g_pkg_over, g_pkg_nobuf, g_pkg_bkoff, g_pkg_age;
+
+// 统计逐项映射：标签与计数器写在同一行，位置由代码结构决定，不再靠「数一下有几个 %llu」。
+// 改前这里是一串 snprintf 参数，第 40 轮那次「标签对上隔壁的数」就是这么漏过去的——数目对了，含义错了。
+// A label sits next to its own counter: a positional slip is now impossible, and the host test feeds each counter a
+// distinct sentinel and checks the printed number under every label is that label's own.
+typedef struct { const char *lab; _Atomic uint64_t *c; int shift; } pkg_stat;
+static const pkg_stat g_pkg_stat[] = {
+    { "尝试图", &g_pkg_attempted_textures, 0 },
+    { "上", &g_pkg_up, 0 },
+    { "重", &g_pkg_re, 0 },
+    { "成MB", &g_pkg_bytes, 20 },
+    { "BC层", &g_pkg_bc, 0 },
+    { "卡环", &g_pkg_arena, 0 },
+    { "越界", &g_pkg_range, 0 },
+    { "解排", &g_pkg_dz, 0 },
+    { "格式", &g_pkg_fmt, 0 },
+    { "深度", &g_pkg_dep, 0 },
+    { "三维", &g_pkg_3d, 0 },
+    { "环拒", &g_pkg_big, 0 },
+    { "环成", &g_pkg_bigok, 0 },
+    { "队满", &g_pkg_qfull, 0 },
+    { "换位", &g_pkg_tk_moved, 0 },
+    { "超表", &g_pkg_sub_over, 0 },
+    { "溢出", &g_pkg_ovfl, 0 },
+    { "余不", &g_pkg_head, 0 },      // 本提交环余量不足：等游标清零就有救，也是唯一该让整趟冲刷停手的一种
+    { "超容", &g_pkg_over, 0 },      // 单图比整条环还大：没有实测证据前不扩环，但绝不变成永久 bad
+    { "无环", &g_pkg_nobuf, 0 },     // 暂存环建不起来（分配失败）：和「放不下」两码事，重试要慢得多
+    { "退避", &g_pkg_bkoff, 0 },     // 退避窗口内直接跳过：连量尺都不做，这就是「长期无空间不忙等」
+    { "队龄", &g_pkg_age, 0 },       // 排了 32 代还没传成：首传没收敛的现场计数
+    { "重开", &g_sub_reenter, 0 },   // 缓冲还开着又 sub_begin：这一趟绝不清游标（清了就是覆盖已录 copy 的字节）
+    { "串线", &g_sub_race, 0 }       // 开缓冲与提交不是同一个线程
+};
+static int pkg_stat_line(char *line, int cap, int m)
+{
+    for (unsigned i = 0; i < sizeof g_pkg_stat / sizeof g_pkg_stat[0]; i++) {
+        if (m < 0 || m >= cap - 48) break;
+        uint64_t x = atomic_load(g_pkg_stat[i].c);
+        x >>= g_pkg_stat[i].shift;
+        m += snprintf(line + m, (size_t)(cap - m), "%s%s%llu ", i ? "" : "｜打包:",
+                      g_pkg_stat[i].lab, (unsigned long long)x);
+    }
+    return m;
+}
 #define PKG_PEND 512   // 加了重传之后排队的不只新建的图，一帧里被游戏改写的那几张也要挤进同一批，256 会饿住新图
-static vktex *g_pkg_pend[PKG_PEND];
+// 票据 = 指针 + 身份快照。g_tex 是数组，释放一张会把末尾那张换位、把空槽清零（见 tex_release），
+// 所以「指针非空、img 非空」证明不了它还是当初那张图：换位的槽会静默变成另一张图，A 的请求办到 B 身上。
+// A ticket is a pointer plus an identity snapshot: release swap-removes, so a non-NULL img proves nothing about which
+// texture sits in that slot now.
+typedef struct { vktex *v; uint64_t serial; VkImage img; uint64_t born; } pkg_tk;
+static pkg_tk g_pkg_pend[PKG_PEND];
 static int g_pkg_pend_n;
 
 // 打包暂存环（原「巨图暂存」）：W24 定案——arena 与顶点流共用，脏页重传一上量就把余量吃光，
@@ -4731,90 +4986,265 @@ static int bigs_build(void)
     return 1;
 }
 
-// 为一张图圈暂存：一律走独立环，整张一次圈够；圈不到返回 0，交由上层下次提交（游标清零）再试
-// Reserve staging for one image: always the dedicated ring, whole-image-or-nothing; 0 means retry next submission.
-static int stage_begin(pkg_stage *s, uint64_t need)
+// 溢出在这条路上不是「算错一点」而是「越界写」：绕回的小尺寸照样能圈到，解排布却按真实大小往环里写，
+// 踩的是环之外的映射内存。所有乘加先过这两道判据，判不过就当几何错——不碰环、一条拷贝也不录。
+// A wrapped footprint still stages "successfully" while the deswizzle writes the real size past the end of the ring.
+static int pkg_mul_ok(uint64_t a, uint64_t b, uint64_t *r)
 {
-    s->off = 0;
-    if (!bigs_build()) return 0;
-    s->buf = g_bigs; s->map = g_bigs_map; s->cap = BIG_STAGE_SZ;
-    if (g_bigs_off + need > s->cap) return 0;   // 本次提交里环满了：下次提交（游标清零）再来 | full for this submission: retry after the cursor resets
-    s->off = g_bigs_off;
+    if (a && b > ~(uint64_t)0 / a) return 0;
+    *r = a * b;
     return 1;
 }
-static uint64_t stage_take(pkg_stage *s, uint64_t len)   // 返回 UINT64_MAX = 没圈到（begin 已整张圈够，走到这里只可能是算量 bug）| UINT64_MAX = nothing left (unreachable while begin reserved the whole image)
+static int pkg_add_ok(uint64_t a, uint64_t b, uint64_t *r)
 {
-    uint64_t need = (len + 15) & ~(uint64_t)15;
-    if (s->off + need > s->cap) return ~(uint64_t)0;
+    if (b > ~(uint64_t)0 - a) return 0;
+    *r = a + b;
+    return 1;
+}
+
+static int stage_begin(pkg_stage *s, uint64_t need)
+{
+    s->off = 0; s->buf = (VkBuffer)0; s->map = NULL; s->cap = 0;
+    if (!bigs_build()) return STG_NOBUF;
+    s->buf = g_bigs; s->map = g_bigs_map; s->cap = BIG_STAGE_SZ;
+    if (g_bigs_off > s->cap) g_bigs_off = s->cap;   // 游标只可能等于 cap，越过就是别处算错：先夹住，减法才不会绕回
+    if (need > s->cap) return STG_OVER;
+    if (need > s->cap - g_bigs_off) return STG_HEAD;   // 改前写的是 off + need > cap，need 一大就绕回成「圈得到」
+    s->off = g_bigs_off;
+    return STG_OK;
+}
+static uint64_t stage_take(pkg_stage *s, uint64_t len)   // UINT64_MAX = 没圈到 | nothing left
+{
+    uint64_t need;
+    if (!pkg_add_ok(len, 15, &need)) return ~(uint64_t)0;
+    need &= ~(uint64_t)15;
+    if (s->off > s->cap || need > s->cap - s->off) return ~(uint64_t)0;   // 同样先保证 off<=cap 再减
     uint64_t o = s->off; s->off += need; g_bigs_off = s->off;
     return o;
 }
 void mtl_sub_reset_bigstage(void);
 void mtl_sub_reset_bigstage(void) { g_bigs_off = 0; }
 
-static void pkg_big_said(const vktex *v, uint64_t tot, uint64_t cmax)
+static void pkg_big_said(const vktex *v, uint64_t tot, uint64_t cmax, int why)
 {
     static int said;
     if (said >= 8) return;
     said++;
-    GVL("[vk] 环拒%{public}d s=%{public}llu NVN%{public}d %{public}u x %{public}u 层%{public}u 级%{public}u 软解%{public}d 要%{public}llu MB 环余%{public}llu MB",
+    GVL("[vk] 环拒%{public}d s=%{public}llu NVN%{public}d %{public}u x %{public}u 层%{public}u 级%{public}u 软解%{public}d 要%{public}llu MB 环余%{public}llu MB 原因%{public}d 拒%{public}d 退到%{public}llu 代",
         said, (unsigned long long)v->serial, (int)v->d.d.format, v->w, v->h, v->layers, v->levels, v->soft_bc,
-        (unsigned long long)((tot + cmax) >> 20), (unsigned long long)((BIG_STAGE_SZ - g_bigs_off) >> 20));
+        (unsigned long long)((tot + cmax) >> 20),
+        (unsigned long long)((BIG_STAGE_SZ > g_bigs_off ? BIG_STAGE_SZ - g_bigs_off : 0) >> 20),
+        why, v->pkg_rej, (unsigned long long)v->pkg_next);
 }
 
-static void pkg_upload(vktex *v)
+// ---- 上传之后把 VkImage 读回（DM_TEXREAD = 绝对输出目录）| read the VkImage back after the upload ----
+// 第 119 轮（T7）判到这一步：暂存字节（B 那份）离线画出来是连续美术，可屏幕上那块面板是斜切的条纹。
+// 「暂存对、显示歪」中间只剩两段没证：① vkCmdCopyBufferToImage 之后 GPU 里那张到底长什么样；② 绑定/UV。
+// 光读回上屏那张分不开这两段——必须读回**这张贴图自己的 VkImage**。rd_*.bin 和 tex*_B.bin 一像素一比：
+// 一样 ⇒ 上传无罪，去查绑定与 UV；不一样 ⇒ 拷贝参数/建图尺寸错，就在这一刀里。
+// The staging bytes decode to coherent art offline while the panel is sheared on screen, so the only unproven links are the
+// buffer→image copy and the bind. rd_*.bin is compared pixel-for-pixel against the matching *_B.bin to split them.
+static VkBuffer g_tr_buf; static VkDeviceMemory g_tr_mem; static uint8_t *g_tr_map;
+static uint64_t g_tr_off;
+#define TR_STAGE_SZ (128ull << 20)
+#define TR_MAX 400   // 120 张在第 119 轮正好截了号，元凶压根没进窗口 | the old cap cut the list off before the culprit
+#define TR_PER_FRAME 4   // 一趟 4 张：2048² RGBA8 一张就 16 MB，4 张刚好在 128 MB 环里周转
+typedef struct { uint64_t serial, off; uint32_t w, h, lvl; uint64_t bytes; } tr_ent;
+static tr_ent g_tr_q[TR_MAX]; static int g_tr_qn; static int g_tr_total; static int g_tr_bad_fmt;
+static uint64_t g_tr_lost;   // 环满/建缓冲失败而没读成的张数 | images skipped because the stage was full
+static uint64_t g_tr_small;  // 按像素数筛掉的（DM_TEXREAD_MIN 以下）| skipped for being under DM_TEXREAD_MIN
+
+static int tex_gate(uint64_t serial)
+{
+    static uint64_t smin, smax; static uint64_t pat; static int tried;
+    if (!tried) {
+        tried = 1;
+        const char *m = getenv("DM_TEXDUMP_MIN"); smin = m ? strtoull(m, NULL, 0) : 0;
+        m = getenv("DM_TEXDUMP_MAX"); smax = m ? strtoull(m, NULL, 0) : 0;
+        m = getenv("DM_TEXDUMP_AT"); pat = m ? strtoull(m, NULL, 0) : 0;
+    }
+    if (smin && serial < smin) return 0;
+    if (smax && serial > smax) return 0;
+    if (pat && g_presents < pat) return 0;
+    return 1;
+}
+
+static void tex_read_arm(VkCommandBuffer cb, vktex *v, unsigned lvl)
+{
+    const char *dir = getenv("DM_TEXREAD");
+    if (!dir || dir[0] == '0' || dir[0] != '/') return;
+    if (g_tr_total >= TR_MAX || g_tr_qn >= TR_PER_FRAME) return;
+    if (!tex_gate(v->serial)) return;
+    // 只读 RGBA8：软解后的打包美术全在这一档，别的格式（R8、深度…）字节宽度不同，混进同一份比对只会添乱。
+    // RGBA8 only: every soft-decoded packaged image lands here, and other formats would need their own pitch rules.
+    if (v->fmt != VK_FORMAT_R8G8B8A8_UNORM || v->layers != 1 || lvl >= v->levels) { g_tr_bad_fmt++; return; }
+    uint32_t w = (v->w >> lvl) ? (v->w >> lvl) : 1u, h = (v->h >> lvl) ? (v->h >> lvl) : 1u;
+    // DM_TEXREAD_MIN = 像素数下限。第 119 轮的教训：斜切面板那两张落在 serial 10951/10952，可 serial 是进程内计数，
+    // 每一轮走到的深度不同（这一轮跑到 serial 4300 还没进世界），拿 serial 当靶子会一整轮空手。
+    // Gate on pixel count, not serial: serials are per-process counters and do not reproduce across rounds.
+    static uint64_t minpx; static int minpx_try;
+    if (!minpx_try) { minpx_try = 1; const char *m = getenv("DM_TEXREAD_MIN"); minpx = m ? strtoull(m, NULL, 0) : 0; }
+    if (minpx && (uint64_t)w * (uint64_t)h < minpx) { g_tr_small++; return; }
+    uint64_t pitch = (((uint64_t)w * 4u) + 15) & ~(uint64_t)15;
+    uint64_t need = pitch * h;
+    if (!need || need > TR_STAGE_SZ) return;
+    if (!g_tr_buf) {
+        if (!mk_hostbuf(TR_STAGE_SZ, VK_BUFFER_USAGE_TRANSFER_DST_BIT, &g_tr_buf, &g_tr_mem, (void **)&g_tr_map)) {
+            GRED("读回暂存 %{public}llu MB 建不起来", (unsigned long long)(TR_STAGE_SZ >> 20)); g_tr_total = TR_MAX; return;
+        }
+        GVL("[vk] 读回暂存就绪：%{public}llu MB", (unsigned long long)(TR_STAGE_SZ >> 20));
+    }
+    if (g_tr_off + need > TR_STAGE_SZ) { g_tr_lost++; return; }   // 这一趟不读，下一趟（report 后游标归零）再来
+    uint64_t off = g_tr_off; g_tr_off += need;
+    to_layout(cb, v, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
+    VkBufferImageCopy rc = {0};
+    rc.bufferOffset = off;
+    rc.bufferRowLength = (uint32_t)(pitch / 4u);
+    rc.bufferImageHeight = h;
+    rc.imageSubresource = (VkImageSubresourceLayers){ VK_IMAGE_ASPECT_COLOR_BIT, lvl, 0, 1 };
+    rc.imageExtent = (VkExtent3D){ w, h, 1 };
+    vkCmdCopyImageToBuffer(cb, v->img, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, g_tr_buf, 1, &rc);
+    rb_host_dep(cb, g_tr_buf, need);
+    g_tr_q[g_tr_qn++] = (tr_ent){ v->serial, off, w, h, lvl, need };
+}
+
+// 出图栅栏之后：那条队列里排在栅栏前的拷贝一定执行完了（同队列按提交序）
+// Runs after the present fence, so every copy queued ahead of it has executed (same queue, submission order).
+static void tex_read_report(void)
+{
+    if (!g_tr_qn) return;
+    const char *dir = getenv("DM_TEXREAD");
+    static int dir_made;
+    if (!dir_made) {
+        dir_made = 1;
+        if (mkdirs(dir) && errno != EEXIST) GVL("[vk] 读回目录建不出来 %{public}s errno=%{public}d", dir, errno);
+    }
+    for (int i = 0; i < g_tr_qn; i++) {
+        tr_ent *e = &g_tr_q[i];
+        char p[512];
+        snprintf(p, sizeof p, "%s/rd_s%llu_L%u.bin", dir, (unsigned long long)e->serial, e->lvl);
+        FILE *f = fopen(p, "wb");
+        if (!f) { GVL("[vk] 读回写不出 %{public}s errno=%{public}d（停手）", p, errno); g_tr_total = TR_MAX; break; }
+        fwrite(g_tr_map + e->off, 1, (size_t)e->bytes, f); fclose(f);
+        g_tr_total++;
+        GVL("[vk] 读回%{public}d serial=%{public}llu 级%{public}u %{public}u x %{public}u 行%{public}llu 字节%{public}llu 拍%{public}llu",
+            g_tr_total, (unsigned long long)e->serial, e->lvl, e->w, e->h,
+            (unsigned long long)((((uint64_t)e->w * 4u) + 15) & ~(uint64_t)15),
+            (unsigned long long)e->bytes, (unsigned long long)g_presents);
+    }
+    g_tr_qn = 0; g_tr_off = 0;
+    if (g_tr_total >= TR_MAX) {
+        static int said;
+        if (!said++) GVL("[vk] 读回到额 %{public}d：格式不合 %{public}d 环满 %{public}llu 太小 %{public}llu",
+                         g_tr_total, g_tr_bad_fmt, (unsigned long long)g_tr_lost, (unsigned long long)g_tr_small);
+    }
+}
+
+// pkg_upload 的三种结局：只有 OK 才许清 dirty/stale；RETRY 必须把请求原样留给下一次提交；FATAL 才配置 pkg_bad。
+// 改前「录到过一次拷贝」就等于成功，后面一级失败也照样走到清标志那段，半张图被宣布成新版本。
+// Three outcomes: only OK may clear dirty/stale; RETRY keeps the request for a later submission; FATAL owns pkg_bad.
+// 有界重试：拒一次隔 2 代，两次隔 4，最多隔 64 代；超容量/建环失败不是「等游标清零」能解的，隔得更远（x16）。
+// 请求始终留在资源身上（dirty/stale 不清），所以退避既不是无限 tight loop，也不是拒满 8 次就永久放弃。
+// Bounded retries: the request stays on the resource, the attempt just waits. Never a tight loop, never a give-up.
+static void pkg_backoff(vktex *v)
+{
+    v->pkg_rej++;
+    unsigned sh = (unsigned)(v->pkg_rej > 6 ? 6 : v->pkg_rej);
+    uint64_t d = 1ull << sh;
+    if (v->pkg_why == STG_OVER || v->pkg_why == STG_NOBUF) d <<= 4;
+    v->pkg_next = g_fence_val + d;
+    if (v->pkg_rej == 64 || v->pkg_rej == 1024)   // 年龄告警：这一条出现就说明首传没收敛，别看聚合数字
+        GVL("[vk] 打包积压 s=%{public}llu 连拒%{public}d 代%{public}llu %{public}u x %{public}u 级%{public}u 层%{public}u 软解%{public}d 原因%{public}d：首传没收敛，退避到%{public}llu",
+            (unsigned long long)v->serial, v->pkg_rej, (unsigned long long)g_fence_val, v->w, v->h,
+            v->levels, v->layers, v->soft_bc, v->pkg_why, (unsigned long long)v->pkg_next);
+}
+
+enum { PKG_UP_RETRY = 0, PKG_UP_OK = 1, PKG_UP_FATAL = 2 };
+
+static int pkg_upload(vktex *v)
 {
     const tex_t *t = &v->d;
-    if (!g_cb || g_in_pass || !v->img) return;   // 通道里发不了 transfer，也不是失败：留着下次冲刷
+    if (!g_cb || g_in_pass || !v->img) return PKG_UP_RETRY;   // 通道里发不了 transfer，也不是失败：留着下次冲刷
+    v->pkg_why = STG_OK;   // 每次尝试都先清掉上一趟的原因，别让「上次环满」把这一趟整批误判成环满
+    // 退避窗口里连量尺都不做：这就是「长期无空间不忙等」那一条，单次提交的 CPU 因此有上限
+    if (v->pkg_next && (uint64_t)g_fence_val < v->pkg_next) { atomic_fetch_add(&g_pkg_bkoff, 1); return PKG_UP_RETRY; }
     textrace(NVN_TRACE_ATTEMPT, v, -1, "entered-upload");
     if (!v->pkg_tried) { v->pkg_tried = 1; atomic_fetch_add(&g_pkg_attempted_textures, 1); }
     // has_layout 不再当闸门（第 109 轮实测）：饥荒一张图都没调 TextureBuilderSetLayout ⇒ EMP pk=0 nopk=53676，
     // 可像素确实躺在池里（8 KB 采样非零 4164~7659，m1）。这条路的排布每步都按描述符现算（nvn_deswizzle_geom /
     // nvn_deswizzle），has_layout 只说明「打包贴图自带布局描述」，用它把关等于把上传整条锁在没人用的那半边。
-    if (!t->mem || !t->pool) { v->pkg_bad = 1; return; }
+    if (!t->mem || !t->pool) { v->pkg_bad = 1; return PKG_UP_FATAL; }
     if (v->is_depth || t->d.target == 2) {   // 深度没有池内容；3D 在本层按深度拆成数组层，形状对不上，这一刀放过
         atomic_fetch_add(t->d.target == 2 ? &g_pkg_3d : &g_pkg_dep, 1);
-        v->pkg_bad = 1; return;
+        v->pkg_bad = 1; return PKG_UP_FATAL;
     }
     int bw = 1, bh = 1;
     int bpb = nvn_fmt_bpb(t->d.format, &bw, &bh);
     int soft = v->soft_bc;                        // 马良 920 一个 BC 块格式都不认（第 81 轮实测）：块先解排布，再在 CPU 上解压
     int bpp = bpb; uint32_t upf = 0;
-    if (soft) { if (!nvn_bc_unpacked((uint32_t)t->d.format, &upf, &bpp)) { atomic_fetch_add(&g_pkg_fmt, 1); v->pkg_bad = 1; return; } }
-    else if (!bpb || bw != 1 || bh != 1) { atomic_fetch_add(&g_pkg_fmt, 1); v->pkg_bad = 1; return; }
+    if (soft) { if (!nvn_bc_unpacked((uint32_t)t->d.format, &upf, &bpp)) { atomic_fetch_add(&g_pkg_fmt, 1); v->pkg_bad = 1; return PKG_UP_FATAL; } }
+    else if (!bpb || bw != 1 || bh != 1) { atomic_fetch_add(&g_pkg_fmt, 1); v->pkg_bad = 1; return PKG_UP_FATAL; }
     uint64_t s0 = t->off > 0 ? (uint64_t)t->off : 0;
     uint64_t avail = t->pool->size > s0 ? t->pool->size - s0 : 0;
-    if (!avail) { v->pkg_bad = 1; return; }
+    if (!avail) { v->pkg_bad = 1; return PKG_UP_FATAL; }
     int lv = (int)v->levels, la_n = (int)v->layers;
     // 先量一遍再动手：一张图要么整张搬完，要么别搬。arena 是每条提交才清的 bump 分配器，中途只剩一半会留下半张贴图。
     // Measure first: an image either moves whole or not at all. The arena is a per-submission bump allocator, so running out
     // halfway would leave a half-filled texture behind.
+    // 拷贝清单：先把每一级每一层在环上备齐、记满这张表，才回头一次性录拷贝。录进命令缓冲的拷贝撤不掉，
+    // 所以「第一条 copy」必须等到全都能备好之后才发。栈上 192×52 B，只在重放线程里用，不进队列。
+    // The plan holds every copy to record: nothing gets recorded until the whole image is known to be stageable.
+    typedef struct { uint64_t off, blen; uint32_t ew, eh, slices, lvl, layer, brl, bih; } pkg_sub;
+    enum { PKG_SUB_MAX = 192 };
     uint64_t tot = 0, cmax = 0, pend = 0;
     uint64_t st0 = nvn_dirty_now();   // 戳要在读像素之前取：读期间游戏若写了这页，代号必 > 本戳 ⇒ 下一次用就重传
     for (int l = 0; l < lv; l++) for (int la = 0; la < la_n; la++) {
         uint32_t rb, rows, slices, bp2; uint64_t bs; unsigned th, td;
         if (nvn_deswizzle_geom(&t->d, (unsigned)l, (unsigned)la, &rb, &rows, &slices, &bs, &th, &td, &bp2) || !rb) {
-            atomic_fetch_add(&g_pkg_dz, 1); v->pkg_bad = 1; return;
+            atomic_fetch_add(&g_pkg_dz, 1); v->pkg_bad = 1; return PKG_UP_FATAL;
         }
-        uint64_t need = (uint64_t)rb * rows * slices;
+        uint64_t need, end1;
+        if (!pkg_mul_ok(rb, rows, &need) || !pkg_mul_ok(need, slices, &need)) {
+            atomic_fetch_add(&g_pkg_ovfl, 1); v->pkg_bad = 1; return PKG_UP_FATAL;
+        }
         // 池尾之外就是又一次 SIGSEGV：解排布按 16 字节段跳着读，越界不会连续踩，靠探针抓不到，只能在这里夹死
         // Reading past the end of the pool is another SIGSEGV, and the deswizzle walks in 16-byte jumps so a stray read is not
         // contiguous - the only safe place to clamp is here.
-        if (bs + need > avail) { atomic_fetch_add(&g_pkg_range, 1); v->pkg_bad = 1; return; }
-        if (bs + need > pend) pend = bs + need;
-        if (!soft) { tot += need; continue; }
+        if (!pkg_add_ok(bs, need, &end1)) { atomic_fetch_add(&g_pkg_ovfl, 1); v->pkg_bad = 1; return PKG_UP_FATAL; }
+        if (end1 > avail) { atomic_fetch_add(&g_pkg_range, 1); v->pkg_bad = 1; return PKG_UP_FATAL; }
+        if (end1 > pend) pend = end1;
+        // 未压缩的按压缩块字节数入总量；软解的按解压后的行距入总量，压缩块只是逐层复用的一块暂存，别双计
+        if (!soft) { if (!pkg_add_ok(tot, need, &tot)) { atomic_fetch_add(&g_pkg_ovfl, 1); v->pkg_bad = 1; return PKG_UP_FATAL; } continue; }
         uint32_t w = (v->w >> l) ? (v->w >> l) : 1u, h = (v->h >> l) ? (v->h >> l) : 1u;
-        tot += ((((uint64_t)w * (uint64_t)bpp) + 15) & ~(uint64_t)15) * h * slices;
+        uint64_t drow;
+        // 未压缩行距 = 16 对齐(宽×每像素字节)，再乘高乘切片；每一步都查，绕回的小值会「圈到」然后写越界
+        if (!pkg_mul_ok(w, (uint64_t)bpp, &drow) || !pkg_add_ok(drow, 15, &drow) ||
+            !pkg_mul_ok(drow & ~(uint64_t)15, h, &drow) || !pkg_mul_ok(drow, slices, &drow) ||
+            !pkg_add_ok(tot, drow, &tot)) {
+            atomic_fetch_add(&g_pkg_ovfl, 1); v->pkg_bad = 1; return PKG_UP_FATAL;
+        }
         if (need > cmax) cmax = need;
     }
-    if (!tot) { v->pkg_bad = 1; return; }
+    if (!tot) { v->pkg_bad = 1; return PKG_UP_FATAL; }
+    // 级×层多过清单容量：这是我们装得下多少的事，不是这张图的错。一条拷贝都不录，请求原样留给下一次提交。
+    // More subresources than the plan holds is our limit, not a broken image: record nothing, keep the request.
+    if ((uint64_t)lv * (uint64_t)la_n > (uint64_t)PKG_SUB_MAX) { atomic_fetch_add(&g_pkg_sub_over, 1); return PKG_UP_RETRY; }
     // 整张要的量 = 各级未压缩字节 + 一份压缩块暂存（逐层复用），再加上每段 16 对齐的最坏零头
-    uint64_t need_all = tot + cmax + 32ull * (uint64_t)lv * (uint64_t)la_n + 64ull;
+    uint64_t need_all, pad;
+    if (!pkg_mul_ok(32ull, (uint64_t)lv, &pad) || !pkg_mul_ok(pad, (uint64_t)la_n, &pad) ||
+        !pkg_add_ok(tot, cmax, &need_all) || !pkg_add_ok(need_all, pad, &need_all) ||
+        !pkg_add_ok(need_all, 64ull, &need_all)) {
+        atomic_fetch_add(&g_pkg_ovfl, 1); v->pkg_bad = 1; return PKG_UP_FATAL;
+    }
     pkg_stage st;
-    if (!stage_begin(&st, need_all)) {
-        atomic_fetch_add(&g_pkg_big, 1); pkg_big_said(v, tot, cmax);
-        if (++v->pkg_rej >= 8) v->pkg_bad = 1;   // 一直圈不到就别每趟绘制都重算一遍几何 | if it never fits, stop recomputing its geometry every flush
-        return;
+    int sg = stage_begin(&st, need_all);
+    if (sg != STG_OK) {
+        atomic_fetch_add(&g_pkg_big, 1);   // 总数仍留在环拒里：历史轮次的数字还能对齐
+        atomic_fetch_add(sg == STG_HEAD ? &g_pkg_head : sg == STG_OVER ? &g_pkg_over : &g_pkg_nobuf, 1);
+        v->pkg_why = sg;
+        pkg_backoff(v);   // 记账 + 拉开下次尝试：三种原因都不许变 pkg_bad
+        pkg_big_said(v, tot, cmax, sg);
+        return PKG_UP_RETRY;
     }
     to_layout(g_cb, v, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
     uint64_t asc = 0;
@@ -4822,36 +5252,39 @@ static void pkg_upload(vktex *v)
     int stag_exh = 0;   // 圈不到属于「这次提交放不下」，可重试；只有真正的错才许置 pkg_bad | staging exhaustion is retryable; only real errors may set pkg_bad
     if (soft) {
         asc = stage_take(&st, cmax ? cmax : 16);   // 压缩块的暂存按最大那一级算，逐层复用同一块
-        if (asc == ~(uint64_t)0) { atomic_fetch_add(&g_pkg_arena, 1); return; }
+        if (asc == ~(uint64_t)0) { atomic_fetch_add(&g_pkg_arena, 1); stag_exh = 1; }
     }
-    int ok = 0;
-    for (int l = 0; l < lv; l++) for (int la = 0; la < la_n; la++) {
+    // 先把每一级每一层在环上备齐，再一次性录拷贝：这样解排布/解码失败绝不会留下「半张已搬却声称全成功」。
+    // 录进命令缓冲的拷贝没法靠减计数撤销，所以必须先确定全都能备好，才发第一条 copy。
+    // Stage every subresource first, record copies afterwards: a command already in the buffer cannot be revoked by
+    // rewinding a counter, so nothing gets recorded until all subresources are known to be stageable.
+    pkg_sub subs[PKG_SUB_MAX];
+    int nsub = 0, plan_fatal = 0;
+    for (int l = 0; l < lv && !stag_exh && !plan_fatal; l++) for (int la = 0; la < la_n && !stag_exh && !plan_fatal; la++) {
         uint32_t rb, rows, slices, bp2; uint64_t bs; unsigned th, td;
         if (nvn_deswizzle_geom(&t->d, (unsigned)l, (unsigned)la, &rb, &rows, &slices, &bs, &th, &td, &bp2) || !rb) break;
         uint64_t need = (uint64_t)rb * rows * slices;
         if (!need) continue;
         uint32_t ew = (v->w >> l) ? (v->w >> l) : 1u, eh = (v->h >> l) ? (v->h >> l) : 1u;
-        uint64_t ao; uint64_t blen;
-        VkBufferImageCopy reg = {
-            .imageSubresource = (VkImageSubresourceLayers){ VK_IMAGE_ASPECT_COLOR_BIT, (uint32_t)l, (uint32_t)la, 1 },
-            .imageOffset = { 0, 0, 0 }, .imageExtent = { ew, eh, slices } };
+        uint64_t ao, blen; uint32_t brl = 0, bih = 0;
+        if (nsub >= PKG_SUB_MAX) { atomic_fetch_add(&g_pkg_dz, 1); plan_fatal = 1; break; }   // 子资源多到放不下：判永久失败，绝不报成功
         if (soft) {
             if (nvn_deswizzle(&t->d, (unsigned)l, (unsigned)la, t->mem, st.map + asc, (size_t)rb)) {
-                atomic_fetch_add(&g_pkg_dz, 1); l = lv; break;
+                atomic_fetch_add(&g_pkg_dz, 1); plan_fatal = 1; break;
             }
             uint64_t drow = (((uint64_t)ew * (uint64_t)bpp) + 15) & ~(uint64_t)15;
             blen = drow * eh * slices;
             ao = stage_take(&st, blen);
-            if (ao == ~(uint64_t)0) { atomic_fetch_add(&g_pkg_arena, 1); stag_exh = 1; l = lv; break; }
+            if (ao == ~(uint64_t)0) { atomic_fetch_add(&g_pkg_arena, 1); stag_exh = 1; break; }
             if (nvn_bc_decode((uint32_t)t->d.format, st.map + asc, (size_t)rb, ew, eh, st.map + ao, (size_t)drow)) {
-                atomic_fetch_add(&g_pkg_fmt, 1); v->pkg_bad = 1; l = lv; break;
+                atomic_fetch_add(&g_pkg_fmt, 1); plan_fatal = 1; break;
             }
-            reg.bufferRowLength = (uint32_t)(drow / (uint64_t)bpp); reg.bufferImageHeight = eh;
+            brl = (uint32_t)(drow / (uint64_t)bpp); bih = eh;
         } else {
             ao = stage_take(&st, need);
-            if (ao == ~(uint64_t)0) { atomic_fetch_add(&g_pkg_arena, 1); stag_exh = 1; l = lv; break; }
+            if (ao == ~(uint64_t)0) { atomic_fetch_add(&g_pkg_arena, 1); stag_exh = 1; break; }
             if (nvn_deswizzle(&t->d, (unsigned)l, (unsigned)la, t->mem, st.map + ao, (size_t)rb)) {
-                atomic_fetch_add(&g_pkg_dz, 1); l = lv; break;
+                atomic_fetch_add(&g_pkg_dz, 1); plan_fatal = 1; break;
             }
             blen = need;
         }
@@ -4865,11 +5298,7 @@ static void pkg_upload(vktex *v)
                      soft ? st.map + ao : NULL, soft ? (size_t)blen : 0,
                      ew, eh, rb, (int)t->d.format, (int)v->fmt, soft);
         if (la == 0 && l == 0) tex_dump_raw(&t->d, v->serial, t->mem, (size_t)avail);   // 整张 + 描述符：离线穷举每级几何
-        reg.bufferOffset = ao;
-        vkCmdCopyBufferToImage(g_cb, st.buf, v->img, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &reg);
-        atomic_fetch_add(&g_pkg_bytes, blen);
-        if (soft) atomic_fetch_add(&g_pkg_bc, 1);
-        ok = 1;
+        subs[nsub++] = (pkg_sub){ ao, blen, ew, eh, slices, (uint32_t)l, (uint32_t)la, brl, bih };
         if (l == 0 && la == 0) {
             // 探针行得带上格式对与行字节数：第 110 轮同是 1280x720 的两次上传，一次 3 686 400 B（4 B/像素，软解）一次 921 600 B
             //   （1 B/像素），光看尺寸分不清是「按压缩块搬」还是「单通道图」，而这两条的下一步完全不同。
@@ -4881,12 +5310,34 @@ static void pkg_upload(vktex *v)
             up_probe(tg, st.map + ao, blen, ew, eh, 1);
         }
     }
+    if (plan_fatal || (!nsub && !stag_exh)) {   // 真错，或几何一格都没备出来：置坏，别再来回重算
+        to_layout(g_cb, v, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
+        v->pkg_bad = 1; return PKG_UP_FATAL;
+    }
+    if (stag_exh) {                             // 环没圈够：一条 copy 都没录，请求原样留给下一次提交
+        to_layout(g_cb, v, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
+        return PKG_UP_RETRY;
+    }
+    for (int i = 0; i < nsub; i++) {            // 全部子资源都备好了，这才开始录拷贝
+        const pkg_sub *s = &subs[i];
+        VkBufferImageCopy reg = {0};
+        reg.bufferOffset = s->off; reg.bufferRowLength = s->brl; reg.bufferImageHeight = s->bih;
+        reg.imageSubresource = (VkImageSubresourceLayers){ VK_IMAGE_ASPECT_COLOR_BIT, s->lvl, s->layer, 1 };
+        reg.imageExtent = (VkExtent3D){ s->ew, s->eh, s->slices };
+        vkCmdCopyBufferToImage(g_cb, st.buf, v->img, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &reg);
+        atomic_fetch_add(&g_pkg_bytes, s->blen);
+        if (soft) atomic_fetch_add(&g_pkg_bc, 1);
+    }
+    // 读回放在拷贝之后：循环里转布局会把下一级的拷贝留在错态上（vkCmdCopyBufferToImage 传的是 TRANSFER_DST）。
+    // Arm the readback after every copy is recorded: transitioning inside the loop would leave a copy in the wrong layout.
+    tex_read_arm(g_cb, v, 0u); tex_read_arm(g_cb, v, 1u);
     to_layout(g_cb, v, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
-    if (!ok) { if (!stag_exh) v->pkg_bad = 1; return; }   // 圈不到不置坏：下次提交再试（W24 之前这里把饿死当坏图，地形一次没传上就永死）
     if (v->uploaded) atomic_fetch_add(&g_pkg_re, 1);   // 重传（游戏又写了这张）| a re-upload: the game wrote this one again
     v->uploaded = 1;
     v->pkg_dirty = 0;
     v->pkg_stale = 0;
+    v->pkg_rej = 0;   // 传成就把瞬时拒绝清零：这是「可重试」承诺的另一半 | success clears the transient refusals
+    v->pkg_next = 0; v->pkg_why = STG_OK;   // 退避与原因一起归零：这张已经没有什么要等的了
     // 上传完把这张图在池里占的页设成只读：游戏再写它就缺页 → 代号前进 → 用之前查到就重传（范围与戳的取法见绑定处那段）
     // After the upload, set the pages this texture occupies read-only: the next guest write faults and bumps the generation, which
     // is what the before-use check turns into a re-upload.
@@ -4901,6 +5352,7 @@ static void pkg_upload(vktex *v)
             saidp, (unsigned long long)v->serial, (int)t->d.format, (int)v->fmt, v->w, v->h,
             v->layers, v->levels, soft, (unsigned long long)g_pkg_bytes);
     }
+    return PKG_UP_OK;
 }
 
 // 通道外冲刷：绑定发生在通道里，那时发不了 transfer，所以先排队，pass_end 统一搬。
@@ -4908,23 +5360,43 @@ static void pkg_upload(vktex *v)
 static void pkg_flush(void)
 {
     if (g_skip & 4194304) { g_pkg_pend_n = 0; return; }   // 位 4194304 = 打包上传整条关掉，做 A/B
+    // 单次冲刷的尝试上限与队龄阈值：一趟重放不许把 CPU 全花在「量一遍几何再被拒」上。
+    enum { PKG_FLUSH_MAX = 256, PKG_AGE = 32 };
     int n = g_pkg_pend_n;
     g_pkg_pend_n = 0;
     if (!n) return;
-    int did = 0;
+    int did = 0, tried = 0, stop = n;
     for (int i = 0; i < n; i++) {
-        vktex *v = g_pkg_pend[i];
-        // 排队存的是数组里的指针，中途有图被释放会把末尾那张换位、把这一槽清成 0：img 空了就不能再搬
-        // The queue holds pointers into the texture array; a release mid-frame swaps the last entry down and zeroes the vacated slot.
-        if (!v || !v->img || v->pkg_bad) {
-            textrace(NVN_TRACE_DROP, v, -1, "flush:no-image-or-bad"); continue;
+        pkg_tk *tk = &g_pkg_pend[i];
+        vktex *v = tk->v;
+        // 指针、serial、VkImage 三样都对上才动手。对不上就是这张被换位/释放/重建了，票据作废——
+        // 请求本身还留在资源身上（dirty/stale 没清），下一次绑定会按新身份重排，所以丢票不等于丢请求。
+        // Resolve against the snapshot: a mismatch voids the ticket without losing the request, because the resource
+        // still carries dirty/stale and the bind path re-queues under its new identity.
+        if (!v || v->img != tk->img || v->serial != tk->serial) {
+            atomic_fetch_add(&g_pkg_tk_moved, 1);
+            textrace(NVN_TRACE_DROP, v, -1, "flush:identity-moved"); continue;
         }
+        if (v->pkg_bad) { textrace(NVN_TRACE_DROP, v, -1, "flush:bad"); continue; }
         if (v->uploaded && !v->pkg_dirty && !v->pkg_stale) continue;
-        pkg_upload(v);
+        uint64_t age = (uint64_t)g_fence_val > tk->born ? (uint64_t)g_fence_val - tk->born : 0;
+        if (age >= PKG_AGE) {
+            atomic_fetch_add(&g_pkg_age, 1);   // 排了 32 代还没传成：这就是「首传没收敛」，别看聚合环拒
+            if (age >= (uint64_t)PKG_AGE * 4) continue;   // 太老的先让位给新图（公平性），请求还在资源身上
+        }
+        if (tried >= PKG_FLUSH_MAX) { stop = i; break; }   // 这一趟的活儿到顶：剩下的原样留在队里
+        tried++;
+        int up = pkg_upload(v);
         textrace(NVN_TRACE_RESULT, v, -1,
-                 v->pkg_bad ? "bad" : v->uploaded && !v->pkg_dirty && !v->pkg_stale
-                 ? "copy-recorded" : "deferred-or-incomplete");
-        if (v->uploaded) did++;
+                 up == PKG_UP_OK ? "copy-recorded" : up == PKG_UP_RETRY ? "retry-later" : "fatal");
+        if (up == PKG_UP_OK) { did++; continue; }
+        // 环满了（余量不足 / 根本建不起来）：后面每张只会更挤，逐张试就是白烧 CPU。改前正是这么干的——
+        // 队尾几十张每趟都把几何量一遍再被拒，还饿死下一批新图。
+        if (up == PKG_UP_RETRY && (v->pkg_why == STG_HEAD || v->pkg_why == STG_NOBUF)) { stop = i; break; }
+    }
+    if (stop < n) {   // 没试过的那截（含刚被拒的这张）搬回队列头：丢票不等于丢请求，这里连票都不丢
+        memmove(g_pkg_pend, &g_pkg_pend[stop], (size_t)(n - stop) * sizeof g_pkg_pend[0]);
+        g_pkg_pend_n = n - stop;
     }
     if (did) g_sets_valid = 0;   // 下一趟绘制重新绑：这些槽该换成真视图 | rebind next pass: these slots now hold real views
 }
@@ -4938,12 +5410,13 @@ static void pkg_queue(vktex *v)
         textrace(NVN_TRACE_DROP, v, -1, "queue:already-current"); return;
     }
     if (g_pkg_pend_n >= PKG_PEND) {
+        atomic_fetch_add(&g_pkg_qfull, 1);   // 队满不是失败：标志还在资源身上，下一趟绑定接着排 | full is retryable
         textrace(NVN_TRACE_DROP, v, -1, "queue:capacity"); return;
     }
-    for (int i = 0; i < g_pkg_pend_n; i++) if (g_pkg_pend[i] == v) {
+    for (int i = 0; i < g_pkg_pend_n; i++) if (g_pkg_pend[i].v == v) {
         textrace(NVN_TRACE_DROP, v, -1, "queue:duplicate"); return;
     }
-    g_pkg_pend[g_pkg_pend_n++] = v;
+    g_pkg_pend[g_pkg_pend_n++] = (pkg_tk){ v, v->serial, v->img, (uint64_t)g_fence_val };
     textrace(NVN_TRACE_QUEUE, v, -1, "accepted");
     // 点名前 40 张进队的图：地面图集到底有没有来过这里（进队=会尝试上传；没进队=绑定路径都没走到）
     // Name the first 40 queued images: did the terrain atlases ever get here? (queued = an upload will be attempted;
@@ -5215,15 +5688,7 @@ static void draw_stats_line(char *line, int m, int cap)
                   (unsigned long long)atomic_load(&g_bind_lay), (unsigned long long)atomic_load(&g_tex_reg),
                   (unsigned long long)atomic_load(&g_tex_rereg));
     // 打包上传（M2-3f）：搬了几张、多少字节、各自卡在哪一环 | the packaged upload path: how many moved, how many bytes, and where each refusal came from
-    m += snprintf(line + m, (size_t)(cap - m), "｜打包:尝试图%llu 上%llu 重%llu 成%llu MB BC层%llu 卡环%llu 越界%llu 解排%llu 格式%llu 深度%llu 三维%llu 环拒%llu 环成%llu",
-                  (unsigned long long)atomic_load(&g_pkg_attempted_textures), (unsigned long long)atomic_load(&g_pkg_up),
-                  (unsigned long long)atomic_load(&g_pkg_re),
-                  (unsigned long long)(atomic_load(&g_pkg_bytes) >> 20),
-                  (unsigned long long)atomic_load(&g_pkg_bc),
-                  (unsigned long long)atomic_load(&g_pkg_arena), (unsigned long long)atomic_load(&g_pkg_range),
-                  (unsigned long long)atomic_load(&g_pkg_dz), (unsigned long long)atomic_load(&g_pkg_fmt),
-                  (unsigned long long)atomic_load(&g_pkg_dep), (unsigned long long)atomic_load(&g_pkg_3d),
-                  (unsigned long long)atomic_load(&g_pkg_big), (unsigned long long)atomic_load(&g_pkg_bigok));
+    m = pkg_stat_line(line, cap, m);   // 标签与计数器在 g_pkg_stat 里成对写死，位置不可能错位
     // 按内容比对判脏：这条是「视频冻在头几帧、屏幕每四拍闪一下」那一类的主判据（缺页那条在本机不响）
     // The content-compare watch: this is the judge for "the video is stuck on its first frames and the screen strobes every four
     // presents", since the write-protect fault path stays silent on this device.
