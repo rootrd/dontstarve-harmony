@@ -25,6 +25,14 @@ HLE_FORCE("_ZN2nn7account16ShowUserSelectorEPNS0_3UidERKNS0_21UserSelectionSetti
 HLE_FORCE("_ZN2nn7account22TryOpenPreselectedUserEPNS0_10UserHandleE", "启动时预选用户；恒为本地用户（返回 bool）", unsigned, h_acc_TryOpenPre, UserHandle *h) {
     h->v[0] = k_uid.v[0]; h->v[1] = k_uid.v[1]; h->v[2] = HANDLE_MAGIC; return 1;
 }
+// 同一件事的 Result 版（HSS/Unity 走这条，饥荒走上面那条 bool 版）。没接管时 SDK 客户端要连 acc:u0 会话，
+// 宿主没这个服务 ⇒ 内部等待判错、AbortImpl 自杀（v12 实测：pc=sdk+0x19a368〈OpenPreselectedUser〉→ AbortImpl，调用者 main+0x13c1d64）。
+// The Result flavour of the same call (HSS/Unity takes this one, Don't Starve the bool version above). Un-taken-over, the SDK client would
+// reach for the acc:u0 session the host does not have, its internal wait reports an error and AbortImpl fires (measured in v12:
+// pc=sdk+0x19a368 <OpenPreselectedUser> -> AbortImpl, caller main+0x13c1d64).
+HLE_FORCE("_ZN2nn7account19OpenPreselectedUserEPNS0_10UserHandleE", "预选用户（Result 版）；恒为本地用户", Result, h_acc_OpenPre, UserHandle *h) {
+    h->v[0] = k_uid.v[0]; h->v[1] = k_uid.v[1]; h->v[2] = HANDLE_MAGIC; return RES_OK;
+}
 HLE_FORCE("_ZN2nn7account8OpenUserEPNS0_10UserHandleERKNS0_3UidE", "打开用户；句柄内直接存 Uid", Result, h_acc_OpenUser, UserHandle *h, const Uid *uid) {
     h->v[0] = uid->v[0]; h->v[1] = uid->v[1]; h->v[2] = HANDLE_MAGIC; return RES_OK;
 }

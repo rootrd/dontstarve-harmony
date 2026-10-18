@@ -424,6 +424,19 @@ static Result err_res(const char *op, const char *path) {
 
 // ---------- 挂载 ----------
 // ---------- Mount ----------
+// HSS 实测：主模块开局调的第一个文件接口就是 SetAllocator，而它在 SDK 里再进 IsEnabledAccessLog →
+// GetFileSystemProxyServiceObject → cmif；宿主没有 fsp-srv，cmif 客户端就伪造 Result=0x1a80a 自杀。
+// 本文件的口径是文件接口全在宿主这层实现，SDK 那套分配器/缓冲池/ram 后端根本用不上，报成功即可。
+// Measured on HSS: the first FS entry point main calls is SetAllocator, which inside the SDK goes on to
+// IsEnabledAccessLog -> GetFileSystemProxyServiceObject -> cmif; with no fsp-srv on the host the cmif client fabricates
+// Result=0x1a80a and aborts. Every FS entry point in this file is host-backed, so the SDK's own allocator, buffer pool
+// and ram backend are never used -- reporting success is enough.
+HLE_FORCE("_ZN2nn2fs12SetAllocatorEPFPvmEPFvS1_mE", "fsp-srv；文件接口全在宿主实现，SDK 分配器用不上", Result, h_fs_SetAllocator, void *af, void *df) { (void)af; (void)df; return RES_OK; }
+HLE_FORCE("_ZN2nn2fs25EnableGlobalFileDataCacheEPvm", "fsp-srv；全局文件数据缓存由宿主页缓存代劳", Result, h_fs_EnableCache, void *buf, size_t sz) { (void)buf; (void)sz; return RES_OK; }
+HLE_FORCE("_ZN2nn2fs20GetRamDiskBufferSizeEm", "fsp-srv；ram 盘缓冲按需回报", size_t, h_fs_RamSize, size_t sz) { return sz; }
+HLE_FORCE("_ZN2nn2fs12MountRamDiskEPKcPvm", "fsp-srv；ram 盘不需要 SDK 后端，空接报成功", Result, h_fs_MountRam, const char *name, void *buf, size_t sz) {
+    (void)buf; (void)sz; LOG("fs ram 盘 %s 空接", name ? name : "(空)"); return RES_OK;
+}
 HLE_FORCE("_ZN2nn2fs22QueryMountRomCacheSizeEPm", "fsp-srv；rom 直读宿主目录，缓存只给最小值", Result, h_fs_QueryRomCache, size_t *out) { *out = 0x1000; return RES_OK; }
 HLE_FORCE("_ZN2nn2fs8MountRomEPKcPvm", "fsp-srv；rom → 宿主 RomFS 目录", Result, h_fs_MountRom, const char *name, void *cache, size_t sz) {
     (void)cache; (void)sz; char b[1024];
@@ -628,6 +641,9 @@ HLE_FORCE("_ZN2nn2fs6CommitEPKc", "fsp-srv；事务式存档：工作目录整�
     return r;
 }
 HLE_FORCE("_ZN2nn2fs7UnmountEPKc", "fsp-srv；挂载表常驻，卸载为空操作", void, h_fs_Unmount, const char *name) { (void)name; }
+// 存档提交：HSS 的主模块引用的是 CommitSaveData 这个拼写（饥荒那版走 Commit）。语义同一个，直接复用宿主的事务提交。
+// The save commit: HSS's main references the CommitSaveData spelling (Don't Starve used Commit). Same semantics, reuse the host's transactional commit.
+HLE_FORCE("_ZN2nn2fs14CommitSaveDataEPKc", "fsp-srv；事务提交（同 Commit，只是拼写不同）", Result, h_fs_CommitSave, const char *name) { return h_fs_Commit(name); }
 
 // ---------- 文件 ----------
 // 剔零档案：资源包里被填零的大段（过场视频、旧版音乐）不随包分发——档案文件里把这些零段剔掉，旁边放一张区段表
@@ -811,6 +827,8 @@ HLE_FORCE("_ZN2nn2fs15CreateDirectoryEPKc", "fsp-srv → mkdir(2)", Result, h_fs
     if (mkdir(hp, 0755)) return err_res("mkdir", hp);
     if (set_guest_name(hp, path)) { int e = errno; rmdir(hp); errno = e; return err_res("mkdir name", hp); }
     return RES_OK; }
+HLE_FORCE("_ZN2nn2fs15DeleteDirectoryEPKc", "fsp-srv → rmdir(2)（只删空目录，与 SDK 的非递归语义一致）", Result, h_fs_DeleteDir, const char *path) {
+    HP(path); RW(); return rmdir(hp) ? err_res("rmdir", hp) : RES_OK; }
 static int rm_tree(const char *p) {
     DIR *d = opendir(p); if (!d) return -1;
     struct dirent *e; char c[1024]; int rc = 0;

@@ -148,7 +148,7 @@ static void dump_file_log(const char *path, int max_lines);
 static const char *kRomfsMarks[][3] = {
     { "data/.build.config",      "data/00-00000001.data", "DST" },
     { "data/build.config",       "data/00-00000001.data", "DST" },
-    { "Data/globalgamemanagers", "Data/resources.assets", "Unity-HSS-v6" },
+    { "Data/globalgamemanagers", "Data/resources.assets", "Unity-HSS-v13" },
 };
 static int romfs_has_cfg(const char *dir)
 {

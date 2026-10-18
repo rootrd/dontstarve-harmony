@@ -113,6 +113,21 @@ HLE_FORCE("_ZN2nn2oe31LeaveExitRequestHandlingSectionEv", "退出请求处理段
 // OperationMode: 0 Handheld, 1 Console; PerformanceMode: 0 Normal, 1 Boost (one-to-one with the operation mode)
 HLE_FORCE("_ZN2nn2oe16GetOperationModeEv", "运行模式查询；按 DM_OPMODE 给固定值", int, h_oe_GetOpMode, void) { int u = g_ui_opmode; if (atomic_exchange(&g_ui_armed, 0)) atomic_fetch_add(&g_ui_reads, 1); return u >= 0 ? u : opmode(); }
 HLE_FORCE("_ZN2nn2oe18GetPerformanceModeEv", "性能模式查询；与运行模式一致", int, h_oe_GetPerfMode, void) { return opmode(); }
+// 累计运行时长：SDK 实现（sdk+0x3988b0）先 TryWait 它自己那个静态 SystemEvent（sdk+0xdc6a50），等不到就直接回缓存值；
+// 等得到才转去 nn::am::GetSelfController() 发 IPC。我们的 oe::Initialize 是空操作、那个事件从没建过 ⇒ 句柄 0 ⇒
+// nn::os 的等待判定为错 ⇒ AbortImpl 自杀（HSS v11 实测：main+0x58d888 调这条，bt 停在 TimedWaitSystemEvent→AbortImpl）。
+// 接管这条，不再碰 SDK 的内部事件与 am 会话：按客体时钟给一个随时间走的值。
+// Total active time: the SDK implementation (sdk+0x3988b0) first TryWaits its own static SystemEvent (sdk+0xdc6a50); if that wait does not
+// succeed it returns the cached value, and only if it does it goes on to nn::am::GetSelfController() and sends IPC. Our oe::Initialize is a
+// no-op, so that event is never created: handle 0 => nn::os treats the wait as an error => AbortImpl (measured on HSS v11: main+0x58d888
+// calls this, the backtrace stops at TimedWaitSystemEvent -> AbortImpl). Take this entry over so neither the SDK's internal event nor the
+// am session is touched, and hand out a value that advances with the guest clock.
+HLE_FORCE("_ZN2nn2oe25GetProgramTotalActiveTimeEv", "累计运行时长：不碰 am 会话，按客体时钟给", uint64_t, h_oe_TotalActive, void) {
+    static int logged;
+    uint64_t ns = guest_ns();
+    if (!logged) { logged = 1; LOG("oe::GetProgramTotalActiveTime → %.3f s（客体时钟）", ns / 1e9); }
+    return ns;
+}
 HLE_FORCE("_ZN2nn2oe27SetPerformanceConfigurationENS0_15PerformanceModeEi", "设 CPU/GPU 频率档；宿主不调频", void, h_oe_SetPerfCfg, int mode, int cfg) {
     LOG("oe::SetPerformanceConfiguration mode=%d cfg=%#x（忽略）", mode, cfg);
 }
