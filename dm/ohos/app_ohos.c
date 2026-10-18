@@ -142,18 +142,25 @@ static void dump_file_log(const char *path, int max_lines);
 // 候选按顺序试，第一个「配置读得到」的胜出；全都不行才退回沙箱 files/romfs。
 // 包内那份配置叫 build.config：hvigor 打 rawfile 时**丢点文件**（实测 .build.config 不进包，子目录正常收），
 // 客体要的 $:/data/.build.config 由 hle_fs.c 的 path_component 去点回退认到它。
+// 标记对：第一列是「这确实是游戏资源根」的判定文件，第二列用来就地读验（能 stat 不代表能 open），第三列是命中时打的标签
+//（也是本轮产物的自检字串：装机前 grep 包内 .so 能不能 grep 到它）。
+// 第一组是饥荒（CASC 分片），第二组是 Unity（高海 Saga DX：根下直接是 Data/，没有分片档案，拿最大的 assets 顶）。
+static const char *kRomfsMarks[][3] = {
+    { "data/.build.config",      "data/00-00000001.data", "DST" },
+    { "data/build.config",       "data/00-00000001.data", "DST" },
+    { "Data/globalgamemanagers", "Data/resources.assets", "Unity-HSS-v6" },
+};
 static int romfs_has_cfg(const char *dir)
 {
-    static const char *names[] = {"data/.build.config", "data/build.config"};
-    for (int i = 0; i < 2; i++) {
+    for (size_t i = 0; i < sizeof kRomfsMarks / sizeof kRomfsMarks[0]; i++) {
         char p[1500];
-        snprintf(p, sizeof p, "%s/%s", dir, names[i]);
+        snprintf(p, sizeof p, "%s/%s", dir, kRomfsMarks[i][0]);
         struct stat st;
         if (!stat(p, &st) && S_ISREG(st.st_mode)) {
-            DLOG("[romfs] 配置命中 %{public}s（%{public}lld B）", p, (long long)st.st_size);
-            // 就地读验：能 stat 不代表能 open（包内目录是只读挂载 + SELinux），拿 1 GB 档案的头 16 字节试
+            DLOG("[romfs] 配置命中 %{public}s（%{public}lld B）标记=%{public}s", p, (long long)st.st_size, kRomfsMarks[i][2]);
+            // 就地读验：包内目录是只读挂载 + SELinux，拿大档案的头 16 字节试
             char ap[1600];
-            snprintf(ap, sizeof ap, "%s/data/00-00000001.data", dir);
+            snprintf(ap, sizeof ap, "%s/%s", dir, kRomfsMarks[i][1]);
             int fd = open(ap, O_RDONLY);
             if (fd < 0) DLOG("[romfs] 档案 open %{public}s 失败 errno=%{public}d", ap, errno);
             else { char b[16]; ssize_t r = read(fd, b, sizeof b); close(fd);

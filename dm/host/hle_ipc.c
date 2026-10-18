@@ -23,6 +23,10 @@ static unsigned g_nsrv;
 static uint32_t g_hnext = 0xE0000000u;   // 假会话句柄段：与宿主自己发出去的句柄号隔开 | fake session handle range, kept away from the host's own handle numbers
 static pthread_mutex_t g_ipc_mtx = PTHREAD_MUTEX_INITIALIZER;
 
+// B30 判据（DX 高海 Saga，真机）：注册 "sm:" 后取服务，客体发 cmd=17（内联名 "fsp-srv"）想拿一个会话句柄，
+// 宿主这边 srv_new 忘了 g_nsrv++，表永远空 → srv_of 认不出句柄 → 那句柄不匹配下面任何分支 → 回 Result=0 但
+// 不带句柄 → 客体拿到 0 号会话，往它发 IFileSystemProxy Initialize（cmd=7 "SFCI"）→ fs 返回错误 →
+// sdk+0x15f248 svcBreak Result=0x1a80a。计数补上，服务名才认得出、句柄才回得出去。
 static uint32_t srv_new(const char *name) {
     uint32_t h = 0;
     pthread_mutex_lock(&g_ipc_mtx);
@@ -30,6 +34,7 @@ static uint32_t srv_new(const char *name) {
     if (g_nsrv < SRV_MAX) {
         snprintf(g_srv[g_nsrv].name, SRV_NAME, "%s", name);
         g_srv[g_nsrv].h = h = g_hnext++;
+        g_nsrv++;
     }
 out:
     pthread_mutex_unlock(&g_ipc_mtx);
@@ -61,7 +66,7 @@ static int srv_of(uint32_t h, char out[SRV_NAME]) {
 // w[1] = data words(10) | auto-list mode(4)@10 (0 none / 1 = 4-byte items / 2 = 8-byte) | list offset(11)@14 | has-special(1)@31.
 // The data region begins right after header+descriptors, sized (w[1]&0x3ff)*4 masked to ~3; the reply's Result is data[0].
 // The old field names below are kept for the log, but they mean fixed/variant/auto, not "input static / send / recv / exchange buffers".
-static struct { unsigned cmd, sstatic, sbuf, rbuf, xbuf, dw, rsm, copy, move; const uint32_t *w, *d; } rq;
+static struct { unsigned cmd, sstatic, sbuf, rbuf, xbuf, dw, rsm, hs, copy, move; const uint32_t *w, *d; } rq;
 
 static void rq_parse(uint32_t *w) {
     rq.w = w;
@@ -70,8 +75,9 @@ static void rq_parse(uint32_t *w) {
     rq.rbuf = (w[0] >> 24) & 0xf;   rq.xbuf = (w[0] >> 28) & 0xf;
     rq.dw = w[1] & 0x3ff; rq.rsm = (w[1] >> 10) & 0xf;
     rq.copy = rq.move = 0;
+    rq.hs = (w[1] >> 31) & 1;
     const uint32_t *p = w + 2;
-    if ((w[1] >> 31) & 1) {                              // 有特殊头 | special header present
+    if (rq.hs) {                                         // 有特殊头 | special header present
         rq.copy = (w[2] >> 1) & 0xf; rq.move = (w[2] >> 5) & 0xf;
         p = w + 3;
         if (w[2] & 1) p += 2;                             // 跟 8 字节 pid | followed by the 8-byte pid
@@ -92,10 +98,48 @@ static void rq_name(char out[SRV_NAME]) {
     out[k] = 0;
 }
 
+// cmif（domain）请求的识别：请求数据区里带内联头 'SFCI'(0x49434653) + 版本 1。
+// sdk+0xcd364/0xcd390 就是这么写进去的（mov x9,#0x4653; movk #0x4943,lsl16; movk #1,lsl32）。
+// 有它 = 客体在等一块 'SFCO' 应答尾部，见 rp_write。
+// A cmif domain request carries the inline header 'SFCI' + version 1 in its data region (that is exactly what
+// sdk+0xcd364 writes). Its presence means the reply must end with the 'SFCO' native-result block.
+static int rq_is_cmif(void) {
+    const uint32_t *e = rq.w + 0x40 - 1;
+    for (const uint32_t *p = rq.w + 2; p < e; p++) if (p[0] == 0x49434653u && p[1] == 1) return 1;
+    return 0;
+}
+
 // 应答：Result=0，可选一个 move 句柄；其余报文区清零 ⇒ 客体的输出参数读到 0。
+// 客体这条若是 cmif domain 请求（数据区带 'SFCI' 内联头），只回 Result 不够：
+// sdk+0xcd3e8〈CmifDomainProxyClientCoreProcessor::ProcessWithOutObjects〉收完包后，从报文里
+// 「align16(数据区末尾)」那一处取一块原生错误信息：+0 必须是 'SFCO'（0x4f434653），Result 在 +8，
+// 输出对象 id 在 +0x10（sdk+0xcd4f4 ldr w24,[x8,#0x10] → sdk+0xcd490 存进新代理对象）。
+// 魔数对不上 → sdk+0xcd434 直接 mov w21,#0xa80a; movk #1,lsl16 → Result=0x1a80a → sdk+0xb9e98 见非零 →
+// AbortImpl → 就是 DX 高海 Saga 卡在 nn::fs::SetAllocator 那条中止。
+// 地址用应答自己声明的数据字数算（照抄请求的字数，免得客体按界读输出越界）：base 2 字 + dw 字，再 & ~0xf。
 // Reply: Result=0 with an optional move handle; the rest of the buffer is zeroed, so the guest's out-params read 0.
-static void rp_write(uint32_t *w, uint32_t handle) {
+// For a cmif domain request the guest additionally requires the trailing native-result block ('SFCO' magic, Result at
+// +8, out-object id at +0x10) at align16(end of the data region) -- without the magic it hardcodes Result 0x1a80a
+// and aborts, which is exactly the nn::fs::SetAllocator stop.
+static uint32_t g_objnext = 1;         // 假 domain 对象 id：0 表示「没有对象」，客体走空指针，所以从 1 起
+static void rp_write(uint32_t *w, uint32_t handle, int cmif, uint32_t *obj_out) {
     memset(w, 0, 0x100);
+    if (obj_out) *obj_out = 0;
+    if (cmif && !handle) {                                 // domain 调用不回句柄，回对象 | domain calls answer with an object
+        // 客体找这块的地址不是「数据区之后」，而是 sdk+0xcd400 那条：align(报文基址 + reader 里那个偏移字段*4)，
+        // 掩码是 ~0x1f（32 字节对齐，不是 16）。reader 里同时存了两个候选：+0x5c = 数据区起点(2 字)、
+        // +0x64 = 数据区末尾(2+dw 字)。声明 dw=1 时两者 align32 后都落到 +0x20，一次写对，不用猜哪一个。
+        // The guest takes the block at sdk+0xcd400: align32(buffer + readerField*4) — and the mask there is ~0x1f,
+        // so this is 32-byte alignment, not 16. The reader keeps two candidates (+0x5c = start of the data region,
+        // 2 words; +0x64 = its end, 2+dw words); declaring dw=1 makes both land on +0x20, so one write is right
+        // under either reading.
+        w[1] = 1;                                          // 一个数据字（Result，读作 0）| one data word
+        uint32_t *sco = (uint32_t *)(((uintptr_t)w + 8u + 0x1fu) & ~(uintptr_t)0x1fu);
+        sco[0] = 0x4f434653u;  sco[1] = 1;                 // 'SFCO' + 与请求内联头同形的版本号
+        sco[2] = 0;            sco[4] = g_objnext;         // Result=0（+8）、输出对象 id（+0x10，sdk+0xcd4f4 读的就是这里）
+        if (obj_out) *obj_out = g_objnext++;
+        return;
+    }
     w[0] = 0;                       // 响应头低半：特殊/对象 id 增量 = 0，输出静态缓冲 = 0 | response header low half
     w[1] = 1u | (handle ? (1u << 31) : 0);   // 1 个数据字（Result）+ 有无特殊头 | one data word (the Result) plus the special-header bit
     if (handle) { w[2] = 1u << 5; w[3] = handle; w[4] = 0; }   // 特殊头(1 个 move 句柄) → 句柄 → Result
@@ -154,7 +198,7 @@ void dm_ipc_send(uint64_t *regs) {
     char line[256];
     snprintf(line, sizeof line,
              "IPC 请求 服务=%s 句柄=%#x cmd=%u 类%u 定%u 变%u 自%u 数据%u 模式%u 特殊%u copy%u move%u 参数=%#x %#x %#x %#x（x0=%#llx x1=%#llx x2=%#llx x3=%#llx）",
-             svc, h, rq.cmd, rq.sstatic, rq.sbuf, rq.rbuf, rq.xbuf, rq.dw, rq.rsm, rq.copy, rq.move,
+             svc, h, rq.cmd, rq.sstatic, rq.sbuf, rq.rbuf, rq.xbuf, rq.dw, rq.rsm, rq.hs, rq.copy, rq.move,
              rq.d[0], rq.d[1], rq.d[2], rq.d[3],
              (unsigned long long)regs[0], (unsigned long long)regs[1], (unsigned long long)regs[2], (unsigned long long)regs[3]);
     ipc_note(svc, rq.cmd, line);
@@ -173,15 +217,28 @@ void dm_ipc_send(uint64_t *regs) {
           }
       } }
 
-    // sm:（服务管理器）：cmd 1 = GetServiceHandle、cmd 2 = RegisterService，二者都要回一个会话句柄；
-    // cmd 0 = RegisterClient/Initialize，只回 Result。其余服务先统一「成功、无输出」。
-    // sm: -- cmd 1 GetServiceHandle and cmd 2 RegisterService both return a session handle; cmd 0 (RegisterClient /
-    // Initialize) only the Result. Other services get the generic "success, no outputs" for now.
+    // sm:（服务管理器）：取服务那几条要回一个会话句柄，其余只回 Result。
+    // 命令号按 SDK 版本变（老口径 cmd 1/2；DX 高海 Saga 的 sdk 实测 cmd=17 带内联名 "fsp-srv"，cmd=16 带特殊头+pid），
+    // 所以不认命令号，认「这条 sm 请求的内联参数是个可打印服务名」——有名字就给那个名字的句柄。
+    // 名字比较别写死 "sm"：注册进来的原名带冒号（"sm:"）。
+    // sm: -- the get-service commands return a session handle, everything else just the Result. Command ids vary by
+    // SDK (older: 1/2; this one: cmd 17 carries inline name "fsp-srv", cmd 16 a special header + pid), so match on
+    // "the inline argument is a printable service name" rather than the number. And keep the colon: the registered
+    // name is "sm:".
     uint32_t out_h = 0;
-    if (!strcmp(svc, "sm") && (rq.cmd == 1 || rq.cmd == 2)) {
+    if (!strncmp(svc, "sm", 2) && nm[0]) {
         out_h = srv_new(nm);
         LOG("IPC sm 要服务 %s -> 假句柄 %#x", nm, out_h);
     }
-    rp_write(w, out_h);
+    int cmif = rq_is_cmif();
+    uint32_t objid = 0;
+    rp_write(w, out_h, cmif, &objid);
+    if (cmif && objid) {                                   // 落点回读，别信算式信报文 | report where the block actually landed
+        static unsigned ndom;
+        int idx = -1;
+        for (int i = 0; i < 0x40; i++) if (w[i] == 0x4f434653u) { idx = i; break; }
+        if (ndom++ < 12) LOG("IPC 回 cmif：%s cmd=%u 请求数据%u 字 SFCO@%#x 对象 id=%u", svc, rq.cmd, rq.dw,
+                             idx < 0 ? 0xffff : idx * 4, objid);
+    }
     regs[0] = 0;
 }

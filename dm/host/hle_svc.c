@@ -14,16 +14,42 @@
 #include <time.h>
 
 // 预留一整块客体地址空间，按 Horizon 分区（地址值直接用宿主 mmap 得到的真地址）。只占地址、不占内存。
-// 大小 5 GB：游戏要的是开头 1 GB（别名区、栈）+ 一整块堆（应用内存池 3285 MiB，见下面 APP_POOL），合计约 4.2 GB；
+// iOS 大小 5 GB：游戏要的是开头 1 GB（别名区、栈）+ 一整块堆（应用内存池 3285 MiB，见下面 APP_POOL），合计约 4.2 GB；
 // iOS 上不带「扩展虚拟寻址」权限时一次最多能预留 6 GB（真机实读：6 GB 成、7 GB 不成），所以不能留得更宽——
 // 留到 8 GB 的话，签不了那项权限的开发者账号（免费账号）出的包在这一步就退出。
 // Reserve one whole block of guest address space, partitioned the Horizon way (address values are the real addresses returned by the host's mmap).
 // It only takes address space, not memory.
-// Size 5 GB: the game needs the first 1 GB (alias region, stacks) + one whole heap block (application memory pool of 3285 MiB, see APP_POOL below),
-// about 4.2 GB in total; on iOS without the "extended virtual addressing" entitlement a single reservation can be at most 6 GB
+// iOS size 5 GB: the game needs the first 1 GB (alias region, stacks) + one whole heap block (application memory pool of 3285 MiB, see APP_POOL
+// below), about 4.2 GB in total; on iOS without the "extended virtual addressing" entitlement a single reservation can be at most 6 GB
 // (read on a real device: 6 GB succeeds, 7 GB fails), so it cannot be made any wider --
 // with an 8 GB reservation, builds from developer accounts that cannot sign that entitlement (free accounts) would exit at this step.
-#define RESERVE (5ull << 30)
+// 鸿蒙上没有 iOS 那 6 GB 预留上限，分区照 Horizon 摆开（下表）。
+// 别名区必须装得下客体「默认堆」那一整块：Unity 系 SDK（DX 高海 Saga）的 nninitStartup 在 VAMM 开着的时候
+// （GetInfo(16)!=0）把别名区当默认堆的来源——main+0x57bbe8 申请 (总量−已用) & 2MB 对齐 这一块，
+// 走 nnmem_nlib_virtual_alloc → VammManager::AllocateAddressRegion，而 VammManager 的区域表就是构造时读到的
+// GetInfo(2)/GetInfo(3)（sdk+0x134618 别名区地址、大小）。这里报 512 MB，它要 3.7 GB，区域表里放不下，
+// 于是 AllocateAddressRegion 返错 → virtual_alloc 返 0xc → CentralHeap::Init 返错 → sdk+0x12648c 致命中止。
+// On HarmonyOS there is no iOS 6 GB reservation cap, so the partitions are laid out as below.
+// The alias region must be able to hold the guest's whole "default heap" block: the Unity-line SDK (DX High Sea Saga) uses the alias region
+// as the source of its default heap when VAMM is on (GetInfo(16) != 0) — main+0x57bbe8 asks for (total - used) rounded down to 2 MB through
+// nnmem_nlib_virtual_alloc -> VammManager::AllocateAddressRegion, and that manager's region table is exactly what it read from
+// GetInfo(2)/GetInfo(3) at construction (sdk+0x134618: alias address and size). Reporting 512 MB here while it asks for 3.7 GB means the table
+// cannot hold the window, so AllocateAddressRegion errors -> virtual_alloc returns 0xc -> CentralHeap::Init errors -> abort at sdk+0x12648c.
+// 判平台沿用本仓库的写法：iOS 定义 __APPLE__，OHOS 端口不定义（见 dm/ohos/compat/ohos_force.h）。
+// Platform test follows this repo's convention: iOS defines __APPLE__, the OHOS port does not (see dm/ohos/compat/ohos_force.h).
+#if defined(__APPLE__)
+#  define RESERVE    (5ull << 30)
+#  define ALIAS_OFF  0x10000000ull
+#  define ALIAS_CAP  0x20000000ull
+#  define STACK_OFF  0x30000000ull
+#  define HEAP_OFF   0x40000000ull
+#else
+#  define RESERVE    (12ull << 30)
+#  define ALIAS_OFF  0ull
+#  define ALIAS_CAP  (6ull << 30)
+#  define STACK_OFF  (6ull << 30)
+#  define HEAP_OFF   (8ull << 30)
+#endif
 static uint8_t *g_as;              // ASLR 区基址 = 整块 | ASLR region base = the whole block
 static uint8_t *g_heap; static size_t g_heap_cur, g_heap_cap; static int g_heap_rejects;
 // 地址段整个落在客体堆当前已开放（可读写）的范围内：这种读不用陷内核核对，直接 memcpy（diag.c tk_rd 等每拍读客体内存的地方用）
@@ -39,11 +65,11 @@ static void mem_init(void) {
     if (g_as) return;
     g_as = mmap(NULL, RESERVE, PROT_NONE, MAP_PRIVATE | MAP_ANON, -1, 0);
     if (g_as == MAP_FAILED) die("reserve guest AS");
-    // 固定划分（都在预留块内）：alias 512MB、stack 256MB、heap 其余从 2GB 处起
-    // Fixed partition (all inside the reserved block): alias 512MB, stack 256MB, heap the rest starting at 2GB
-    g_alias = g_as + 0x10000000; g_alias_cap = 0x20000000;
-    g_stack = g_as + 0x30000000; g_stack_cap = 0x10000000;
-    g_heap  = g_as + 0x40000000; g_heap_cap  = RESERVE - 0x40000000;   // 4 GB，容得下游戏那一整块约 3.2 GB 的堆 | 4 GB, enough to hold the game's single heap block of about 3.2 GB
+    // 固定划分（都在预留块内）：别名区、栈、堆从 HEAP_OFF 起到块尾
+    // Fixed partition (all inside the reserved block): alias region, stack, heap from HEAP_OFF to the end of the block
+    g_alias = g_as + ALIAS_OFF; g_alias_cap = ALIAS_CAP;
+    g_stack = g_as + STACK_OFF; g_stack_cap = 0x10000000;
+    g_heap  = g_as + HEAP_OFF;  g_heap_cap  = RESERVE - HEAP_OFF;   // 4 GB，容得下游戏那一整块约 3.2 GB 的堆 | 4 GB, enough to hold the game's single heap block of about 3.2 GB
     { const char *sl = getenv("DM_STKSLACK"); if (sl) g_stk_slack = strtoull(sl, NULL, 0); }
     LOG("guest AS %p +%#llx  heap %p alias %p stack %p 栈下余量 %#llx", g_as, (unsigned long long)RESERVE, g_heap, g_alias, g_stack, (unsigned long long)g_stk_slack);
 }
@@ -326,6 +352,17 @@ uint64_t svc_dispatch(int num, uint64_t *regs, uint64_t orig_addr) {
         module_t *mm = module_of((void *)regs[30]);
         static int nb;
         LOG("Break#%d reason=%#llx Result=%#x svc 位于 %s+%#llx  调用者=%#llx", ++nb, regs[0], res, mm ? mm->name : "?", orig_addr, (unsigned long long)regs[30]);
+        // callee-saved 那一批要单独打：sdk 的断言尾巴（VAbortImpl → svc Break）只用 x0..x3，
+        // 出问题的参数早在调用方手里（x19、x20…），lr/x29 链又只给地址不给值。
+        // The tail needs the callee-saved set on its own: the SDK's abort tail (VAbortImpl -> svc Break) uses only x0..x3,
+        // while the offending arguments still live in the caller's x19/x20/... and the lr/x29 chain gives addresses, not values.
+        LOG("Break 现场 x19=%#llx x20=%#llx x21=%#llx x22=%#llx x23=%#llx",
+            (unsigned long long)regs[19], (unsigned long long)regs[20], (unsigned long long)regs[21],
+            (unsigned long long)regs[22], (unsigned long long)regs[23]);
+        LOG("Break 现场 x24=%#llx x25=%#llx x26=%#llx x27=%#llx x28=%#llx x29=%#llx x30=%#llx",
+            (unsigned long long)regs[24], (unsigned long long)regs[25], (unsigned long long)regs[26],
+            (unsigned long long)regs[27], (unsigned long long)regs[28],
+            (unsigned long long)regs[29], (unsigned long long)regs[30]);
         dm_backtrace(regs[29]);
         if (regs[0] & 0x80000000ull) return 0;   // 仅通知，可继续 | notification only, can continue
         // 退出前把 stderr 冲干再等桥线程读完：stderr→hilog 是另一条线程，直接 _exit 会把 Break 与它前面那几行一起带走
@@ -368,6 +405,14 @@ uint64_t svc_dispatch(int num, uint64_t *regs, uint64_t orig_addr) {
         case I_UserExcAddr: v = 0; break;
         default: v = 0; break;
         }
+        // DM_INFOLOG=1：每一次 GetInfo 都报「问的哪一格、答了多少」。换游戏第一轮必开：
+        // 客体拿这些数算自己的默认堆、内存池，算出 0 就直接断言自杀（D2R 的 sdk 读 6/7，Unity 的 sdk 读 21/22，缺的那格默认给 0）。
+        // DM_INFOLOG=1: report every GetInfo as "which item was asked, what was answered". Turn it on for a new title's first round:
+        // the guest computes its default heap and memory pools from these, and a zero makes it assert straight away (D2R's sdk reads 6/7,
+        // Unity's reads 21/22, and any item not handled falls through the default above as 0).
+        { static int il = -1; static unsigned nic;
+          if (il < 0) il = getenv("DM_INFOLOG") ? 1 : 0;
+          if (il && nic++ < 128) LOG("[info] GetInfo(%#llx) -> %#llx", (unsigned long long)id, (unsigned long long)v); }
         regs[0] = 0; regs[1] = v; return 0;
     }
     case 0x1F: {   // ConnectToNamedPort(out_handle*, name)：假服务管理器（hle_ipc.c） | fake service manager
