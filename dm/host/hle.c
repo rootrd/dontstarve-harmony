@@ -172,8 +172,9 @@ void hle_hist_dump(void) {
 #define TR_MAIN (0x1001u % TR_RINGS)      // 客体主线程句柄固定 0x1001 | the guest main thread handle is always 0x1001
 typedef struct { const char *name; uint64_t a, b, c; } tr_ent;
 static tr_ent g_tr[TR_RINGS][TR_N]; static unsigned g_tr_i[TR_RINGS];
+static uint32_t g_tr_h[TR_RINGS];          // 这一槽当初登记时的客体线程句柄（心跳按句柄认线程）
 static __thread unsigned g_tr_slot = TR_RINGS;   // 线程起跑时登记；非客体线程越界 => 不记 | registered at thread start; out of range = not a guest thread
-void hle_trace_tag(uint32_t handle) { g_tr_slot = handle % TR_RINGS; }
+void hle_trace_tag(uint32_t handle) { g_tr_slot = handle % TR_RINGS; g_tr_h[g_tr_slot] = handle; }
 void hle_hist_call(const char *name, uint64_t a, uint64_t b, uint64_t c) {
     if (g_tr_slot >= TR_RINGS) return;
     unsigned i = (g_tr_i[g_tr_slot]++) % TR_N;
@@ -191,6 +192,50 @@ static void tr_print(unsigned slot, const char *tag) {
 void hle_trace_dump(void) {   // 崩溃现场用：本线程一份、主线程一份（不同线程时才打第二份） | crash dump: this thread, plus the main thread when it is another one
     tr_print(g_tr_slot, "本线程调用");
     if (g_tr_slot != TR_MAIN) tr_print(TR_MAIN, "主线程调用");
+}
+// 心跳用：按客体线程句柄转储那一条调用环。环只有 24 个槽（句柄取模），线程多于 24 时后建的会盖掉同槽的旧线程，
+// 心跳只在关心的几个句柄上转储，够用。
+// Heartbeat: dump one call ring by guest thread handle. There are only 24 rings (handle modulo), so with more than 24
+// threads a late one overwrites a same-slot thread's ring; the heartbeat only dumps the handful we care about.
+void hle_trace_ring(uint32_t handle) {
+    char tag[40]; snprintf(tag, sizeof tag, "调用环 thr=%#x", handle);
+    tr_print(handle % TR_RINGS, tag);
+}
+// 心跳用（主推这条）：先一条环一行概览（句柄 / 累计条数 / 距上次心跳新增几条 / 最后三次调用的名字），
+// 再把「这轮有新动作」的那几条环整条打出来（最多 3 条，加主线程）。
+// 概览回答「谁在动、动的是不是图形层」；整条回答「它卡在哪一次调用之后」——客体不提交画面时，
+// 图形线程的环尾就是它停下的那一步。
+// Heartbeat (the main form of it): one line per non-empty ring (handle / total entries / new since the last beat / the last
+// three call names), then the whole rings that moved this beat (at most 3, plus the main thread).
+// The overview answers "who is running, and is it the graphics layer"; the full ring answers "which call did it stop after" --
+// when the guest never submits a frame, the tail of the graphics thread's ring is the step it halted on.
+void hle_trace_beat(void) {
+    static unsigned prev[TR_RINGS];
+    unsigned grow[TR_RINGS]; int ngrow = 0;
+    extern int thr_name_by_handle(uint32_t, char *, size_t);
+    fprintf(stderr, "[dm] 调用环概览（thr=客体句柄，末 3 = 最近三次宿主交互）\n");
+    for (unsigned s = 0; s < TR_RINGS; s++) {
+        unsigned n = g_tr_i[s], d = n - prev[s]; prev[s] = n;
+        if (!n) continue;
+        char nb[48] = ""; thr_name_by_handle(g_tr_h[s], nb, sizeof nb);
+        fprintf(stderr, "[dm]   thr=%#x %s 计%u 新增%u 末3:", g_tr_h[s], nb, n, d);
+        for (int k = 3; k >= 1; k--) {
+            unsigned i = (n - 1 - (unsigned)k) % TR_N;
+            if (n <= (unsigned)k) { fprintf(stderr, " -"); continue; }
+            fprintf(stderr, " %s", g_tr[s][i].name ? g_tr[s][i].name : "?");
+        }
+        unsigned i = (n - 1) % TR_N;
+        fprintf(stderr, "（末条 x0=%#llx）\n", (unsigned long long)g_tr[s][i].a);
+        if (d && ngrow < TR_RINGS) grow[ngrow++] = s;
+    }
+    int shown = 0;
+    for (int k = 0; k < ngrow && shown < 3; k++) {
+        unsigned s = grow[k];
+        if (s == TR_MAIN) continue;                 // 主线程单独必打 | the main thread is always dumped on its own
+        if (g_tr_h[s] == 0) continue;
+        fprintf(stderr, "[dm] —— 整条环 thr=%#x ——\n", g_tr_h[s]); tr_print(s, "环"); shown++;
+    }
+    fprintf(stderr, "[dm] —— 整条环 thr=0x1001（主线程）——\n"); tr_print(TR_MAIN, "环");
 }
 
 void stubs_report(void) { LOG("stubs=%u", g_nstub);

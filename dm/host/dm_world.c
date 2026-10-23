@@ -17,9 +17,15 @@
 #include <time.h>
 
 static uint8_t *wb(void) { static uint8_t *b; if (!b) for (int i = 0; i < g_nmod; i++) if (!strcmp(g_mod[i].name, "main")) b = (uint8_t *)g_mod[i].base; return b; }
-static uint64_t w_player(void) { uint8_t *b = wb(); return b ? ((uint64_t (*)(uint32_t))(b + 0x45f9d0))(*(uint32_t *)(b + 0x2d20e4c)) : 0; }
+// 客体交回来的指针必须先过客体堆闸门再用。世界还没就绪时"取玩家 / 找单位"这些客体函数返的是哨兵值（实测 0xffff7fff、~0），
+// 光判 !p 挡不住，下一次解引用就是 SIGSEGV —— A（离线烘素材）与 B（设备自转）两路同点崩在这里，崩点 w_unit_xy 读 u+0x38。
+// Guest lookups hand back sentinels (measured 0xffff7fff / ~0) while the world is not ready yet, so "!p" alone cannot guard them.
+int dm_guest_heap_readable(uint64_t, size_t);
+static int gp_ok(uint64_t p, size_t n) { return p && dm_guest_heap_readable(p, n); }
+static uint64_t w_player(void) { uint8_t *b = wb(); uint64_t p = b ? ((uint64_t (*)(uint32_t))(b + 0x45f9d0))(*(uint32_t *)(b + 0x2d20e4c)) : 0; return gp_ok(p, 0x160) ? p : 0; }
 static int w_unit_xy(uint64_t u, int *x, int *y) {   // 单位格坐标：物件 / 物品 / 出口砖是路径 +0x10 / +0x14，玩家 / 怪物是路径头的 16 位 x / y（同 0x4acf54–0x4ad038） | unit cell coordinates: for objects / items / exit tiles path +0x10 / +0x14, for players / monsters the 16-bit x / y in the path header (same as 0x4acf54–0x4ad038)
-    uint64_t p = *(uint64_t *)(u + 0x38); if (!p) return 0; uint32_t t = *(uint32_t *)u;
+    if (!gp_ok(u, 0x160)) return 0;
+    uint64_t p = *(uint64_t *)(u + 0x38); if (!gp_ok(p, 0x18)) return 0; uint32_t t = *(uint32_t *)u;
     if (t == 2 || t == 4 || t == 5) { *x = *(int32_t *)(p + 0x10); *y = *(int32_t *)(p + 0x14); } else { *x = *(uint16_t *)(p + 2); *y = *(uint16_t *)(p + 6); }
     return 1;
 }
@@ -49,7 +55,7 @@ static int w_interact(uint64_t u) {   // 就近交互：游戏的点击入口（
                    // (Akara 4 cells 0/5, 2 cells 5/5). So always walk to within 2 cells before interacting; when 2 cells cannot be reached (the target itself occupies the cell, or it is blocked) and the player is already within W_FAR cells, interact in place
 #define W_FAR 4
 static struct { uint32_t type, id; uint64_t until_ns, stick, next_fr, still_fr; int on, lx, ly; int n, i, tx, ty, replans, stop_at, empty, direct, alt, alt_on, ax, ay, nearest; uint16_t node[24][2]; } g_go;   // stop_at > 0：只走到这么多格内就停、不交互（测试开关「走到怪旁」用） | stop_at > 0: only walk to within this many cells and stop, without interacting (used by the test switch "walk next to a monster")
-static uint64_t w_find(uint32_t type, uint32_t id) { uint8_t *b = wb(); return type <= 5 ? ((uint64_t (*)(uint64_t, uint32_t, uint32_t, uint32_t))(b + 0x45f5f0))((uint64_t)(uintptr_t)(b + 0x2d603a0 + type * 0x400), id & 0x7f, id, type) : 0; }
+static uint64_t w_find(uint32_t type, uint32_t id) { uint8_t *b = wb(); uint64_t u = type <= 5 ? ((uint64_t (*)(uint64_t, uint32_t, uint32_t, uint32_t))(b + 0x45f5f0))((uint64_t)(uintptr_t)(b + 0x2d603a0 + type * 0x400), id & 0x7f, id, type) : 0; return gp_ok(u, 0x160) ? u : 0; }
 static void w_go(uint64_t u) { uint64_t dm_stick_last_ns(void); g_go.type = *(uint32_t *)u; g_go.nearest = 0; g_go.id = *(uint32_t *)(u + 8); g_go.until_ns = w_now_ns() + 15000000000ull; g_go.stick = dm_stick_last_ns(); g_go.next_fr = 0; g_go.still_fr = 0; g_go.n = g_go.i = g_go.replans = g_go.empty = g_go.direct = g_go.alt = g_go.alt_on = 0; g_go.stop_at = 0; g_go.on = 1; }
 // 路线规划：宿主自己在游戏的碰撞格上做最短路（广度优先），再拉直成几段直线，逐段发游戏自己的「跑到点」（0x4ad870 + 服务端移动）。只换规划，不换游戏逻辑。
 // 为什么不用游戏的寻路函数（main+0x59fa20）当规划器（三条原因）：①它是「朝目标走、贴着障碍滑」的贪心，会把人带进死角（哈洛加斯走向安亚：停在建筑北墙 22 格外，再算返回 0）；
@@ -152,7 +158,7 @@ static void w_tile_retry_step(void) {
     if (!g_tile_retry.at || dm_guest_frame() < g_tile_retry.at) return; g_tile_retry.at = 0; uint8_t *b = wb(); uint64_t pl = w_player(); int px = 0, py = 0;
     if (!b || !pl || g_go.on || w_level(pl) != g_tile_retry.lv || !w_unit_xy(pl, &px, &py) || abs(px - g_tile_retry.x) > W_FAR || abs(py - g_tile_retry.y) > W_FAR) return;   // 换了关卡 / 人走开了 / 又点了别的：不管 | level changed / player walked away / something else was tapped: ignore
     uint64_t act = 0; long bd = -1; int ax = 0, ay = 0, ox = g_tile_retry.x, oy = g_tile_retry.y;
-    for (int k = 0; k < 128; k++) for (uint64_t c = *(uint64_t *)(b + 0x2d603a0 + 2 * 0x400 + k * 8); c; c = *(uint64_t *)(c + 0x158)) { int cx = 0, cy = 0;
+    for (int k = 0; k < 128; k++) for (uint64_t c = *(uint64_t *)(b + 0x2d603a0 + 2 * 0x400 + k * 8); gp_ok(c, 0x160); c = *(uint64_t *)(c + 0x158)) { int cx = 0, cy = 0;
         if (!w_unit_xy(c, &cx, &cy) || abs(cx - ox) > 2 || abs(cy - oy) > 2) continue; if (!(((int (*)(uint64_t, int, int, int, int))(b + 0x464a70))(c, 0, 0, -1, -1) & 1) || ((int (*)(int, uint64_t, uint64_t))(b + 0x2f7b7c))(0x165, pl, c) != 2) continue;
         long d = (long)(cx - ox) * (cx - ox) + (long)(cy - oy) * (cy - oy); if (bd < 0 || d < bd) { bd = d; act = c; ax = cx; ay = cy; } }
     // 旁边没有把守它的物件：再对出口砖交互，最多补两次。人刚走到 / 刚被挪到就发的那一下服务端有时不认（水晶通道 → 冰冻之河同一站位 2 局 1 进 1 不进；探路「传到旁边立刻交互」也撞过），站定之后再发就认
@@ -268,7 +274,7 @@ static uint64_t w_hit(uint8_t *b, float sx, float sy, float min, float *dist, in
         if (dump) LOG("世界目标：标签 物品 id %d 矩形 (%d,%d %dx%d)", r[4], r[0], r[1], r[2], r[3]);
         if (w_in_rect(sx, sy, r[0] + r[2] / 2.0f, r[1] + dm_ui_proj_dy() + r[3] / 2.0f, (float)r[2], (float)r[3], min, &d) && d < bd) { uint64_t u = w_find(4, (uint32_t)r[4]); if (u && *(uint32_t *)(u + 0xc) == 3) { bd = d; best = u; brank = 0; *by_label = 1; } } }
     for (int t = 0; t <= 5; t++) { if (t == 3) continue;   // 0 = 玩家类：只认尸体（见下） | 0 = player type: only corpses count (see below)
-        for (int k = 0; k < 128; k++) for (uint64_t u = *(uint64_t *)(b + 0x2d603a0 + t * 0x400 + k * 8); u; u = *(uint64_t *)(u + 0x158)) {
+        for (int k = 0; k < 128; k++) for (uint64_t u = *(uint64_t *)(b + 0x2d603a0 + t * 0x400 + k * 8); gp_ok(u, 0x160); u = *(uint64_t *)(u + 0x158)) {
             if (t == 4 && *(uint32_t *)(u + 0xc) != 3) continue;   // 物品只认在地上的 | items only count when on the ground
             if (!(((int (*)(uint64_t, int, int, int, int))(b + 0x464a70))(u, 0, 0, -1, -1) & 1)) continue;
             if (t == 0 && u == pl) continue;
@@ -332,7 +338,7 @@ int dm_world_watch_pos(float *nx, float *ny) { uint64_t v = atomic_load(&g_watch
 static void w_watch_step(uint8_t *b) {
     uint32_t w = atomic_load(&g_watch); if (!w) return; int t = (w >> 24) & 0x7f; uint32_t cls = w & 0xffffff; uint64_t scene = *(uint64_t *)(b + 0x2e2a698), v = 0;
     int W = 0, H = 0; dm_screen_real(&W, &H);
-    for (int k = 0; scene && W > 0 && H > 0 && t <= 5 && k < 128 && !v; k++) for (uint64_t u = *(uint64_t *)(b + 0x2d603a0 + t * 0x400 + k * 8); u; u = *(uint64_t *)(u + 0x158)) {
+    for (int k = 0; scene && W > 0 && H > 0 && t <= 5 && k < 128 && !v; k++) for (uint64_t u = *(uint64_t *)(b + 0x2d603a0 + t * 0x400 + k * 8); gp_ok(u, 0x160); u = *(uint64_t *)(u + 0x158)) {
         if (cls != 0xffffff ? *(uint32_t *)(u + 4) != cls : (t == 4 && *(uint32_t *)(u + 0xc) != 3)) continue;   // 类号 0xffffff（开关里写 any）= 这一类里任意一个；物品只认在地上的 | class number 0xffffff (written as any in the switch) = any one of this type; items only count when on the ground
         float f[2], h[2]; if (!w_project(b, scene, u, f, 0)) continue;
         if (!w_project(b, scene, u, h, 1)) { h[0] = f[0]; h[1] = f[1]; }
@@ -353,7 +359,7 @@ static void w_test_xy_step(void) {
         { const char *e = getenv("DM_TEST_OBJREC"); char buf[80]; if (e) { strlcpy(buf, e, sizeof buf); uint64_t t = *(uint64_t *)(b + 0x2d64a18 + (uint64_t)*(uint8_t *)(pl + 0x1bd) * 16);
             for (char *sv, *tkn = strtok_r(buf, ",", &sv); tkn && t; tkn = strtok_r(NULL, ",", &sv)) { uint32_t c = (uint32_t)atoi(tkn); if (c >= *(uint64_t *)(t + 0x1550)) continue; int32_t *r = (int32_t *)(*(uint64_t *)(t + 0x1548) + (uint64_t)c * 0x168); char o[1400]; int k = 0;
                 for (int q = 0; q < 0x168 / 4; q++) k += snprintf(o + k, sizeof o - k, " %d", r[q]); if (k >= (int)sizeof o) k = (int)sizeof o - 1; LOG("物件表记录 cls %u（每格 4 字节，十进制）：%s", c, o); } } }
-        for (int gt = 1; gt <= 5; gt += gt == 2 ? 3 : 1) { char o[1600]; int c2 = 0, cnt = 0; o[0] = 0; for (int k = 0; k < 128; k++) for (uint64_t c = *(uint64_t *)(b + 0x2d603a0 + gt * 0x400 + k * 8); c && cnt < 60; c = *(uint64_t *)(c + 0x158)) { int x = 0, y = 0; w_unit_xy(c, &x, &y); int sel = ((int (*)(uint64_t, int, int, int, int))(b + 0x464a70))(c, 0, 0, -1, -1) & 1, cat = ((int (*)(int, uint64_t, uint64_t))(b + 0x2f7b7c))(0x165, pl, c);
+        for (int gt = 1; gt <= 5; gt += gt == 2 ? 3 : 1) { char o[1600]; int c2 = 0, cnt = 0; o[0] = 0; for (int k = 0; k < 128; k++) for (uint64_t c = *(uint64_t *)(b + 0x2d603a0 + gt * 0x400 + k * 8); gp_ok(c, 0x160) && cnt < 60; c = *(uint64_t *)(c + 0x158)) { int x = 0, y = 0; w_unit_xy(c, &x, &y); int sel = ((int (*)(uint64_t, int, int, int, int))(b + 0x464a70))(c, 0, 0, -1, -1) & 1, cat = ((int (*)(int, uint64_t, uint64_t))(b + 0x2f7b7c))(0x165, pl, c);
             c2 += snprintf(o + c2, sizeof o - c2, " c%u/模式%u%s(%d,%d)", *(uint32_t *)(c + 4), *(uint32_t *)(c + 0xc), !sel ? "/不可选" : cat == 2 ? "/物" : cat == 4 ? "/出口" : cat == 5 ? "/人" : cat ? "/别" : "/无类", x, y); if (c2 >= (int)sizeof o) c2 = (int)sizeof o - 1; cnt++; } LOG("  类型 %d：%s", gt, o); } }
     if (cur < 0) { for (int i = 0; i < n; i++) if (!q[i].st && tk >= q[i].at) { cur = i; q[i].st = 1; q[i].until = w_now_ns() + 12000000000ull; g_go.on = 0; g_go.n = g_go.i = 0; LOG("按坐标走：→ %d,%d（从 %d,%d）", q[i].x, q[i].y, px, py); break; } if (cur < 0) return; }
     int dx = abs(q[cur].x - px), dy = abs(q[cur].y - py); static uint64_t nf;
@@ -388,7 +394,7 @@ static void w_test_seek_step(void) {
         uint64_t am = *(uint64_t *)(lv + 0x1c8); LOG("关卡信息（拍 %u）：关卡号 %u，关卡房间 %d 间（已载入 %d），范围 (%d,%d)–(%d,%d)，玩家 %d,%d；真墓关卡号 %u", tk, *(uint32_t *)(lv + 0x1f8), cnt, ld, x0, y0, x1, y1, px, py, am ? *(uint32_t *)(am + 0x120) : 0); }
     if (cur < 0) { for (int i = 0; i < n; i++) if (!q[i].st && tk >= q[i].at && (!q[i].lvl || q[i].lvl == *(uint32_t *)(lv + 0x1f8))) { cur = i; q[i].st = 1; lv0 = lv; settle = 0; atomic_store(&g_dm_seek_tp, 1); LOG("探路：在关卡 %u 里找 类型 %u 类号 %u", *(uint32_t *)(lv + 0x1f8), q[i].type, q[i].cls); break; } if (cur < 0) return; }
     if (lv != lv0) { LOG("探路：关卡变了（%u），这一条结束", *(uint32_t *)(lv + 0x1f8)); q[cur].st = 2; cur = -1; atomic_store(&g_dm_seek_tp, 0); return; }
-    for (int k = 0; k < 128; k++) for (uint64_t c = *(uint64_t *)(b + 0x2d603a0 + q[cur].type * 0x400 + k * 8); c; c = *(uint64_t *)(c + 0x158)) if (*(uint32_t *)(c + 4) == q[cur].cls) { int x = 0, y = 0; w_unit_xy(c, &x, &y);
+    for (int k = 0; k < 128; k++) for (uint64_t c = *(uint64_t *)(b + 0x2d603a0 + q[cur].type * 0x400 + k * 8); gp_ok(c, 0x160); c = *(uint64_t *)(c + 0x158)) if (*(uint32_t *)(c + 4) == q[cur].cls) { int x = 0, y = 0; w_unit_xy(c, &x, &y);
         { uint32_t ty = *(uint32_t *)c; uint64_t cp = *(uint64_t *)(c + 0x38), cr = cp ? *(uint64_t *)(cp + (ty == 2 || ty == 4 || ty == 5 ? 0 : 0x20)) : 0, cd = cr ? *(uint64_t *)(cr + 0x18) : 0; if (cd && *(uint64_t *)(cd + 0x90) != lv) continue; }   // 只认本关卡里的：相邻关卡已载入的房间里也会有同类号的出口砖（要塞二层找 82 时看见的是一层那块） | only those in this level count: already loaded rooms of adjacent levels can also contain exit tiles with the same class number (looking for 82 on Keep level 2 it saw the one on level 1)
         int s3 = atomic_load(&g_dm_seek_tp); if (s3 == 3) return;
         if (s3 == 1) { g_dm_seek_tp_x = x; g_dm_seek_tp_y = y; atomic_store(&g_dm_seek_tp, 3); LOG("探路：看见 类型 %u 类号 %u 在 %d,%d（玩家 %d,%d）→ 先传到它旁边", q[cur].type, q[cur].cls, x, y, px, py); return; }
@@ -566,16 +572,16 @@ void dm_world_pump(void) {   // 取手柄处每帧调 | Called every frame at th
       int kind = 0; if (e && !strncmp(e, "monster", 7)) { kind = 1; gt = 1; sscanf(e + 7, "@%d", &at); } else if (e && !strncmp(e, "exit", 4)) { kind = 2; gt = 5; sscanf(e + 4, "@%d", &at); }
       if (e && (kind || (sscanf(e, "%d:c%d@%d", &gt, &gi, &at) >= 2 ? (bycls = 1) : sscanf(e, "%d:%d@%d", &gt, &gi, &at) >= 2)) && dm_cur_tick() >= (uint32_t)at && w_player() && gt >= 0 && gt <= 5) { tgs[gk] = 1; uint64_t u = 0;
           if (kind) { uint64_t pl2 = w_player(); int px = 0, py = 0, x, y; long bd = -1; w_unit_xy(pl2, &px, &py);   // monster = 最近的敌对怪（可选中，游戏的交互类别是怪而不是 NPC）；exit = 最近的出口砖（类型 5） | monster = nearest hostile monster (selectable, and the game's interaction category is monster rather than NPC); exit = nearest exit tile (type 5)
-              for (int k = 0; k < 128; k++) for (uint64_t c = *(uint64_t *)(b + 0x2d603a0 + gt * 0x400 + k * 8); c; c = *(uint64_t *)(c + 0x158)) {
+              for (int k = 0; k < 128; k++) for (uint64_t c = *(uint64_t *)(b + 0x2d603a0 + gt * 0x400 + k * 8); gp_ok(c, 0x160); c = *(uint64_t *)(c + 0x158)) {
                   if (!(((int (*)(uint64_t, int, int, int, int))(b + 0x464a70))(c, 0, 0, -1, -1) & 1) || !w_unit_xy(c, &x, &y)) continue;
                   if (kind == 1) { int ct = ((int (*)(int, uint64_t, uint64_t))(b + 0x2f7b7c))(0x165, pl2, c); if (ct != 1 && ct != 0xa) continue; }   // 类别 1 = 普通怪（运行时读出：野外的怪都是 1；营地 NPC 是 5），0xa = 另一类可攻击目标 | Category 1 = ordinary monster (read at runtime: monsters in the wilderness are all 1; camp NPCs are 5), 0xa = another kind of attackable target
                   long dd = (long)(x - px) * (x - px) + (long)(y - py) * (y - py); if (bd < 0 || dd < bd) { bd = dd; u = c; } }
-              if (!u) { int shown = 0; for (int k = 0; k < 128 && shown < 8; k++) for (uint64_t c = *(uint64_t *)(b + 0x2d603a0 + gt * 0x400 + k * 8); c && shown < 8; c = *(uint64_t *)(c + 0x158)) { int cx2 = 0, cy2 = 0; w_unit_xy(c, &cx2, &cy2); shown++;
+              if (!u) { int shown = 0; for (int k = 0; k < 128 && shown < 8; k++) for (uint64_t c = *(uint64_t *)(b + 0x2d603a0 + gt * 0x400 + k * 8); gp_ok(c, 0x160) && shown < 8; c = *(uint64_t *)(c + 0x158)) { int cx2 = 0, cy2 = 0; w_unit_xy(c, &cx2, &cy2); shown++;
                   LOG("世界目标：  在场 类型 %d 类号 %u 模式 %u 可选 %d 类别 %d 距 (%d,%d)", gt, *(uint32_t *)(c + 4), *(uint32_t *)(c + 0xc), ((int (*)(uint64_t, int, int, int, int))(b + 0x464a70))(c, 0, 0, -1, -1) & 1, ((int (*)(int, uint64_t, uint64_t))(b + 0x2f7b7c))(0x165, pl2, c), cx2 - px, cy2 - py); } }
               if (u) { w_go(u); if (kind == 1) g_go.stop_at = 5; else if (nearonly) g_go.stop_at = nearonly; } LOG("世界目标：%s %s → %s", gn[gk], e, u ? "已发" : "没找到（附近已载入的房间里没有）"); if (u) LOG("世界目标：%s 目标 类型 %u 类号 %u id %u", gn[gk], *(uint32_t *)u, *(uint32_t *)(u + 4), *(uint32_t *)(u + 8)); continue; }
           if (!bycls) u = w_find((uint32_t)gt, (uint32_t)gi);
           else { int px = 0, py = 0, x, y; long bd = -1; w_unit_xy(w_player(), &px, &py);
-              for (int k = 0; k < 128; k++) for (uint64_t c = *(uint64_t *)(b + 0x2d603a0 + gt * 0x400 + k * 8); c; c = *(uint64_t *)(c + 0x158)) if (*(uint32_t *)(c + 4) == (uint32_t)gi && w_unit_xy(c, &x, &y)) { long dd = (long)(x - px) * (x - px) + (long)(y - py) * (y - py); if (bd < 0 || dd < bd) { bd = dd; u = c; } } }
+              for (int k = 0; k < 128; k++) for (uint64_t c = *(uint64_t *)(b + 0x2d603a0 + gt * 0x400 + k * 8); gp_ok(c, 0x160); c = *(uint64_t *)(c + 0x158)) if (*(uint32_t *)(c + 4) == (uint32_t)gi && w_unit_xy(c, &x, &y)) { long dd = (long)(x - px) * (x - px) + (long)(y - py) * (y - py); if (bd < 0 || dd < bd) { bd = dd; u = c; } } }
           if (u) { w_go(u); if (nearonly) g_go.stop_at = nearonly; } LOG("世界目标：DM_TEST_WORLD_GO %s → %s", e, u ? "已发" : "没找到"); if (u) LOG("世界目标：DM_TEST_WORLD_GO 目标 类型 %u 类号 %u id %u", *(uint32_t *)u, *(uint32_t *)(u + 4), *(uint32_t *)(u + 8)); } }
     w_tap_step(b);
     { uint64_t pl = w_player(); atomic_store(&g_has_target, pl && ((uint64_t (*)(uint64_t, uint32_t))(b + 0x2f7a0c))(((uint64_t (*)(void))(b + 0x2acecc))(), *(uint32_t *)(b + 0x2d20e4c)) != 0); }

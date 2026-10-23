@@ -514,8 +514,25 @@ int thr_find_by_name(const char *name, pthread_t *out);
 static const char *g_sample_name;
 static void *sampler(void *p) {
     useconds_t us = (useconds_t)(uintptr_t)p; unsigned printed = 0;
+    // DM_HBEAT=<秒>：每隔几秒转储一次「客体走到哪了」——NVN 调用计数、HLE 入口/SVC 计数（DM_HLECOUNT_LOG 时才走日志）、
+    // 几条关键线程的调用环。采样行只说线程停在哪个 pc，心跳说的是「这段时间它到底调没调东西」：
+    // 两次心跳之间计数不动 = 真停住；一直在涨但画面不前进 = 在空转循环，涨的那几条就是它在反复等的东西。
+    // DM_HBEAT=<seconds>: periodically dump "how far did the guest get" -- NVN call counts, HLE entry/SVC counts (routed to
+    // the log by DM_HLECOUNT_LOG) and the call rings of a few key threads. A sample line only says where a thread sits; the
+    // heartbeat says whether it called anything in between: counts frozen = really stuck, counts climbing with no picture =
+    // spinning in a loop, and the entries that climb are what it keeps waiting on.
+    const char *hbe = getenv("DM_HBEAT");
+    uint64_t hb_ns = hbe ? strtoull(hbe, 0, 10) * 1000000000ULL : 0;
+    uint64_t next_beat = hb_ns ? now_ns() + hb_ns : 0; unsigned beats = 0;
     for (;;) {
         usleep(us);
+        if (hb_ns && now_ns() >= next_beat) {
+            next_beat = now_ns() + hb_ns; extern uint64_t g_t0_ns;
+            fprintf(stderr, "\n[dm] ===== 心跳 #%u [%.1fs] =====\n", ++beats, (now_ns() - g_t0_ns) / 1e9);
+            { extern void nvn_dump_counts(const char *); char tag[48]; snprintf(tag, sizeof tag, "心跳 #%u", beats); nvn_dump_counts(tag); }
+            { extern void hlecount_dump_now(void); hlecount_dump_now(); }
+            { extern void hle_trace_beat(void); hle_trace_beat(); }
+        }
         { extern void crash_reassert(void); crash_reassert(); }   // 顺便复查宿主崩溃处理器还在不在（驱动会自装处理器抢走现场）
         if (g_sample_name && !strcmp(g_sample_name, "*")) {        // 全部客体线程轮一遍 | Cycle through all guest threads
             int thr_list(pthread_t *out, int max); pthread_t all[64]; int n = thr_list(all, 64);
@@ -528,8 +545,10 @@ static void *sampler(void *p) {
             unsigned i = printed % SRING;
             extern uint64_t g_t0_ns;
             fprintf(stderr, "[dm] SAMPLE #%u [%.3fs] thr=%#x", printed + 1, (g_sring[i].t - g_t0_ns) / 1e9, g_sring[i].h);
-            { extern _Atomic int g_last_svc[256]; int sv = atomic_load_explicit(&g_last_svc[g_sring[i].h & 0xff], memory_order_relaxed);
-              if (sv) fprintf(stderr, " svc=%#x", sv); }
+            { extern _Atomic int g_last_svc[256]; extern _Atomic uint64_t g_last_svc_a0[256];
+              int sv = atomic_load_explicit(&g_last_svc[g_sring[i].h & 0xff], memory_order_relaxed);
+              if (sv) fprintf(stderr, " svc=%#x a0=%#llx", sv,
+                              (unsigned long long)atomic_load_explicit(&g_last_svc_a0[g_sring[i].h & 0xff], memory_order_relaxed)); }
             off("pc", g_sring[i].pc); off("lr", g_sring[i].lr);
             fprintf(stderr, "\n[dm] bt:"); for (int k = 0; k < g_sring[i].n; k++) off("", g_sring[i].bt[k]); fputc('\n', stderr);
             // 栈链（诊断）：sp 起 2 KB 里落在客体代码模块的值（去重、最多 12 个）= 调用链
@@ -549,9 +568,11 @@ void crash_sample_self(void) {
     const char *e = getenv("DM_SAMPLE"); if (!e) return;
     g_sample_pt = pthread_self();
     const char *c = strchr(e, ':'); if (c) g_sample_name = strdup(c + 1);
+    int ms = atoi(e);
+    if (ms <= 0) return;   // DM_SAMPLE=0 的本意是关掉采样；建线程会让它 0 微秒一轮空转，实测 8 分钟打 2 GB 日志、机身发烫
     struct sigaction sa = {.sa_sigaction = on_sample, .sa_flags = SA_SIGINFO | SA_ONSTACK | SA_RESTART};
     sigaction(SIGUSR2, &sa, 0);
-    pthread_t t; pthread_create(&t, NULL, sampler, (void *)(uintptr_t)(atoi(e) * 1000)); pthread_detach(t);
+    pthread_t t; pthread_create(&t, NULL, sampler, (void *)(uintptr_t)(ms * 1000)); pthread_detach(t);
 }
 
 // ---------- DM_INFLATE_BENCH=<样本文件>：用游戏映像里的 zlib（main 0xf3a930 inflateInit_、0xf3aa90 inflate）解同一批样本并计时 ----------

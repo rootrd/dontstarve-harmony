@@ -72,7 +72,11 @@ int dm_elysium_active(void) { return atomic_load(&g_active); }
 static void on_uimsg(const char *cat, const char *act, const char *arg) { (void)cat; (void)arg; if (!strcmp(act, "TryCreateCharacter")) atomic_store(&g_created, 1); }
 
 static uint8_t *main_base(void) { static uint8_t *b; if (!b) for (int i = 0; i < g_nmod; i++) if (!strcmp(g_mod[i].name, "main")) b = (uint8_t *)g_mod[i].base; return b; }
-static uint64_t table(uint8_t *b, int ver, uint64_t *n) { uint64_t t = *(uint64_t *)(b + 0x2d64a18 + (uint64_t)ver * 16); if (!t) { *n = 0; return 0; } *n = *(uint64_t *)(t + 0x16c8); return *(uint64_t *)(t + 0x16c0); }
+// 表槽与表头指针都要先过客体堆闸门：进世界前那几拍客体还没建表，槽里是哨兵值（实测 ~0），照旧解引用就是 SIGSEGV
+// （A/B 两路同点崩：崩在 table 读 t+0x16c8）。| Gate the table slot and the record pointer through the guest-heap test: before the
+// world exists the slot holds a sentinel (measured ~0), and dereferencing it faults (both arms crashed at this same read of t+0x16c8).
+int dm_guest_heap_readable(uint64_t, size_t);
+static uint64_t table(uint8_t *b, int ver, uint64_t *n) { uint64_t t = *(uint64_t *)(b + 0x2d64a18 + (uint64_t)ver * 16); if (!dm_guest_heap_readable(t, 0x16d0)) { *n = 0; return 0; } *n = *(uint64_t *)(t + 0x16c8); uint64_t r = *(uint64_t *)(t + 0x16c0); if (!*n || *n > (1u << 20) || !dm_guest_heap_readable(r, *n * RATIO_REC)) { *n = 0; return 0; } return r; }
 static uint64_t fnv(uint64_t h, const uint8_t *p, size_t n) { for (size_t i = 0; i < n; i++) { h ^= p[i]; h *= 0x100000001b3ull; } return h; }
 static uint64_t tc_sum(uint8_t *b, uint64_t h);
 static uint64_t mon_sum(uint8_t *b, uint64_t h);
@@ -217,7 +221,10 @@ static void tc_dump(uint8_t *b) {
 void dm_elysium_pump(void) {
     static int sub, in_game; if (!sub) { sub = 1; uimsg_subscribe(on_uimsg); if (getenv("DM_TEST_ELYSIUM_ARM")) dm_elysium_arm(1); }
     uint8_t *b = main_base(); if (!b || !snapshot(b)) return;
-    uint64_t pl = ((uint64_t (*)(uint32_t))(b + 0x45f9d0))(*(uint32_t *)(b + 0x2d20e4c)), pd = pl ? *(uint64_t *)(pl + 0x10) : 0;
+    uint64_t pl = ((uint64_t (*)(uint32_t))(b + 0x45f9d0))(*(uint32_t *)(b + 0x2d20e4c));
+    if (!dm_guest_heap_readable(pl, 0x160)) pl = 0;   // 没进局时客体返哨兵值，不当指针用 | the guest returns a sentinel outside a run: never treat it as a pointer
+    uint64_t pd = pl ? *(uint64_t *)(pl + 0x10) : 0;
+    if (!dm_guest_heap_readable(pd, 0x40)) pd = 0;
     if (!pd) { if (in_game) { in_game = 0; restore(b); if (atomic_exchange(&g_active, 0)) LOG("极乐世界：退局，品质比例表与宝藏表已写回原值（校验和 %s）", tables_sum(b) == g_orig_sum ? "相符" : "【红】不符"); } return; }
     if (in_game) {   // 补齐做完后：等游戏把这次存盘提交了再把欠条划掉，并再存一次把「划掉」也落盘；没等到就留着欠条，下次进局再补（补到定数，不会多给） | After the top-up is done: wait for the game to commit this save before striking off the IOU, then save once more so the 'strike-off' is persisted too; if the wait fails keep the IOU and top up again on the next run entry (topped up to a fixed amount, never giving extra)
         static uint64_t c0, f0, cl, fl; static int w; uint64_t dm_fs_commit_count(void), dm_guest_frame(void); int dm_request_save(void); uint64_t c = dm_fs_commit_count(), f = dm_guest_frame();

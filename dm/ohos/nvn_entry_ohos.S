@@ -77,3 +77,46 @@ nvn_prof_entry:
     ldp x29, x30, [sp]
     add sp, sp, #240
     ret
+
+// 有序调用环入口（DM_NVN_TRACE=1 时槽表指向这里）：跳板进来时 x16 = 本函数槽地址。
+// 记 (槽号, x0..x5, x8, 调用时的 sp) 进 nvn_trace[] 环形缓冲，然后尾跳到真实现 nvn_real[i]。
+// x8 是结构体返回的隐藏缓冲区指针：NVN 有一批「按值返回大结构」的取值函数，写坏客体栈的就是这条路，所以必须记。
+// 只改 x9..x15 与 x17（x8 要存进环、x16 要原样留给未实现桩，都不动），不开栈帧、不动 sp，
+// 所以记录的 sp 就是客体调用方的 sp，崩现场能用它把同一个线程的调用串挑出来。
+// Ordered call-ring entry (the slot table points here when DM_NVN_TRACE=1): when the thunk comes in, x16 = this slot address.
+// Records (slot, x0..x5, x8, caller sp) into the nvn_trace[] ring, then tail-branches to the real implementation nvn_real[i].
+// x8 is the hidden structure-return buffer: a batch of NVN getters return large structs by value and that is the write
+// path suspected of clobbering the guest stack, so it must be recorded.
+// Touches only x9..x15 and x17 (x8 is saved into the ring, x16 must survive for the unimplemented stubs), allocates no
+// frame and never moves sp, so the recorded sp is the guest caller's own sp -- the crash dump uses it to pick out one
+// thread's call chain.
+    .globl nvn_trace_entry
+    .p2align 2
+nvn_trace_entry:
+    adrp x9, nvn_slot
+    add x9, x9, :lo12:nvn_slot
+    sub x12, x16, x9
+    lsr x12, x12, #4                 // 槽号 i；x16 原样留着，未实现桩还要用它当槽地址 | Slot index i; x16 stays intact, the unimplemented stub needs it as the slot address
+    adrp x10, nvn_trace_n
+    add x10, x10, :lo12:nvn_trace_n
+    mov x11, #1
+    ldadd x11, x13, [x10]            // x13 = 自增前的序号 | sequence before increment
+    and x13, x13, #255
+    lsl x13, x13, #7                 // 每条 128 字节 | 128 bytes per entry
+    adrp x14, nvn_trace
+    add x14, x14, :lo12:nvn_trace
+    add x13, x13, x14
+    str x12, [x13]
+    str x0, [x13, #8]
+    str x1, [x13, #16]
+    str x2, [x13, #24]
+    str x3, [x13, #32]
+    str x4, [x13, #40]
+    str x5, [x13, #48]
+    str x8, [x13, #56]
+    mov x15, sp
+    str x15, [x13, #64]
+    adrp x14, nvn_real
+    add x14, x14, :lo12:nvn_real
+    ldr x17, [x14, x12, lsl #3]
+    br x17

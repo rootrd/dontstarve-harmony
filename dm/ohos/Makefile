@@ -11,7 +11,13 @@ OHOS_SYSROOT ?= $(HOME)/ohos/sysroot
 CROSS ?= clang --target=aarch64-linux-ohos --sysroot=$(OHOS_SYSROOT)
 CFLAGS := -O1 -g -Wall -Wno-unused-function -D_GNU_SOURCE \
   -I$(HOST) -I$(GFX)/nvn -I$(GFX)/nvn/include -I$(COMPAT) -I$(PLACE) \
+  -I$(HERE)/../../third_party/astcenc/include -ffunction-sections -fdata-sections \
   -include $(COMPAT)/ohos_force.h
+# B 路（设备自转 BC3→ASTC）的静态库：构建机交叉编的 astcenc 5.7.0（NEON）+ 静态 libc++。
+# .so 里带 C++ 运行时的唯一原因是 astcenc 是 C++；-gc-sections 把没用到的部分剪掉，别让 11 MB 的 libc++ 全进包。
+# Round B's static archives: the cross-built astcenc (NEON) plus a static libc++. --gc-sections keeps the .so from carrying all of it.
+ASTC_DIR := $(HERE)/../../third_party/astcenc/ohos
+ASTC_LIBS := $(ASTC_DIR)/libastcenc-neon-static.a $(ASTC_DIR)/libc++_static.a $(ASTC_DIR)/libc++abi.a
 
 # Apple 专属不编（front_mac.m app_mac.m memstat.m touch_mac.c）；重放层 .m 待以 nvn_vulkan.c 替代
 HOST_SRC := $(HOST)/main.c $(HOST)/loader.c $(HOST)/hle.c $(HOST)/crash.c $(HOST)/diag.c \
@@ -55,5 +61,5 @@ solib:
 	$(CROSS) -fPIC -c -o $(BUILD)/pic/entry_ohos.o $(HERE)/entry_ohos.S
 	$(CROSS) -fPIC -c -o $(BUILD)/pic/nvn_thunks_ohos.o $(HERE)/nvn_thunks_ohos.S
 	$(CROSS) -fPIC -c -o $(BUILD)/pic/nvn_entry_ohos.o $(HERE)/nvn_entry_ohos.S
-	$(CROSS) -shared -fPIC -fuse-ld=lld -Wl,-Bsymbolic -Wl,--error-limit=0 -o $(BUILD)/libdmhost.so $(BUILD)/pic/*.o -lm -lpthread -lace_napi.z -lhilog_ndk.z -lvulkan
+	$(CROSS) -shared -fPIC -fuse-ld=lld -Wl,-Bsymbolic -Wl,--error-limit=0 -o $(BUILD)/libdmhost.so $(BUILD)/pic/*.o $(ASTC_LIBS) -lm -lpthread -lace_napi.z -lhilog_ndk.z -lvulkan
 	@file $(BUILD)/libdmhost.so | cut -c1-140

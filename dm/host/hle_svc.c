@@ -8,7 +8,7 @@
 #include <stdatomic.h>
 #include <sys/mman.h>
 #include <errno.h>
-#include <unistd.h>
+#include <fcntl.h>
 #include <unistd.h>
 #include <sched.h>
 #include <time.h>
@@ -61,6 +61,10 @@ static uint8_t *g_stack; static size_t g_stack_cap;
 // Extra room opened below each mapped stack (DM_STKSLACK=<bytes>, default 512 KiB, 0 = off)
 static uint64_t g_stk_slack = 0x80000;
 
+// alias 区缺页兜底：定义在下面映射登记表之后（要用 g_map），这里先声明给 mem_init 注册用。
+// Alias demand-back: defined below the mapping registry because it needs g_map; declared here so mem_init can register it.
+static int alias_demand_back(void *addr, int is_write, void *uc);
+
 static void mem_init(void) {
     if (g_as) return;
     g_as = mmap(NULL, RESERVE, PROT_NONE, MAP_PRIVATE | MAP_ANON, -1, 0);
@@ -68,10 +72,33 @@ static void mem_init(void) {
     // 固定划分（都在预留块内）：别名区、栈、堆从 HEAP_OFF 起到块尾
     // Fixed partition (all inside the reserved block): alias region, stack, heap from HEAP_OFF to the end of the block
     g_alias = g_as + ALIAS_OFF; g_alias_cap = ALIAS_CAP;
-    g_stack = g_as + STACK_OFF; g_stack_cap = 0x10000000;
+    // 栈区报多大，决定客体能给多少个线程建栈：nn::os 的 MapAliasStack 走 StackGuardManager 的
+    // AddressSpaceAllocator，窗口就是 GetInfo(0xe)/(0xf) 这区间（sdk+0x137c24 里 start = 0xe 的值、end = 0xe + 0xf 的值），
+    // 每建一个线程要在这儿放下一整条栈（高海 Saga 是 8 MiB），线程不退出就不还。
+    // 写死 256 MiB 时实测：14 条之后 AllocateSpace 返 0 → MapAliasStack 返 Result 1 → sdk+0x1365c4 AbortImpl（退出码 42），
+    // 而那 256 MiB 之外我们本来就留了 STACK_OFF..HEAP_OFF 的空闲窗口没用。iOS 那边这个差正好还是 0x10000000，行为不变。
+    // How large we report the stack region decides how many threads the guest can build: nn::os's MapAliasStack allocates from
+    // StackGuardManager's AddressSpaceAllocator, whose window is exactly this GetInfo(0xe)/(0xf) range (in sdk+0x137c24: start = the 0xe value, end = 0xe + 0xf),
+    // and each new thread needs its whole stack here (8 MiB for High Sea Saga), never returned while the thread lives.
+    // With 256 MiB hard-coded, measured: after 14 stacks AllocateSpace returns 0 → MapAliasStack gives Result 1 → AbortImpl at sdk+0x1365c4 (exit 42),
+    // while the STACK_OFF..HEAP_OFF window we reserved and left unused was far bigger. On iOS the difference is still 0x10000000, so nothing changes there.
+    g_stack = g_as + STACK_OFF; g_stack_cap = HEAP_OFF - STACK_OFF;
     g_heap  = g_as + HEAP_OFF;  g_heap_cap  = RESERVE - HEAP_OFF;   // 4 GB，容得下游戏那一整块约 3.2 GB 的堆 | 4 GB, enough to hold the game's single heap block of about 3.2 GB
     { const char *sl = getenv("DM_STKSLACK"); if (sl) g_stk_slack = strtoull(sl, NULL, 0); }
+    dm_fault_hook_register(alias_demand_back);
     LOG("guest AS %p +%#llx  heap %p alias %p stack %p 栈下余量 %#llx", g_as, (unsigned long long)RESERVE, g_heap, g_alias, g_stack, (unsigned long long)g_stk_slack);
+}
+
+// 宿主常驻内存（MB）：鸿蒙读 /proc/self/statm 第二列；iOS 没有 /proc，返回 -1 让日志显示「-1」，不骗人。
+// Host resident memory in MB: on HarmonyOS read column 2 of /proc/self/statm; iOS has no /proc so return -1 and let the log show it, rather than lie.
+static long long host_rss_mb(void) {
+#if defined(__APPLE__)
+    return -1;
+#else
+    FILE *f = fopen("/proc/self/statm", "r"); if (!f) return -1;
+    long long tot = 0, rss = 0; int n = fscanf(f, "%lld %lld", &tot, &rss); fclose(f);
+    return n == 2 ? rss * (long long)sysconf(_SC_PAGESIZE) / (1 << 20) : -1;
+#endif
 }
 
 // 应用内存池 = Switch（4 GB 机型）给应用的 3285 MB。游戏启动（main+0x1b66160）把 QueryMemoryInfo 报的总量整块设成堆、失败就减 2 MB 重试，
@@ -163,6 +190,41 @@ static void map_add(uint64_t b, uint64_t n, uint64_t src, uint32_t st) {
 }
 static void map_del(int i) { pthread_mutex_lock(&g_map_lock); g_map[i] = g_map[--g_nmap]; pthread_mutex_unlock(&g_map_lock); }
 
+// alias 区缺页兜底。alias 区在预留块里天生是 PROT_NONE，客体要哪页我们才 mprotect 哪页（SVC 0x2C）。
+// Unity 系（高海 Saga DX）不守这个规矩：它按 2 GB 对齐划设备堆，块基址直接当对象指针使，却只对用过的页发
+// 映射请求——v14 实测线程「UnityGfxDeviceWorker」拿 x0=0x6b00000000 读 +0x24d0，而整段
+// [0x6b00000000, 0x6b64c80000) 一次映射请求都没发过（DM_SVC=1 那轮收到 121 条，全在洞的两侧）。真机 VAMM
+// 在建块时就把物理页绑好，那边读得动。这里补上这一步：按需把该页设成可读写零页再继续。
+// 只在「本来就要如实报崩」的路上触发：钩子排在缺页钩子链里，不属于 alias 区的地址一律返回 0 交下去。
+// Alias demand-back. The alias region inside the reservation is PROT_NONE by construction and a page only became RW
+// when the guest asked for it (SVC 0x2C). The Unity line does not honour that -- it carves the device heap on 2 GB
+// boundaries and uses a block base straight as an object pointer, yet requests pages only for the part it touches:
+// measured in v14, the thread 「UnityGfxDeviceWorker」 dereferenced x0=0x6b00000000 at +0x24d0 while
+// [0x6b00000000, 0x6b64c80000) never got one request (the DM_SVC=1 run logged 121, all on either side of the hole).
+// Real-hardware VAMM binds the physical pages when it creates the block, so that read works there; this supplies the
+// missing step -- back the page as zeroed read/write memory and carry on. It only fires on a path that was about to
+// report a crash anyway: an address outside the alias region returns 0 and falls through to the next hook.
+static int alias_demand_back(void *addr, int is_write, void *uc)
+{
+    (void)uc;
+    uint64_t lo = (uint64_t)g_alias, hi = lo + g_alias_cap, a = (uint64_t)(uintptr_t)addr;
+    if (!g_alias || a < lo || a >= hi) return 0;
+    uint64_t p = a & ~(uint64_t)0x1FFFFF, n = 0x200000;   // 2 MB 一页，贴边时退到 4 KiB | 2 MB granularity, 4 KiB at the edge
+    if (p < lo) { p = a & ~(uint64_t)0xFFF; n = 0x1000; }
+    if (p + n > hi) n = hi - p;
+    if (mprotect((void *)p, (size_t)n, PROT_READ | PROT_WRITE) != 0) return 0;
+    if (pthread_mutex_trylock(&g_map_lock) == 0) {   // 登记：QueryMemory 不能再把这个区间当成空闲 | so QueryMemory stops reporting it free
+        if (g_nmap < MAX_MAP) g_map[g_nmap++] = (typeof(g_map[0])){ p, n, 0, 0x0C /*MappedMemory*/ };
+        pthread_mutex_unlock(&g_map_lock);
+    }
+    static _Atomic unsigned nb;
+    unsigned k = atomic_fetch_add(&nb, 1);
+    if (k < 24) LOG("alias 按需供页 %p+%#llx（缺页 %p，客体在【%s】）", (void *)p, (unsigned long long)n, addr,
+                    is_write ? "写" : "读");
+    else if (k == 24) LOG("alias 按需供页 已累计 %u 页，后续不再逐条打印", k);
+    return 1;
+}
+
 int svc_thread(int num, uint64_t *regs);   // hle_thread.c：线程与同步类 | hle_thread.c: thread and synchronization kind
 
 // 诊断：睡眠/等待类 svc 打「客体调用者」。依据：门块公共段是 stp x29,x30,[sp,#-16]! + blr，
@@ -185,7 +247,18 @@ static void svc_caller_diag(int num, const uint64_t *regs, uint64_t orig_addr) {
         slot = seen_cnt; seen_lr[seen_cnt++] = lr;
     }
     unsigned n = __atomic_fetch_add(&seen_n[slot], 1, __ATOMIC_RELAXED);
-    if (n >= 3) return;                       // 每个调用点前 3 次（栈链已够长，省日志量）| first 3 hits per call site
+    // 长睡（>=100 ms）单独放行：帧限流器一旦把时钟算错就会睡到天荒地老，而「每调用点前 3 次」的额度早被 10 ms 轮询吃光，
+    // 这类必须一直看得见（每 64 次打一条，避免刷屏）。
+    // Let long sleeps (>=100 ms) through separately: a frame limiter with a bad clock sleeps forever, but the first-3-per-site
+    // budget is already spent on 10 ms polling, so these have to stay visible (one line every 64 hits).
+    int big = num == 0x0B && regs[0] >= 100000000ULL;
+    // 进程宽键等待（0x1C/0x1D）也留一条常流水：前端冻死时十几条客体线程全停在 0x1C，只看前 3 次的话
+    // 稳态恰好落在额度之外，等于没有探针。每 1024 次放一条，够认出「谁在等哪个键、等了多久」。
+    // Leave a trickle for the process-wide-key waits (0x1C/0x1D): when the front end froze, a dozen guest threads all sat
+    // in 0x1C, and with only the first 3 hits per site the steady state falls outside the budget, i.e. no instrument at all.
+    // One line every 1024 hits is enough to see who waits on which key, and for how long.
+    int pwk = (num == 0x1C || num == 0x1D) && n >= 3 && (n - 3) % 1024 == 0;
+    if (n >= 3 && !(big && (n - 3) % 64 == 0) && !pwk) return;   // 每个调用点前 3 次（栈链已够长，省日志量）| first 3 hits per call site
     char chain[420]; chain[0] = 0; size_t used = 0;
     uint64_t fp = regs[29]; int lvl = 0;
     while (fp && lvl < 6) {
@@ -211,10 +284,12 @@ uint64_t svc_dispatch(int num, uint64_t *regs, uint64_t orig_addr) {
     // Per-thread last SVC number: printed by the sampler to tell "blocked" from "spinning inside an SVC".
     { extern void thr_dump_maybe_start(void); thr_dump_maybe_start(); }
     { extern void spur_maybe_start(void); spur_maybe_start(); }
-    { extern _Atomic int g_last_svc[256]; extern unsigned thr_cur_slot(void);
-      atomic_store_explicit(&g_last_svc[thr_cur_slot() & 0xff], num, memory_order_relaxed); }
+    { extern _Atomic int g_last_svc[256]; extern _Atomic uint64_t g_last_svc_a0[256]; extern unsigned thr_cur_slot(void);
+      unsigned sl = thr_cur_slot() & 0xff;
+      atomic_store_explicit(&g_last_svc[sl], num, memory_order_relaxed);
+      atomic_store_explicit(&g_last_svc_a0[sl], regs[0], memory_order_relaxed); }
     { void hlecount_svc(int); hlecount_svc(num); }   // DM_HLECOUNT：svc 按号计数 | DM_HLECOUNT: svc counts by number
-    if (num == 0x0B || num == 0x11 || num == 0x18) svc_caller_diag(num, regs, orig_addr);
+    if (num == 0x0B || num == 0x11 || num == 0x18 || num == 0x1C || num == 0x1D) svc_caller_diag(num, regs, orig_addr);
     mem_init();
     if (svc_thread(num, regs)) return regs[0];
     { uint64_t svc_host_call(int, uint64_t *); if (num >= 0x80 && svc_host_call(num, regs)) return regs[0]; }   // 0x80 起：剪口约定的宿主调用（hle_tact.c） | from 0x80: host calls by cut convention (hle_tact.c)
@@ -301,7 +376,17 @@ uint64_t svc_dispatch(int num, uint64_t *regs, uint64_t orig_addr) {
         int rc = num == 0x2C ? mprotect(a, size, PROT_READ | PROT_WRITE)
                              : (madvise(a, size, MADV_FREE), mprotect(a, size, PROT_NONE));
         if (rc) die("SVC %#x mprotect %p+%#zx errno=%d", num, a, size, errno);
-        if (g_flag.svc) LOG("%sPhysicalMemory %p+%#zx", num == 0x2C ? "Map" : "Unmap", a, size);
+        // alias 水位 + 宿主常驻：v20 把这台中止钉到「栈区窗口」而不是 alias 区——客体的 8 MiB 线程栈落在 GetInfo(0xe)/(0xf)
+        // 报的那段里，256 MiB 只够 14 条，栈区放大后接着要盯的是宿主常驻（每条栈被 memcpy 写过就是 8 MiB 实页）。
+        // Alias water level plus host residency: v20 pinned this abort to the "stack region window", not the alias region -- the guest's 8 MiB
+        // thread stacks live in what GetInfo(0xe)/(0xf) reports, and 256 MiB only fits 14 of them. With the stack region widened, the number to
+        // watch next is host residency (a stack once written by the memcpy is 8 MiB of real pages).
+        static _Atomic long long use; static _Atomic unsigned nm, nu;
+        long long d = num == 0x2C ? (long long)size : -(long long)size;
+        long long u = atomic_fetch_add(&use, d) + d;
+        atomic_fetch_add(num == 0x2C ? &nm : &nu, 1);
+        if (g_flag.svc) LOG("%sPhysicalMemory %p+%#zx（alias 水位 %lld MB，映射 %u 段 / 卸载 %u 次，宿主常驻 %lld MB）", num == 0x2C ? "Map" : "Unmap", a, size,
+                            u >> 20, atomic_load(&nm), atomic_load(&nu), host_rss_mb());
         regs[0] = 0; return 0;
     }
     case 0x26: {  // Break(reason, ptr, size)：SDK 致命中止 | Break(reason, ptr, size): SDK fatal abort
@@ -370,6 +455,18 @@ uint64_t svc_dispatch(int num, uint64_t *regs, uint64_t orig_addr) {
         // so a bare _exit takes the Break line and the few lines before it away with it.
         fflush(stderr); fflush(stdout);
         usleep(400000);
+        // 中止同样是一次现场：把崩溃路径那两件套（NVN 调用普查 + 客体线程清单）也导一份。
+        // 普查一条就 4 KB、线程清单每线程一条长行，走 stderr→hilog 桥会被整条吞掉（v19 的两次中止什么都没留下），
+        // 所以先把 fd 2 改道到 $DM_CRASHDIR/break.txt 再打。
+        // An abort is a scene too: export the same two items the crash path exports (the NVN call census + the guest thread list).
+        // The census is one 4 KB line and the thread list one long line per thread, and the stderr->hilog bridge swallows such lines whole
+        // (the two aborts in v19 left nothing behind), so redirect fd 2 to $DM_CRASHDIR/break.txt before printing.
+        { const char *d = getenv("DM_CRASHDIR"); if (!d || !*d) d = getenv("DM_SAVE");
+          if (d && *d) { char p[512]; snprintf(p, sizeof p, "%s/break.txt", d);
+              int fd = open(p, O_WRONLY | O_CREAT | O_TRUNC, 0644); if (fd >= 0) { dup2(fd, 2); close(fd); } } }
+        { extern void nvn_dump_counts(const char *); nvn_dump_counts("中止时"); }
+        { extern void svc_thread_dump(void); svc_thread_dump(); }
+        fflush(stderr);
         _exit(42);
     }
     case 0x1E: regs[0] = 0; regs[1] = guest_ns() * 12 / 625; return 0;   // GetSystemTick

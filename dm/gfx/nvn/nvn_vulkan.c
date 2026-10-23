@@ -11,6 +11,7 @@
 #include <native_window/external_window.h>
 #include <hilog/log.h>
 #include "nvn_mtl.h"
+#include "../../host/dm.h"   // dm_guest_write_prepare：流内写入落在写保护的客体池页上时得先解保护 | unprotect guest pool pages before the host writes into them
 #include "nvn_obj.h"
 #include "nvn_tex.h"
 #include "dmsh_chain.h"
@@ -18,6 +19,7 @@
 #include "nvn_shbin.h"      // 构建机折出的着色器二进制库（shaders.bin）的布局 | layout of the binary shader library packed by the build box
 #include "nvn_diag.h"
 #include "nvn_dirty.h"      // 客体内存写保护脏页：打包贴图上传后要能察觉游戏又写了它 | guest write-protect dirty tracking, so a packaged upload can notice the game rewrote it
+#include "nvn_rt_astc.h"    // B 路：设备自己在上传时把 BC3 编成 ASTC 4x4（astcenc 静态链进 .so）| round-B: the device transcodes BC3 -> ASTC 4x4 at upload time
 #include <CommonCrypto/CommonDigest.h>   // OHOS 替身：oc_sha256（compat/sha256.c），与 nvn_mtl.m 的 CC_SHA256 同一门 | compat shim, same call site as nvn_mtl.m
 #include "../ohos/xcomp_ohos.h"
 #include <pthread.h>
@@ -167,6 +169,14 @@ static uint64_t g_fence_val;
 static uint64_t g_submits, g_presents;
 #define DUMP_EVERY 60      // 出图节拍：每 60 帧做一次读回 + 打一遍绘制侧记账。300 帧在这台机要 75 秒（一帧 250 ms），一整轮实测都等不到第二次 dump
 static int g_in_pass;
+static int g_dyn_dirty = 1;   // 动态状态（视口/裁剪/深度界/混合常量/模板）待重发 | dynamic state pending a re-emit; see emit_dyn
+// 清屏掩码账（AN 轮）：客体每条 ClearDepthStencil 都带「清不清深度 / 清哪个模板值 / 清不清模板」，
+// 之前这三样一律不看，无条件清深度、模板一次都没清过。这四个计数把两种行为分开归因。
+// Clear-mask accounting: every guest ClearDepthStencil carries depthMask/stencil value/stencilMask, and all three were ignored -
+// depth was always cleared and stencil never was. These counters keep the two changes separately attributable.
+static _Atomic uint64_t g_dsc_s, g_dsc_nost, g_dsc_none, g_cc_nomask;
+static _Atomic uint64_t g_cc_mask_or;
+static _Atomic uint64_t g_cc_mask_and = ~(uint64_t)0;   // 与起来剩下的就是「每条清屏都写了哪些位」| the bits every single colour clear had in common
 // 通道没开成的原因计数（M2-3b 定位 无通道 用）| why a game render pass did not open (used to locate the 无通道 half of M2-3b)
 static _Atomic uint64_t g_rt_noatt, g_rt_nocb, g_rt_rp, g_rt_fb;
 static uint64_t g_buf_ops[OP_COUNT_];   // 本次提交里每种 op 的条数：驱动报错时把这条缓冲的构成打出来
@@ -184,6 +194,8 @@ typedef struct {
     uint32_t w, h, layers, levels;
     int is_depth;
     int soft_bc;                         // NVN 是 BC 块、设备一个 BC 都不认（第 81 轮实测）：像素要在 CPU 解码后上传，Vk 图按格式是 R8/RG8/RGBA8/RGBA16F
+    int rt_astc;                         // B 路：这张 0x44 的块在上传那一刻由设备自己编成 ASTC 4x4，Vk 图按 ASTC 建（不查素材清单）
+                                         // Round B: this 0x44 texture's blocks are transcoded to ASTC 4x4 by the device at upload time - no asset manifest involved
     int uploaded;                        // 已经把池里的内容送进显卡（后续刀次用）| pool content has been pushed to the device (later cuts)
     int pkg_bad;                         // 打包上传试过但失败（格式不认 / 越界 / arena 满）：不再反复排队 | packaged upload attempted and refused - stop re-queuing it
     int pkg_tried;                       // entered pkg_upload at least once; NOT proof of queue entry
@@ -485,6 +497,11 @@ static void sp_why(int code, int vi, int fi, int extra)
 
 // 计数（mtl_stats / mtl_res_counts 用）| counters (for mtl_stats / mtl_res_counts)
 static _Atomic uint64_t g_passes, g_draws, g_clears, g_dispatches, g_copies;
+// 命令流里的 CPU 可见写入（这两条在 Vulkan 层此前是"记账后丢掉"，Metal 层有实现）：
+// 计数 + 解址失败数 + 因此作废了几次arena/描述符缓存
+// CPU-visible writes inside the command stream (the Vulkan layer used to count and drop these; the Metal layer implements them):
+// occurrences, address-resolution failures, and how many times the arena/descriptor caches were voided because of them.
+static _Atomic uint64_t g_upd_ub, g_b2b, g_wrfail, g_wr_void;
 static _Atomic uint64_t g_ops[OP_COUNT_];
 
 static const char *vr(VkResult r)
@@ -505,6 +522,10 @@ static const char *vr(VkResult r)
 // NVNformat → VkFormat（本刀只覆盖窗口/通道会用到的那些；认不出的记数并回 0）
 // NVNformat -> VkFormat (this cut covers what the window / render passes use; unknowns are counted and return 0)
 static uint32_t g_bcap;   // 压缩格式能力位：1 BC1_RGB 2 BC1_RGBA 4 BC2 8 BC3 16 BC4 32 BC5 64 BC6H 128 BC7 256 ASTC | compressed-format support bits, probed once at boot
+static int g_tex_astc;    // DM_TEX_ASTC=1 且设备认 ASTC 4x4、又不认 BC3：NVN 0x44 的块直接按 ASTC 4x4 建图（素材要已在构建机离线转好）
+                          // With DM_TEX_ASTC=1 on an ASTC-only device, NVN 0x44 blocks are uploaded as ASTC 4x4 instead of being decoded on the CPU
+static float g_rt_astc;   // B 路：DM_RT_ASTC=<档位> 时由设备在上传那一刻把 BC3 现编成 ASTC 4x4。它不读素材清单，
+                          // 所以"离线烘漏了某个容器"这类事故在结构上不会发生；代价是编码耗时，全部记在 rt_astc_stat。
 
 // NVN 格式里有几个颜色分量（0 = 不知道：压缩、深度、以及 _UI2F 那一族的别名，这些一律留给恒等映射）。
 // 只算未压缩族，免得把软解码 BC 的错误也一起遮掉。
@@ -591,7 +612,9 @@ static VkFormat fmt_of(int f, int *depth)
     case 0x46: return g_bcap & 2   ? VK_FORMAT_BC1_RGBA_SRGB_BLOCK  : VK_FORMAT_R8G8B8A8_SRGB;
     case 0x43: return g_bcap & 4   ? VK_FORMAT_BC2_UNORM_BLOCK      : VK_FORMAT_R8G8B8A8_UNORM;
     case 0x47: return g_bcap & 4   ? VK_FORMAT_BC2_SRGB_BLOCK       : VK_FORMAT_R8G8B8A8_SRGB;
-    case 0x44: return g_bcap & 8   ? VK_FORMAT_BC3_UNORM_BLOCK      : VK_FORMAT_R8G8B8A8_UNORM;
+    case 0x44: return g_bcap & 8 ? VK_FORMAT_BC3_UNORM_BLOCK
+                       : g_tex_astc ? VK_FORMAT_ASTC_4x4_UNORM_BLOCK   // 离线转过素材的这一档：块尺寸与 BC3 一样（4×4 / 16 字节），搬块那一路不用改
+                       : VK_FORMAT_R8G8B8A8_UNORM;
     case 0x48: return g_bcap & 8   ? VK_FORMAT_BC3_SRGB_BLOCK       : VK_FORMAT_R8G8B8A8_SRGB;
     case 0x49: return g_bcap & 16  ? VK_FORMAT_BC4_UNORM_BLOCK      : VK_FORMAT_R8_UNORM;      // 单通道：解出来就是 R8（nvn_bcdec 的 1 bpp 目标）
     case 0x4A: return g_bcap & 16  ? VK_FORMAT_BC4_SNORM_BLOCK      : VK_FORMAT_R8_SNORM;
@@ -1188,6 +1211,15 @@ static vktex *tex_get(const tex_t *t)
     }
     VkFormat f = fmt_of(t->d.format, &depth);
     if (!f) { if (++g_tex_noformat <= 6) GRED("认不出的 NVN 格式 %{public}d（%{public}u x %{public}u），这张先不建", t->d.format, t->d.width, t->d.height); return NULL; }
+    // B 路：0x44（BC3）在设备认 ASTC 4x4、又不认 BC3 的机器上直接按 ASTC 4x4 建图，块在上传那一刻现编。
+    // 尺寸与 BC3 一模一样（4×4 / 16 字节），所以寻址、行距、mip 全不用改，只是"这批字节按什么解释"变了。
+    // Round B: build NVN 0x44 as ASTC 4x4 and transcode the blocks at upload. Same 4x4/16-byte geometry as BC3, so
+    // addressing, pitch and mips are untouched - only the interpretation of the bytes changes.
+    int rt_astc = 0;
+    if (g_rt_astc > 0.0f && !depth && t->d.format == 0x44 && (g_bcap & 256) && !(g_bcap & 8)) {
+        f = VK_FORMAT_ASTC_4x4_UNORM_BLOCK;
+        rt_astc = 1;
+    }
     if (g_tex_n >= VTN) { GRED("贴图表满了（%{public}d）", VTN); return NULL; }
     vktex *v = &g_tex[g_tex_n++];
     g_tex_gen++;
@@ -1198,6 +1230,8 @@ static vktex *tex_get(const tex_t *t)
     v->fmt = f;
     v->soft_bc = (t->d.format >= 0x41 && t->d.format <= 0x50) &&
                  !(f >= VK_FORMAT_BC1_RGB_UNORM_BLOCK && f <= VK_FORMAT_ASTC_12x12_SRGB_BLOCK);
+    v->rt_astc = rt_astc;
+    if (rt_astc) v->soft_bc = 0;
     v->is_depth = depth;
     v->w = t->d.width ? t->d.width : 1;
     v->h = t->d.height ? t->d.height : 1;
@@ -1207,6 +1241,14 @@ static vktex *tex_get(const tex_t *t)
         if (g_txfmt[i].f == t->d.format && g_txfmt[i].n) { atomic_fetch_add(&g_txfmt[i].n, 1); break; }
         if (!g_txfmt[i].n) { g_txfmt[i].f = t->d.format; atomic_fetch_add(&g_txfmt[i].n, 1); break; }
     }
+    // 每张一行：NVN 格式码 → Vk 格式 → 要不要 CPU 软解。直方图只在收尾的 打包: 行里出，跑不到收尾就一条也看不见；
+    // 有了这四十字段的头 40 张，资源到底是 BC（要离线转 ASTC）还是已经是 ASTC（直接进硬件）当场就能判。
+    // One line per texture: NVN code → Vk format → whether the CPU soft path is taken. The histogram only prints in the
+    // closing 打包: line, which a run that never finishes never reaches; the first 40 of these fields settle on the spot
+    // whether the assets are BC (needs the offline ASTC repack) or already ASTC (straight to hardware).
+    { static _Atomic unsigned g_tex_seq; unsigned k = atomic_fetch_add(&g_tex_seq, 1);
+      if (k < 40) GVL("[tex] 第%{public}u 张 %{public}u x %{public}u NVN格%{public}d → Vk%{public}d 级%{public}u 层%{public}u 深%{public}d 软解%{public}d",
+                      k, v->w, v->h, t->d.format, (int)f, v->levels, v->layers, depth, (int)v->soft_bc); }
 
     VkImageCreateInfo ii = { VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO };
     ii.imageType = VK_IMAGE_TYPE_2D;
@@ -1224,6 +1266,11 @@ static vktex *tex_get(const tex_t *t)
     // comparison sampler. Without SAMPLED that read can only fall back to the 1x1 dummy (one source of round 88's all-white frame).
     ii.usage = depth ? (VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT | VK_IMAGE_USAGE_SAMPLED_BIT)
                      : (VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_SAMPLED_BIT);
+    // 自转成 ASTC 的这张不能再要 COLOR_ATTACHMENT：压缩格式做不了渲染目标（客体本来也不可能往 BC3 里画），
+    // 要了只会在 vkCreateImage 那步被驱动拒掉，整张图建不出来。
+    // A transcoded ASTC image must not ask for COLOR_ATTACHMENT: compressed formats cannot be render targets (the guest
+    // cannot draw into BC3 either), and asking for it only makes vkCreateImage fail and lose the texture.
+    if (v->rt_astc) ii.usage = VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_SAMPLED_BIT;
     ii.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
     if (v->layers > 1) ii.flags |= VK_IMAGE_CREATE_2D_ARRAY_COMPATIBLE_BIT_KHR;
     if (vkCreateImage(g_dev, &ii, NULL, &v->img) != VK_SUCCESS) { GRED("vkCreateImage 失败 %{public}u x %{public}u 格式 %{public}d", v->w, v->h, (int)f); v->img = NULL; return NULL; }
@@ -1261,6 +1308,26 @@ static vktex *tex_get(const tex_t *t)
             iv.components.b = ch >= 3 ? VK_COMPONENT_SWIZZLE_B : VK_COMPONENT_SWIZZLE_ZERO;
             iv.components.a = VK_COMPONENT_SWIZZLE_ONE;
             if (g_tex_new < 8) GVL("[vk] 视图补 A=1：NVN 格式 %{public}d 分量 %{public}d → Vk %{public}d", (int)t->d.format, ch, (int)f);
+        }
+    }
+    // 客体显式改写过通道（nvnTextureBuilderSetSwizzle）时按它建视图。NVN 的枚举是 ZERO=0 ONE=1 R=2 G=3 B=4 A=5，
+    // Vulkan 的是 IDENTITY=0 ZERO=1 ONE=2 R=3 G=4 B=5 A=6 —— 非恒等时正好差 1。
+    // 没设过或设成恒等都不动，好让上面那条「不足四分量把 A 补成 1.0」继续生效（恒等映射在 Vulkan 里是 IDENTITY，
+    // 但 NVN 的恒等写作 R,G,B,A，两者对不足四分量格式的补值规矩不同）。
+    // When the guest explicitly reorders channels, build the view that way. The NVN enum is ZERO=0 ONE=1 R=2 G=3 B=4 A=5 and
+    // Vulkan's is IDENTITY=0 ZERO=1 ONE=2 R=3 G=4 B=5 A=6, so a non-identity swizzle is exactly +1. Unset or identity leaves the
+    // A=1.0 fix above in force: NVN spells identity as R,G,B,A, which substitutes differently than Vulkan's IDENTITY.
+    if (t->swz_set) {
+        int bad = 0;
+        for (int c = 0; c < 4; c++) if (t->swz[c] > NVN_TEXTURE_SWIZZLE_A) bad = 1;
+        if (bad) GRED("视图通道改写了非法值 %{public}u %{public}u %{public}u %{public}u（按恒等处理）", t->swz[0], t->swz[1], t->swz[2], t->swz[3]);
+        else if (t->swz[0] != NVN_TEXTURE_SWIZZLE_R || t->swz[1] != NVN_TEXTURE_SWIZZLE_G
+                 || t->swz[2] != NVN_TEXTURE_SWIZZLE_B || t->swz[3] != NVN_TEXTURE_SWIZZLE_A) {
+            iv.components.r = (VkComponentSwizzle)(t->swz[0] + 1);
+            iv.components.g = (VkComponentSwizzle)(t->swz[1] + 1);
+            iv.components.b = (VkComponentSwizzle)(t->swz[2] + 1);
+            iv.components.a = (VkComponentSwizzle)(t->swz[3] + 1);
+            if (g_tex_new < 8) GVL("[vk] 视图按客体改写 R%{public}u G%{public}u B%{public}u A%{public}u（NVN 编号）", t->swz[0], t->swz[1], t->swz[2], t->swz[3]);
         }
     }
     iv.subresourceRange = (VkImageSubresourceRange){ depth ? VK_IMAGE_ASPECT_DEPTH_BIT : VK_IMAGE_ASPECT_COLOR_BIT, 0, v->levels, 0, v->layers };
@@ -1593,6 +1660,7 @@ static void att(VkRenderingAttachmentInfo *a, VkImageView view, VkImageLayout la
 
 static void pkg_flush(void);   // 定义在拷贝那一节：通道外把排队中的打包贴图搬进显卡 | defined with the copy ops: push queued packaged textures outside a pass
 static void pkg_queue(vktex *v);   // 绑定看到「有图没来源」时排一张，等通道外冲刷 | queue an image that has no source yet; flushed outside the pass
+static void pkg_upload_now(vktex *v);   // 绑定当场搬（见打包那一节的定义）| upload at bind time from inside the pass
 
 static void pass_end(void)
 {
@@ -1839,6 +1907,7 @@ static void do_set_rt(const p_set_rt *r)
     memset(cv, 0, sizeof cv);
     vkCmdBeginRenderPass(g_cb, &rpb, VK_SUBPASS_CONTENTS_INLINE);
     g_p.rp = rp; g_p.pk = key;      // 管线要照这条通道建 | pipelines are built against this pass
+    g_dyn_dirty = 1;                // 新开通道：第一条绘制必须重发一遍动态状态 | a fresh pass forces a re-emit on the first draw
     g_in_pass = 1;
     atomic_fetch_add(&g_passes, 1);
     for (int i = 0; i < 8; i++) {   // 尺寸直方图：只认前 8 种，够看出「游戏根本没往屏幕尺寸那张画」
@@ -1850,6 +1919,9 @@ static void do_set_rt(const p_set_rt *r)
 static void do_clear_color(const p_clear_color *r)
 {
     if (!g_in_pass || !g_cb) return;
+    if (!r->mask) atomic_fetch_add(&g_cc_nomask, 1);   // 先只记账：这一刀不改行为，掩码语义确认了再动 | count only for now - do not change behavior until the mask's meaning is proven
+    atomic_fetch_or(&g_cc_mask_or, (uint64_t)(uint32_t)r->mask);
+    atomic_fetch_and(&g_cc_mask_and, (uint64_t)(uint32_t)r->mask);
     VkClearAttachment ca = { VK_IMAGE_ASPECT_COLOR_BIT, 0, {{0}} };
     ca.colorAttachment = (uint32_t)(r->index < 0 ? 0 : r->index);
     if (ca.colorAttachment >= g_p.ncol) return;   // 清了没挂的槽：驱动不会替我们圆 | clearing an unattached slot: the driver will not paper over it for us
@@ -1860,11 +1932,42 @@ static void do_clear_color(const p_clear_color *r)
     atomic_fetch_add(&g_clears, 1);
 }
 
+static int fmt_has_stencil(VkFormat f)
+{
+    switch (f) {
+    case VK_FORMAT_S8_UINT:
+    case VK_FORMAT_D16_UNORM_S8_UINT:
+    case VK_FORMAT_D24_UNORM_S8_UINT:
+    case VK_FORMAT_D32_SFLOAT_S8_UINT: return 1;
+    default: return 0;   // D32 / X8_D24_PACK32 这类根本没有模板面，清它 = 未定义行为 | no stencil aspect to clear; asking for one is undefined
+    }
+}
+
 static void do_clear_ds(const p_clear_ds *r)
 {
     if (!g_in_pass || !g_cb || !g_p.has_ds) return;
-    VkClearAttachment ca = { VK_IMAGE_ASPECT_DEPTH_BIT, 0, {{0}} };
+    // 客体的两个掩码以前完全不看：无条件清深度、模板一次都没清过。
+    // 通道是 DONT_CARE 开的，所以模板面每趟都是未定义值——任何开模板测试的绘制结果都由驱动心情决定，
+    // 这正是「弹窗标题在、按钮文字整条空」的形状（同一套字体着色器，差别只在状态）。
+    // The guest masks were ignored entirely: depth was always cleared, stencil never. The pass opens DONT_CARE, so the stencil
+    // plane held undefined bits every pass - which is the shape of "the popup title draws but its button label is blank".
+    VkImageAspectFlags af = 0;
+    if (r->depth_mask) af |= VK_IMAGE_ASPECT_DEPTH_BIT;
+    if (r->stencil_mask) {
+        if (g_p.dv && fmt_has_stencil(g_p.dv->fmt)) { af |= VK_IMAGE_ASPECT_STENCIL_BIT; atomic_fetch_add(&g_dsc_s, 1); }
+        else atomic_fetch_add(&g_dsc_nost, 1);
+    }
+    if (!af) {
+        // 两个掩码都说"不清"：先退回旧行为（照旧清深度）并记账，而不是真的什么都不做。
+        // 要是 NVN 这个参数其实不是布尔，"一个都不清"会把深度攒爆——那是拿整个世界去赌一条签名判读。
+        // Both masks say "clear nothing": fall back to the old depth-only clear and count it, rather than trusting the reading
+        // with the whole world as the stake. 全跳>0 就是这条判读要重看的信号。
+        af = VK_IMAGE_ASPECT_DEPTH_BIT;
+        atomic_fetch_add(&g_dsc_none, 1);
+    }
+    VkClearAttachment ca = { af, 0, {{0}} };
     ca.clearValue.depthStencil.depth = r->depth;
+    ca.clearValue.depthStencil.stencil = (uint32_t)r->stencil;
     VkClearRect cr = { .rect = (VkRect2D){ { 0, 0 }, att_min() }, .baseArrayLayer = 0, .layerCount = 1 };
     vkCmdClearAttachments(g_cb, 1, &ca, 1, &cr);
 }
@@ -1920,6 +2023,13 @@ void mtl_sub_begin(void)
     cb_begin();
     mtl_sub_reset_draw();   // 只有真开出一条新缓冲才算换一代：游标随这条命令缓冲一起作废 | a fresh generation needs a fresh buffer
 }
+
+// 现在能不能另开一趟提交：命令池 g_cp 上只允许一条缓冲在用，通道开着时更发不了 transfer。
+// 设备自带命令缓冲收口执行前先问这一句，问不到就整批留到下一个安全点，绝不插进别人那条命令缓冲。
+// Can another submission be opened? The command pool g_cp holds one in-use buffer at a time and a transfer cannot be issued
+// inside an open pass. The device-owned buffer asks this before draining; if the answer is no, the records wait for the next
+// safe point instead of being recorded into somebody else's command buffer.
+int mtl_sub_idle(void) { return !g_cb && !g_in_pass && !atomic_load(&g_dead); }
 
 void mtl_sub_index(const uint64_t *h, int n) { (void)h; (void)n; }
 void mtl_exec_rest(const uint64_t *handles, int n) { (void)handles; (void)n; }
@@ -2628,6 +2738,10 @@ static progrec g_progs[PROG_MAX];
 static int g_nprogs;
 static progrec *g_cur_prog;             // 本句柄当前绑定的程序，BEGIN 清掉 | program bound in this handle, cleared at BEGIN
 static int g_bind_vi = -1, g_bind_fi = -1;   // 本条录制里已绑过的半边（客体一段一个程序时用它凑成对）| the half already bound in this recording (used to complete a pair when the guest binds one stage per program)
+// 继承来的那半边只带一个库下标，事后查不到它是谁——把当时那段的键一起留下，继承行才点得出名
+static char g_bind_vk[17], g_bind_fk[17];
+static _Atomic uint64_t g_inherit;           // 半段继承发生次数（下面 inherit_note）
+static _Atomic uint64_t g_inherit_null;      // 没得继承（另一半从没绑过）只好留空的次数
 static _Atomic uint64_t g_ctrl_bad, g_draw_noprog;
 static uint32_t g_prim_hist[32];        // OP_DRAW 的拓扑直方图 | primitive topology histogram of OP_DRAW
 static uint32_t g_itype_hist[8];        // OP_DRAW_IDX 的索引类型直方图 | index type histogram of OP_DRAW_IDX
@@ -2659,13 +2773,18 @@ static void sh_key_of(const void *ctrl, uint64_t code_addr, size_t klen, char ou
 // One line per new stage key: the set of these lines is the input list for the offline SPIR-V build (round 66's 40-entry cap missed the most-drawn program)
 // DM_VK_KEYDUMP=<沙箱绝对路径>：每个新键把**客体内存里那份控制段（0x880）+ 它的指令区**原样落盘，离线翻译就以这份为准。
 // 为什么非要落盘（B20 实测）：饥荒的控制段真身只有 0x838 字节（D2R 是 0x880），文件侧的 .ksh 在 0x838 之后接的是本段自己的指令区，
-// 逐字节比对：前 0x838 一致，差异全落在 +0x838 之后 ⇒ 拿 romfs 的 shaders_nx/*.ksh 算出来的键对不上设备。
-// 键式换到「前缀 + 码」（见上）后这条差异不再是问题，但落盘仍然是出题依据：翻译器要的就是这份被装载改写过的指令区。
+// 逐字节比对：前 0x838 一致，差异全落在 +0x838 之后 ⇒ 当年「整段哈希」算出来的键对不上设备。
+// 键式换到「前缀 + 码」（见上）之后这条差异不再是问题：拿 romfs 的 shaders_nx/*.ksh 扫魔数 34 12 76 98 就能离线复键
+// （第 N 轮实测 98 段 / 64 个文件、93 段可翻译，世界内缺的 5461f70680ae7d03 + 96225b5d4c6aa151 就是这么从 lighting.ksh 补回来的）。
+// 落盘仍然是首选出题依据：翻译器要的是这份被装载改写过的指令区，.ksh 里的是改写前的。
 // DM_VK_KEYDUMP=<absolute sandbox path>: for every new key, dump the control segment (0x880) and its instruction area exactly as they sit in guest memory - the offline translator builds from this copy.
 // Why a dump was mandatory (measured on B20): Don't Starve's real control segment is only 0x838 bytes (D2R uses 0x880), and in a .ksh file what follows those 0x838 bytes is this stage's own instruction area.
-// Byte-for-byte: the first 0x838 match, every difference lies past +0x838 => keys computed from the romfs shaders_nx/*.ksh never matched the device.
-// After moving the key to "stable prefix + code" that gap no longer breaks matching, but the dump stays the source of truth: it is the loader-patched instruction area the translator needs.
+// Byte-for-byte: the first 0x838 match, every difference lies past +0x838 => a whole-segment hash never matched the device.
+// After moving the key to "stable prefix + code" that gap stopped mattering: scanning the romfs shaders_nx/*.ksh for magic 34 12 76 98 reproduces device keys offline
+// (round N measured 98 segments across 64 files, 93 translatable - the in-world pair 5461f70680ae7d03 + 96225b5d4c6aa151 came back that way, straight out of lighting.ksh).
+// The dump stays the preferred source anyway: it is the loader-patched instruction area the translator wants, while the .ksh holds the pre-patch bytes.
 // 记录 = 32 字节头（键 16 / 段号 4 / 码地址 8 / 码长 4，小端）+ 0x880 控制段 + 码长字节指令区。
+// 饥荒客体一次只给一段（段数 1）⇒ 这里记的段号恒为 0，vs/ps 只能等翻译后的反射判；文件按 "wb" 打开，重启会清空上一轮已落盘的键，换进程前先把它取回来。
 static void key_note(int stage, const char *k, const void *ctrl, uint64_t code_addr)
 {
     for (int i = 0; i < g_nshkeys; i++) if (!strcmp(g_shkeys[i], k)) return;
@@ -2692,6 +2811,20 @@ static void key_note(int stage, const char *k, const void *ctrl, uint64_t code_a
           if (cl) fwrite(cd, 1, cl, kf);
           fflush(kf);
       } }
+}
+
+// 半段继承（#45）：客体一段一个程序，缺的那一半从「本条录制刚绑过的那半」里补。
+// 补进来的那条可能是上一屏留下的旧副本，而这条路 无库/无管线 一个都不响——AC 轮 426 万笔绘制里
+// 「无库0」就是这么被静错配蒙过去的。所以继承发生的那一刻单独记账，并把被继承的键点名。
+// The half-pair carry-over: the guest binds one stage per program, and the missing half is taken from the one
+// bound last in this recording. That half can be a leftover from an earlier screen, and neither 无库 nor 无管线
+// fires on it -- which is how 4.26M draws of round AC reported 无库0 while a pair was silently wrong.
+static void inherit_note(const char *key, int half_is_frag, int ei, const char *inherited_key)
+{
+    uint64_t n = atomic_fetch_add(&g_inherit, 1) + 1;
+    if (n <= 16)
+        GVL("[vk] 半段继承 第%{public}llu 次：本段%{public}s 缺%{public}s半，取自上次绑定 → 序%{public}d 键%{public}s",
+            (unsigned long long)n, key, half_is_frag ? "像" : "顶", ei, inherited_key && inherited_key[0] ? inherited_key : "-");
 }
 
 static void do_bind_program(const p_bind_program *r)
@@ -2743,10 +2876,28 @@ static void do_bind_program(const p_bind_program *r)
     if (ns == 1 && e->key[0][0] && (e->vi < 0 || e->fi < 0)) {
         int vi = -1, fi = -1;
         if (shb_stage(e->key[0], &vi, &fi)) {
-            if (vi >= 0) { e->vi = vi; if (g_bind_fi >= 0) e->fi = g_bind_fi; g_bind_vi = vi; }
-            else if (fi >= 0) { e->fi = fi; if (g_bind_vi >= 0) e->vi = g_bind_vi; g_bind_fi = fi; }
+            if (vi >= 0) {
+                e->vi = vi;
+                if (g_bind_fi >= 0) { e->fi = g_bind_fi; inherit_note(e->key[0], 1, g_bind_fi, g_bind_fk); }
+                else atomic_fetch_add(&g_inherit_null, 1);
+                g_bind_vi = vi; memcpy(g_bind_vk, e->key[0], 17);
+            } else if (fi >= 0) {
+                e->fi = fi;
+                if (g_bind_vi >= 0) { e->vi = g_bind_vi; inherit_note(e->key[0], 0, g_bind_vi, g_bind_vk); }
+                else atomic_fetch_add(&g_inherit_null, 1);
+                g_bind_fi = fi; memcpy(g_bind_fk, e->key[0], 17);
+            }
         }
-    } else if (e->vi >= 0 && e->fi >= 0) { g_bind_vi = e->vi; g_bind_fi = e->fi; }
+    } else if (e->vi >= 0 && e->fi >= 0) {
+        g_bind_vi = e->vi; g_bind_fi = e->fi;
+        if (ns == 1) {
+            // 单段程序这次是从库里配上的：只有本段的键是权威的，另一半清空，别把上一屏的键贴到新下标上
+            int sv = -1, sf = -1;
+            shb_stage(e->key[0], &sv, &sf);
+            if (sv >= 0) { memcpy(g_bind_vk, e->key[0], 17); g_bind_fk[0] = 0; }
+            else { memcpy(g_bind_fk, e->key[0], 17); g_bind_vk[0] = 0; }
+        } else { memcpy(g_bind_vk, e->key[0], 17); memcpy(g_bind_fk, e->key[1], 17); }
+    }
     g_cur_prog = e;
 }
 
@@ -2803,9 +2954,18 @@ static void vk_probe_dump(void)
     for (int i = 0; i < 8 && m < (int)sizeof line - 12; i++) if (g_itype_hist[i]) m += snprintf(line + m, sizeof line - m, " i%d:%u", i, g_itype_hist[i]);
     GVL("%{public}s", line);
     {   // 绘制重放单独一行：上一行已被 op 直方图占了大半，拼在一起会被截掉 | its own line: the op histogram already fills most of the buffer, so appending there truncates
-        char ds[1280]; ds[0] = 0;
+        char ds[4096]; ds[0] = 0;
         draw_stats_line(ds, 0, (int)sizeof ds);
         GVL("%{public}s", ds);
+        if (g_rt_astc > 0.0f) {   // 缓存单独一行：判"第二次启动到底有没有走盘"就看这行的命中数
+            uint64_t ch = 0, cw = 0, cio = 0, ccap = 0, cmb = 0;
+            rt_astc_cache_stat(&ch, &cw, &cio, &ccap, &cmb);
+            char cl[224];
+            snprintf(cl, sizeof cl, "[vk] ASTC缓存 命中=%llu 新写=%llu 盘错=%llu 额尽=%llu 已存=%llu MB",
+                     (unsigned long long)ch, (unsigned long long)cw, (unsigned long long)cio,
+                     (unsigned long long)ccap, (unsigned long long)cmb);
+            GVL("%{public}s", cl);
+        }
         {   // 空图清单单独一行（纯 ASCII）：一次性现场行会被 hilog 环形缓冲挤掉，只有跟着周期行走得出去
             char el[640]; el[0] = 0;
             emp_line(el, (int)sizeof el);
@@ -2939,6 +3099,55 @@ static void probe_bc(void)
     }
     g_bcap = got;
     GVL("%{public}s", line);
+    // BC→ASTC 那条离线近路：只在「设备认 ASTC 4x4 又不认 BC3」时成立，否则照旧。开关要跟转换过的素材一起开，
+    // 没转的 .tex 里是 BC3 块，按 ASTC 采样就是一张花图 —— 所以这里把「开了但素材未必转过」喊出来。
+    // The offline BC->ASTC shortcut only applies when the device samples ASTC 4x4 but not BC3, and it has to be
+    // paired with the baked assets: an unconverted .tex read as ASTC is a garbled image, so say so out loud.
+    {
+        const char *s = getenv("DM_TEX_ASTC");
+        int want = s && !strcmp(s, "1");
+        // 没给开关时看包自己：烘过的素材跟着包走，从桌面图标点进来（没有 --ps 参数）才不会把 ASTC 块当 BC3 软解成花图。
+        // 判据是包里的 data/astc_baked.txt（构建机烘完素材时一起放；hvigor 收点文件会丢，所以这个名字不带点）。
+        // With no switch given, ask the package: baked assets travel with it, so a launcher-icon start (no --ps) does not
+        // read ASTC blocks as BC3 and garble the screen. The marker is data/astc_baked.txt (hvigor drops dotfiles, hence the name).
+        if (!s) {
+            const char *rf = getenv("DM_ROMFS");
+            char mk[1400];
+            struct stat sb;
+            if (rf && rf[0] && snprintf(mk, sizeof mk, "%s/data/astc_baked.txt", rf) < (int)sizeof mk &&
+                !stat(mk, &sb) && S_ISREG(sb.st_mode)) {
+                want = 1;
+                GVL("[vk] 包内素材已烘 ASTC（%{public}s）：自动按 ASTC 4x4 建图", mk);
+            }
+        }
+        g_tex_astc = want && (got & 256) && !(got & 8);
+        if (want && !g_tex_astc)
+            GVL("[vk] DM_TEX_ASTC=1 没生效：ASTC4 收不收=%{public}d BC3 收不收=%{public}d", (got & 256) != 0, (got & 8) != 0);
+        else if (g_tex_astc)
+            GVL("[vk] DM_TEX_ASTC=1：NVN 0x44 按 ASTC 4x4 建图，不再 CPU 软解（素材须已在构建机转好）");
+    }
+    // B 路开关：DM_RT_ASTC=<档位>（10=FAST，60=MEDIUM，与离线烘同一档位才可比）。开了就不许再走 A 路：
+    // A 路读的是烘过的字节，B 路读的是原厂 BC3，两个同时开等于让 B 去编 ASTC 字节。
+    // Round B: DM_RT_ASTC=<preset>. It is mutually exclusive with the offline bake - B transcodes pristine BC3, so
+    // turning both on would ask B to encode already-encoded bytes.
+    {
+        const char *s = getenv("DM_RT_ASTC");
+        float p = s ? (float)atof(s) : 0.0f;
+        if (p > 0.0f && (got & 256) && !(got & 8)) {
+            if (g_tex_astc) { g_tex_astc = 0; GVL("[vk] DM_RT_ASTC 顶掉了 DM_TEX_ASTC：设备自转要读原厂 BC3，不能再按已烘的字节建图"); }
+            if (!rt_astc_init(p)) {
+                g_rt_astc = p;
+                // 同一轮里就把缓存装没装说清楚：装上了回目录，没装回原因（探针读空先自证装没装）
+                const char *cd = rt_astc_cache_dir();
+                GVL("[vk] DM_RT_ASTC=%{public}.0f：BC3 在上传那一刻由设备现编成 ASTC 4x4（不查素材清单）｜缓存:%{public}s",
+                    p, cd ? cd : rt_astc_cache_off());
+            } else {
+                GVL("[vk] DM_RT_ASTC=%{public}.0f 没生效：%{public}s", p, rt_astc_err());
+            }
+        } else if (p > 0.0f) {
+            GVL("[vk] DM_RT_ASTC=%{public}.0f 没生效：ASTC4 收不收=%{public}d BC3 收不收=%{public}d", p, (got & 256) != 0, (got & 8) != 0);
+        }
+    }
 }
 
 static void vk_read_limits(void)
@@ -3027,14 +3236,26 @@ static int shb_load(void)
 {
     if (g_shb_ready) return 1;
     if (g_shb_fail) return 0;
-    const char *over = getenv("DM_SHBIN");   // 显式指一条库文件（沙箱里 push 进去的那份）：换库不用重打 2.2 GB 的包
+    const char *over = getenv("DM_SHBIN");   // 显式指一条库文件：换库不用重打 2.2 GB 的包
     const char *res = getenv("DM_RES");
     char path[512];
-    if (over && over[0]) snprintf(path, sizeof path, "%s", over);
-    else if (!res || !res[0]) { GVL("[vk] 没有 DM_RES：拿不到 shaders.bin，绘制不重放"); g_shb_fail = 1; return 0; }
-    else snprintf(path, sizeof path, "%s/shaders.bin", res);
-    int fd = open(path, O_RDONLY | O_CLOEXEC);
-    if (fd < 0) { GVL("[vk] 打不开 %{public}s：绘制不重放", path); g_shb_fail = 1; return 0; }
+    int fd = -1;
+    if (over && over[0]) {
+        snprintf(path, sizeof path, "%s", over);
+        fd = open(path, O_RDONLY | O_CLOEXEC);
+        // 指错了不许把整轮换掉：生产包里没有任何 shell 可写、沙箱又可见的入口（实测 /data/local/tmp 在应用侧打不开），
+        // DM_SHBIN 一旦写错，旧行为是 g_shb_fail=1 ⇒ 重放 0、无库两万，一整轮 25 分钟白跑。
+        // 现在只放弃这个覆盖、回落到包内那份，并把原因打出来——一轮废掉的代价换成一行日志。
+        // A wrong override must not cost the whole round: there is no shell-writable path the app sandbox can see
+        // (measured: /data/local/tmp opens as EACCES in-app), so the old behaviour blanked 25 minutes of driving.
+        if (fd < 0) GRED("DM_SHBIN %{public}s 打不开（%{public}s）：回落到包内 shaders.bin", path, strerror(errno));
+    }
+    if (fd < 0) {
+        if (!res || !res[0]) { GVL("[vk] 没有 DM_RES：拿不到 shaders.bin，绘制不重放"); g_shb_fail = 1; return 0; }
+        snprintf(path, sizeof path, "%s/shaders.bin", res);
+        fd = open(path, O_RDONLY | O_CLOEXEC);
+        if (fd < 0) { GVL("[vk] 打不开 %{public}s：绘制不重放", path); g_shb_fail = 1; return 0; }
+    }
     struct stat st;
     if (fstat(fd, &st) || st.st_size < (off_t)sizeof(shb_hdr)) { close(fd); g_shb_fail = 1; return 0; }
     void *m = mmap(NULL, (size_t)st.st_size, PROT_READ, MAP_PRIVATE, fd, 0);
@@ -3352,12 +3573,35 @@ static void state_reset(void)
     S.dr[1] = 1.0f;
     for (int i = 0; i < 8; i++) S.blend[i] = (blend_st){ i, NVN_BLEND_FUNC_ONE, NVN_BLEND_FUNC_ZERO, NVN_BLEND_FUNC_ONE, NVN_BLEND_FUNC_ZERO, NVN_BLEND_EQUATION_ADD, NVN_BLEND_EQUATION_ADD };
     args_dirty_all();
+    g_dyn_dirty = 1;
+}
+
+// 动态状态脏标记：视口/裁剪/深度界/多边形偏移/混合常量/模板掩码这几样既不进管线键，
+// 也不在每次绘制重发（旧代码只在换管线时发一次），所以"只改了裁剪盒"的那批绘制会沿用上一件的矩形。
+// 参照实现是每条绘制都重发（nvn_mtl.m:4389-4400）；这里改成打脏标记 + 绘制前按需重发，语义一致、代价更低。
+// Dynamic-state dirty flag: viewport / scissor / depth bounds / polygon offset / blend constants / stencil masks are
+// neither in the pipeline key nor re-emitted per draw (the old code sent them once per pipeline change), so a draw that
+// only moved the scissor kept its predecessor's rect. The reference re-issues every draw (nvn_mtl.m:4389-4400); this
+// takes the same semantics at lower cost via a dirty flag checked before each draw.
+static _Atomic uint64_t g_vshrink_a, g_vshrink_s;   // 缩绑次数（属性/流）| shrinking rebinds, per kind
+static _Atomic uint64_t g_dyn_emit;                 // 实际重发了多少次 | how often we really re-emitted
+
+static void vshrink_said(int which, int newn, int oldn)
+{
+    static int said_a, said_s;
+    int *c = which == 1 ? &said_a : &said_s;
+    if (*c >= 6) return;
+    (*c)++;
+    char ln[96];
+    snprintf(ln, sizeof ln, "[vk] 缩绑 %s 拍%llu 新%d 旧%d", which == 1 ? "属性" : "流",
+             (unsigned long long)g_presents, newn, oldn);
+    GVL("%{public}s", ln);
 }
 
 static int state_op(uint32_t op, const void *a)
 {
     switch (op) {
-    case OP_SCISSOR: S.sc = *(const p_scissor *)a; S.has_sc = 1; break;
+    case OP_SCISSOR: S.sc = *(const p_scissor *)a; S.has_sc = 1; g_dyn_dirty = 1; break;
     case OP_COPY_STRIDE: S.copy_stride = ((const p_copy_stride *)a)->stride; break;
     case OP_BIND_PROGRAM: { const prog_t *np = ((const p_bind_program *)a)->prog; if (np != S.prog) { S.prog = np; args_dirty_all(); } break; }
     case OP_BIND_STATE: {
@@ -3374,9 +3618,24 @@ static int state_op(uint32_t op, const void *a)
         if (dst && memcmp(dst, b->bytes, n)) memcpy(dst, b->bytes, n);
         break; }
     case OP_BIND_VATTR: { const p_bind_vattr *b = (const p_bind_vattr *)a;
-        if (b->n > 0 && b->n <= 16 && memcmp(S.attr, b->st, 4 * b->n)) { memcpy(S.attr, b->st, 4 * b->n); S.nattr = b->n; } break; }
+        // 计数判据不能省（照 nvn_mtl.m:3049）：客体换绑一个更小的属性集而头几条恰好与当前一致时，
+        // 只比 memcmp 会整块跳过，S.nattr 就停在上一次的大值 —— 已不再绑定的属性照样被 vtx_plan_for 当活的，
+        // 按上一件东西的 fmt/偏移/流步长取数。多部件实体撕成碎片正是这个形状。
+        // The count check is not optional (mirrors nvn_mtl.m:3049): when the guest rebinds a smaller attribute set whose
+        // head entries happen to match, a memcmp-only test skips the whole record and S.nattr keeps the previous larger
+        // value - attributes that are no longer bound stay live in vtx_plan_for and read on the previous object's
+        // format/offset/stream stride. That is exactly the shape of a shredded multi-part entity.
+        if (b->n > 0 && b->n <= 16) {
+            if (b->n < S.nattr) { atomic_fetch_add(&g_vshrink_a, 1); vshrink_said(1, b->n, S.nattr); }
+            if (S.nattr != b->n || memcmp(S.attr, b->st, 4 * b->n)) { memcpy(S.attr, b->st, 4 * b->n); S.nattr = b->n; }
+        }
+        break; }
     case OP_BIND_VSTREAM: { const p_bind_vstream *b = (const p_bind_vstream *)a;
-        if (b->n > 0 && b->n <= 16 && memcmp(S.stream, b->st, 8 * b->n)) { memcpy(S.stream, b->st, 8 * b->n); S.nstream = b->n; } break; }
+        if (b->n > 0 && b->n <= 16) {
+            if (b->n < S.nstream) { atomic_fetch_add(&g_vshrink_s, 1); vshrink_said(2, b->n, S.nstream); }
+            if (S.nstream != b->n || memcmp(S.stream, b->st, 8 * b->n)) { memcpy(S.stream, b->st, 8 * b->n); S.nstream = b->n; }
+        }
+        break; }
     case OP_BIND_VBUF: { const p_bind_vbuf *b = (const p_bind_vbuf *)a;
         if (b->first >= 0 && b->first + b->n <= 16 && b->n > 0) memcpy(&S.vbuf[b->first], b->r, sizeof *b->r * b->n); break; }
     case OP_BIND_UBO: { const p_bind_buf *b = (const p_bind_buf *)a;
@@ -3407,18 +3666,19 @@ static int state_op(uint32_t op, const void *a)
             && memcmp(&S.img[b->stage][b->first], b->h, 8 * b->n)) { memcpy(&S.img[b->stage][b->first], b->h, 8 * b->n); g_args_dirty[b->stage] = 1; }
         break; }
     case OP_STENCIL: { const p_stencil *b = (const p_stencil *)a;
+        g_dyn_dirty = 1;
         for (int f = 0; f < 2; f++) if (b->face & (1 << f)) {
             if (b->which == 0) S.st_vmask[f] = (uint32_t)b->value_mask;
             else if (b->which == 1) S.st_wmask[f] = (uint32_t)b->mask;
             else S.st_ref[f] = (uint32_t)b->ref;
         }
         break; }
-    case OP_POLY_OFFSET: S.po = *(const p_poly_offset *)a; break;
+    case OP_POLY_OFFSET: S.po = *(const p_poly_offset *)a; g_dyn_dirty = 1; break;
     case OP_VIEWPORTS: { const p_viewports *b = (const p_viewports *)a;
         for (int i = 0; i < b->n && b->first + i < 16; i++) memcpy(S.vp[b->first + i], b->v[i], 16);
-        S.has_vp = 1; break; }
-    case OP_DEPTH_RANGE: { const p_depth_range *b = (const p_depth_range *)a; S.dr[0] = b->n; S.dr[1] = b->f; break; }
-    case OP_BLEND_COLOR: memcpy(S.blend_color, ((const p_blend_color *)a)->rgba, 16); break;
+        S.has_vp = 1; g_dyn_dirty = 1; break; }
+    case OP_DEPTH_RANGE: { const p_depth_range *b = (const p_depth_range *)a; S.dr[0] = b->n; S.dr[1] = b->f; g_dyn_dirty = 1; break; }
+    case OP_BLEND_COLOR: memcpy(S.blend_color, ((const p_blend_color *)a)->rgba, 16); g_dyn_dirty = 1; break;
     default: return 0;
     }
     return 1;
@@ -3429,30 +3689,106 @@ static int state_op(uint32_t op, const void *a)
 #define ARENA_GUARD (1ull << 20)      // 尾巴留 1 MB 已清零的护区：着色器越界读落在自己地里，不打掉设备 | a zeroed tail so a stray over-read stays inside our own memory
 static VkBuffer g_arena; static VkDeviceMemory g_arena_mem; static uint8_t *g_arena_map;
 static uint64_t g_arena_off, g_arena_gen;
-typedef struct { uint64_t addr, len, gen; uint32_t off; } adedup;
-static adedup g_ahash[8192];         // 直映缓存：同一提交里同 (地址, 长度) 只搬一次 | direct-mapped: one copy per (address, length) inside a submission
-static _Atomic uint64_t g_adup_hit, g_adup_new, g_adup_bad, g_arena_full;
+typedef struct { uint64_t addr, len, gen, stamp; uint32_t off; } adedup;
+static adedup g_ahash[8192];         // 直映缓存：同一提交里同 (地址, 长度) 且客体没再写过，才只搬一次 | one copy per (address, length) inside a submission, and only while the guest has not written it again
+static _Atomic uint64_t g_adup_hit, g_adup_new, g_adup_bad, g_arena_full, g_adup_dirty;
+// 去重命中 ≠ 内容还是那份。AH 轮实测：只翻 DM_ARENA_NODUP（同一个二进制）菜单文字就全回来了
+// ⇒ 客体在同一提交里把同一块（同地址、同长度）改写后再绑，去重把上一次的副本当成同一份交了出去。
+// 旧判据是命中时 memcmp 前 4 KB（vtx_check），只数不修，而且改写落在 4 KB 之外就看不见——陈旧0 就是这么来的。
+// 现在用写保护脏页戳判：搬的时候取戳，命中的时候问「这几页在戳之后被动过没有」，动过就作废重搬。
+// A dedup hit does not prove the bytes are still the same. Round AH proved it: the only change was
+// DM_ARENA_NODUP on the same binary, and the menu text came back -- the guest rewrites the same
+// (address, length) block inside one submission. The old check (a 4 KB memcmp on hit) only counted,
+// and missed any rewrite past the first 4 KB, which is why 陈旧 read 0. Now the copy carries a dirty-page
+// stamp and a hit asks whether those pages moved since it.
+static int arena_rewritten(const void *p, size_t n, uint64_t stamp)
+{
+    if (!stamp || !p) return 1;                        // 没戳 ⇒ 不敢复用 | no stamp: never reuse
+    if (!nvn_dirty_tracked(p, n)) return 1;            // 这块没在写保护名单里 ⇒ 无从判断，保守重搬 | untracked: cannot tell, so re-move
+    return nvn_dirty_since(p, n, stamp);
+}
+// 上一次 arena_put 走的是哪条路：1 = 去重命中（这份拷贝是更早某笔绘制留下的），0 = 这次真从客体搬的。
+// 顶点流要在命中时拿客体原字节对一遍——命中意味着「同一提交里同一块又被画了一次」，而客体完全可能在两笔
+// 之间重写这块（同一地址、同一长度 ⇒ 去重看不出来），那 GPU 读到的就是我们上一次搬走的旧顶点。
+// Which path the last arena_put took: 1 = dedup hit (this copy is left over from an earlier draw), 0 = freshly
+// moved from the guest. On a hit the vertex stream compares against the live guest bytes: same address and same
+// length is exactly the case dedup cannot see, and the guest may have rewritten the block between the two draws.
+static int g_ahit;
+static uint64_t g_arena_stamp;        // arena_put 这次交出的那份内容的脏页戳（命中=原戳，新搬=搬前的新戳）
+static int g_arena_nodup;             // DM_ARENA_NODUP 非 0：每次绑定都重搬，判「去重是不是元凶」| bypass the dedup to test whether it is the culprit
+static int g_arena_arm_on = 0;        // 默认关：DM_ARENA_ARM=1 才武装。开武装在同一构建上 A/B 实测 481 帧前端冻死（关到 9301 帧仍 31 fps）
+static _Atomic uint64_t g_arena_arm;  // 真设了只读的块数 | blocks actually re-armed
+// 搬之前把源页设成只读。脏页代号只在「写触发缺页」时前进，而页只有处在只读保护下才会缺页：不武装 ⇒
+// 第一次写之后页永远是可写的，之后的改写一概看不见 ⇒ 去重把旧副本交出去。AI 轮的拉丝三角形与竖条就是这条：
+// 那一轮 脏39735 全部来自别的调用（贴图上传）替这些页顺手设过的保护，用完就再也没人重新武装。
+// Set the source pages read-only before the copy. The generation only advances when a write faults, and a page
+// only faults while protected: un-armed, the page stays writable after the first write and every later rewrite is
+// invisible, so dedup hands out the older copy. Round AI's stretched slivers are this - its 脏39735 all came from
+// protection that texture uploads happened to set on those pages, and nothing armed them afterwards.
+static void arena_arm(void *p, size_t n)
+{
+    if (!g_arena_arm_on || !n || !nvn_dirty_tracked(p, n)) return;
+    nvn_dirty_protect(p, n);
+    atomic_fetch_add(&g_arena_arm, 1);
+}
 
 static uint64_t arena_put(uint64_t addr, uint64_t len, uint64_t floor_sz, uint32_t *off)
 {
+    g_ahit = 0;
     if (!addr) return 0;
     if (!len) len = 1;
     uint64_t need = (len > floor_sz ? len : floor_sz) & ~(uint64_t)15;
     need += 15;
     unsigned slot = (unsigned)(((addr ^ (len * 0x9E3779B1u)) * 0x9E3779B97F4A7C15ull) >> 51) & 8191u;
     adedup *h = &g_ahash[slot];
-    if (h->gen == g_arena_gen && h->addr == addr && h->len == len) { *off = h->off; atomic_fetch_add(&g_adup_hit, 1); return 1; }
     void *base; uint64_t bo;
+    if (!g_arena_nodup && h->gen == g_arena_gen && h->addr == addr && h->len == len && mtl_addr(addr, len, &base, &bo)) {
+        if (!arena_rewritten((uint8_t *)base + bo, len, h->stamp)) {
+            arena_arm((uint8_t *)base + bo, len);   // 命中也补一次保护：上一次可能因 BUSY 断段没落地
+            *off = h->off; g_ahit = 1; g_arena_stamp = h->stamp; atomic_fetch_add(&g_adup_hit, 1); return 1;
+        }
+        atomic_fetch_add(&g_adup_dirty, 1);   // 键对上了但内容被客体改过 ⇒ 去重作废，走下面的重搬
+    }
     if (!mtl_addr(addr, len, &base, &bo)) { atomic_fetch_add(&g_adup_bad, 1); return 0; }   // 不在任何池里：宁可不画 | not inside a pool: skip rather than dereference
     if (g_arena_off + need > ARENA_SZ - ARENA_GUARD) { atomic_fetch_add(&g_arena_full, 1); return 0; }
     uint64_t o = g_arena_off;
     g_arena_off = o + need;
+    // 先设只读、再取戳、最后搬：这三步之后客体发生的每一次写都必然缺页 ⇒ 代号必 > 本戳 ⇒ 下一次命中判得出。
+    // 反序（先取戳后保护）会留一个「写完还没保护」的窗口，那次写既不进戳也不进我们的拷贝 —— AI 轮就卡在这里。
+    // Arm first, then take the stamp, then copy: every guest write after these three steps must fault, so its
+    // generation is > the stamp and the next hit sees it. The reverse order (stamp, copy, arm) leaves a window
+    // where a write lands in neither the stamp nor our copy - which is exactly where round AI was stuck.
+    arena_arm((uint8_t *)base + bo, len);
+    uint64_t stamp = nvn_dirty_now();
+    g_arena_stamp = stamp;
     memcpy(g_arena_map + o, (uint8_t *)base + bo, len);
     if (need > len) memset(g_arena_map + o + len, 0, (size_t)(need - len));
-    *h = (adedup){ addr, len, g_arena_gen, (uint32_t)o };
+    *h = (adedup){ addr, len, g_arena_gen, stamp, (uint32_t)o };
     *off = (uint32_t)o;
     atomic_fetch_add(&g_adup_new, 1);
     return 1;
+}
+
+// 命令流里往客体缓冲写数据（UpdateUniformBuffer / CopyBufferToBuffer）之后，凡是"这地址已经被绑定过"的
+// 那份拷贝就作废：arena 换代 ⇒ 下一次绑定重新从客体内存搬；描述符集作废 ⇒ 绑定排在更新之前的那种
+// （先绑后用、每帧只更新数据）也会在下一次绘制时重取。不判地址是否被绑就每笔都作废，那是白丢去重。
+// A command-stream write into guest memory voids any arena copy of that range: the arena generation rolls
+// (the next bind re-reads guest memory) and the cached descriptor set is dropped (so the bind-before-update
+// pattern - bind once, refill per frame - also re-fetches on the next draw). Without the overlap test this
+// would throw away the dedup on every single update.
+static void wr_invalidate(uint64_t addr, uint64_t n)
+{
+    int hit = 0;
+    for (int st = 0; st < 6 && !hit; st++)
+        for (int i = 0; i < 16; i++) {
+            uint64_t a = S.ubo[st][i].addr, z = S.ubo[st][i].size;
+            uint64_t b = S.ssbo[st][i].addr, y = S.ssbo[st][i].size;
+            if ((a && n && addr < a + z && a < addr + n) || (b && n && addr < b + y && b < addr + n)) { hit = 1; break; }
+        }
+    if (!hit) return;
+    g_arena_gen++;
+    g_sets_valid = 0;
+    atomic_fetch_add(&g_wr_void, 1);
 }
 
 // ---- 静态哑资源：全零缓冲、support、1x1 哑图与采样器 | the static dummies: zero buffer, support, 1x1 images and samplers ----
@@ -3737,8 +4073,18 @@ static int dummy_boot(void)
     if (!mk_hostbuf(ZERO_SZ, VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT, &g_sup, &g_sup_mem, NULL)) return 0;
     g_sup_sz = ZERO_SZ;
     {   // support_buffer：Ryujinx 布局，只有 render_scale 要 1.0（nvn_mtl.m:2667 同一份）| only render_scale needs 1.0, same layout as nvn_mtl.m:2667
+        // DM_SUPFULL=1：把 support 区每个 float 都填 1.0（连 vec4 的 yzw 一起）。上面那版只在每 16 字节的第一
+        // 个 float 落 1.0，其余三个仍是 0——着色器若从 support 取颜色的 yzw 分量，读到的就是硬零。这一路只用来
+        // 判"世界层红通道为 0 是不是 support 给的"，翻不翻它不改别的任何行为。
+        // DM_SUPFULL=1 fills every float of the support region, not just the first lane of each vec4. The default leaves
+        // yzw at zero, so a shader taking a colour component from support reads a hard zero. This switch exists only to
+        // decide whether the world's dead red channel comes from the support buffer; nothing else changes.
         uint8_t *p = NULL; vkMapMemory(g_dev, g_sup_mem, 0, ZERO_SZ, 0, (void **)&p);
-        if (p) for (int i = 0; i < 73; i++) *(float *)(p + 192 + 16 * i) = 1.0f;
+        if (p) {
+            if (getenv("DM_SUPFULL"))
+                for (size_t i = 0; i < ZERO_SZ; i += 4) *(float *)(p + i) = 1.0f;
+            else for (int i = 0; i < 73; i++) *(float *)(p + 192 + 16 * i) = 1.0f;
+        }
     }
     // 每种维数一张哑图：描述符的视图类型必须与着色器声明的维数同族，否则是非法用法（校验层不在，锅由驱动判）。
     // 颜色采样族默认纯黑（下面那条），缓冲维（拿坐标 / LUT）与深度填 0 —— 查表填白会把 UV 推到画外，反而看不出东西。
@@ -3940,10 +4286,15 @@ static void pipe_key_fill(pipe_key *k, int vi, int fi, int prim, VkRenderPass rp
     k->color = *(const uint32_t *)&S.color;
     k->chmask = S.chmask.mask; k->a2c = S.ms.a2c; k->blend_en = S.color.blend_en;
     for (int i = 0; i < 8; i++) memcpy(&k->blend[i], &S.blend[i], sizeof S.blend[i]);
-    // 只有着色器真声明的属性进键：其余槽位改了不该让用户重编管线 | only attributes the shader declares take part in the key
+    // 只有着色器真声明、且客体真绑了的属性进键：其余槽位改了不该让用户重编管线 | only attributes the shader declares take part in the key
+    // 少一半条件就漏：客体缩绑后 attr[loc] 的尾巴还是上一件的东西，内容没变 ⇒ 键没变 ⇒ 直接复用按旧布局烘好的管线
+    // （顶点输入是烘进 VkPipeline 的）。参照实现同样带这道闸：nvn_mtl.m:2418 的 `a < S.nattr`。
+    // Dropping the second half of the test aliases the cache: after a shrinking rebind the tail of attr[] still holds the
+    // previous object's bytes, so the content - and therefore the key - is unchanged, and the pipeline baked for the old
+    // layout gets reused. The reference gates the same way: nvn_mtl.m:2418 has `a < S.nattr`.
     for (int v = 0; v < g_shb_e[vi].nvi; v++) {
         int loc = g_shb_vi[g_shb_e[vi].vi_off + v].loc;
-        if (loc < 16) { k->attr[loc] = S.attr[loc]; int st = S.attr[loc].stream; if (st < 16) k->stream[st] = S.stream[st]; }
+        if (loc < 16 && loc < S.nattr) { k->attr[loc] = S.attr[loc]; int st = S.attr[loc].stream; if (st < 16) k->stream[st] = S.stream[st]; }
     }
 }
 
@@ -4082,6 +4433,8 @@ static VkPipeline pipe_get(int vi, int fi, int prim, VkRenderPass rp, uint64_t p
     dss.depthWriteEnable = S.ds.dw ? VK_TRUE : VK_FALSE;
     dss.depthCompareOp = cmp_of(S.ds.df);
     dss.stencilTestEnable = S.ds.st ? VK_TRUE : VK_FALSE;
+    if (g_skip & 2097152) dss.stencilTestEnable = VK_FALSE;   // 位 2097152：一律不测模板（AN 的运行时 A/B，不重编就能判「按钮文字空」是不是模板的锅）
+                                                               // 位 64 早就被「呈现不用信号量」占了，别抢（AN 装出去的那块误用了 64，那块 g_skip=0 所以没后果）
     if (g_skip & 524288) dss.depthTestEnable = VK_FALSE;   // 位 524288：不测深度（深度全灭那种黑）| bit 524288: never reject a fragment on depth
     dss.front = (VkStencilOpState){ stop_of(S.ds.fail_f), stop_of(S.ds.zpass_f), stop_of(S.ds.zfail_f), cmp_of(S.ds.sf_f), 0xFF, 0xFF, 0 };
     dss.back  = (VkStencilOpState){ stop_of(S.ds.fail_b), stop_of(S.ds.zpass_b), stop_of(S.ds.zfail_b), cmp_of(S.ds.sf_b), 0xFF, 0xFF, 0 };
@@ -4106,10 +4459,16 @@ static VkPipeline pipe_get(int vi, int fi, int prim, VkRenderPass rp, uint64_t p
     }
     VkPipelineColorBlendStateCreateInfo cbs = { VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO };
     cbs.attachmentCount = g_p.ncol; cbs.pAttachments = cba;
+    // 模板三样必须是动态的：emit_dyn 每次都在发 vkCmdSetStencilCompareMask/WriteMask/Reference，
+    // 没声明进这张表就是未定义行为（校验层会直接判错），而管线里烘的又是写死的 0xFF/0 —— 客体给的掩码全丢。
+    // The three stencil states must be dynamic: emit_dyn issues vkCmdSetStencil* every time, which is undefined unless
+    // declared (the validation layer flags it outright), while the baked state is a hardcoded 0xFF/0 - the guest's masks were dropped.
     VkDynamicState dyn[] = { VK_DYNAMIC_STATE_VIEWPORT, VK_DYNAMIC_STATE_SCISSOR, VK_DYNAMIC_STATE_DEPTH_BIAS,
-                             VK_DYNAMIC_STATE_BLEND_CONSTANTS, VK_DYNAMIC_STATE_LINE_WIDTH };
+                             VK_DYNAMIC_STATE_BLEND_CONSTANTS, VK_DYNAMIC_STATE_LINE_WIDTH,
+                             VK_DYNAMIC_STATE_STENCIL_COMPARE_MASK, VK_DYNAMIC_STATE_STENCIL_WRITE_MASK,
+                             VK_DYNAMIC_STATE_STENCIL_REFERENCE };
     VkPipelineDynamicStateCreateInfo dys = { VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO };
-    dys.dynamicStateCount = 5; dys.pDynamicStates = dyn;
+    dys.dynamicStateCount = 8; dys.pDynamicStates = dyn;
     VkPipelineShaderStageCreateInfo st[2] = { { VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO },
                                               { VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO } };
     st[0].stage = VK_SHADER_STAGE_VERTEX_BIT; st[0].module = g_sho[vi].mod; st[0].pName = "main";
@@ -4159,6 +4518,139 @@ static _Atomic uint64_t g_set_oom;
 // / buffer-dim lookup, which binds a 1D dummy for now and logs what the real texture looks like.
 static _Atomic uint64_t g_bind_real, g_bind_dummy, g_bind_none, g_bind_buf, g_bind_lay;
 // 哑的分桶计数器 g_b_* 声明在前面（统计块要先用）| the dummy-bucket counters g_b_* are declared earlier, the stats block uses them first
+
+// ---- 常量段取证（DM_CBUF = 程序键子串，"1" = 全部程序）| constant-segment forensics ----
+// 世界层整片红通道为 0，实体因此塌成黑剪影，而同一张后缓冲上的 HUD 颜色正常。光圈那条片元程序离线反编译出来
+// 一张贴图都不采，颜色 100% 来自 fp_c3._m0[1].xyz；实体那条是 贴图.rgb × min(通道 tint 常量, 光强常量) × 0.4，
+// 所以「世界没红」和「实体发黑」是同一个源头：常量段里那几组 vec4。只剩两种可能——游戏自己算出的这条光就是 (0,g,b)，
+// 或者我们递进 GPU 的字节本来就不对（arena 去重命中了旧的一份 / 库里烘进来的 c1 段被截断）。
+// 把描述符真正指向的前 44 个 float（= 11 组 vec4，正好盖住两条程序用到的 0..3 与 4..10）打出来，一次分开这两种。
+// cbuf 那一路同时读客体原址：两份不同 ⇒ 搬运错（arena 的 (地址,长度) 去重把改写过的常量当成了同一块），不是游戏的数。
+// The world layer reads with red == 0 while the HUD on the same back buffer keeps its colours. The light program samples no texture
+// at all - its colour is exactly fp_c3._m0[1].xyz - and the entity program multiplies texture.rgb by per-channel tint constants, so
+// both symptoms share one source: those vec4 groups. Either the game computed (0,g,b), or the bytes reaching the GPU are wrong (the
+// arena's (addr,len) dedup served a stale copy, or the c1 segment baked into the library was truncated). Print the 44 floats the
+// descriptor points at; for a game UBO also compare the guest bytes, which separates a bad transfer from the game's own math.
+#define CBUF_F 44
+static char g_cbuf_want[192];
+static int g_cbuf_off;                        // 开关没给：绑定热路径以后一次都不进 | switch absent: never enter the hot path again
+typedef struct { uint64_t h; uint32_t t; } cbrec;
+static cbrec g_cbuf_seen[512]; static int g_cbuf_ns;
+static int g_cbuf_noprint;                    // 表满：只停打印，三条计数继续全程累加 | table full: stop printing, keep counting
+// 计数器与打印分开：去重表打满以后下面四条仍然全程累加，周期行里看到的是整轮的账
+// Counters are separate from the printout - after the dedup table fills these keep summing for the whole round.
+static _Atomic uint64_t g_cbuf_stale;         // arena 那份 ≠ 客体原字节：同一（地址,长度）命中了旧副本 | the arena copy differs from the guest bytes
+static _Atomic uint64_t g_cbuf_trunc;         // 送进去的字节不足 176：库内 c1 截断 / 客体绑小了 | fewer than 176 bytes reached the shader
+static _Atomic uint64_t g_cbuf_zero;          // 前 44 个 float 全零：把全零段递给了着色器 | the shader was handed an all-zero block
+// AA 轮的教训：探针只在「客体这次真绑了」时才响，而描述符还有一条静默拿 g_zero 的路（该槽压根没绑）。
+// 那一条要是正是世界层的常量来源，整轮就一条取证行都看不到——必须单独数出来。
+// Round AA's lesson: the probe only fired when the game had bound that slot, yet the descriptor has a second, silent path that hands
+// the shader g_zero (slot never bound at all). If that slot is where the world's constants should come from, the round prints nothing.
+static _Atomic uint64_t g_cbuf_nobind;        // 常量行没绑到任何缓冲：描述符指向全零段 | a constant row with no buffer behind it: the descriptor points at the zero bank
+
+// DM_CBUF = 逗号分隔的程序键前缀，"1" = 全部程序 | comma-separated key prefixes, "1" = every program
+static int cbuf_wants(const char *pk)
+{
+    if (!pk || !pk[0]) return 0;
+    for (const char *p = g_cbuf_want; *p; ) {
+        const char *e = strchr(p, ',');
+        size_t n = e ? (size_t)(e - p) : strlen(p);
+        if (n == 1 && p[0] == '1') return 1;
+        if (n >= 4 && n <= 16 && !strncmp(pk, p, n)) return 1;
+        if (!e) break;
+        p = e + 1;
+    }
+    return 0;
+}
+
+// 这条绑定所属的库条目在不在取证名单里；键直接取库里的 8 字节（设备打印字序 == 文件正序，AA 轮离线核过）。
+// 不能再用 g_cur_prog->key[stage]：客体一段一个程序，key[] 下标是「段序」而不是着色器阶段，
+// 片元段存在 key[0] 里，按 stage=1 去取永远取到空串——AA 轮一条取证行都没有就是这个原因。
+// Gate on the library entry's own 8-byte key (device print order == file order, verified offline).
+// g_cur_prog->key[stage] cannot be used: the guest creates one program per stage, so key[] is indexed by segment order,
+// not by shader stage - a fragment-only program keeps its key in key[0], and asking for stage 1 always returned "".
+static int cbuf_gate(int ei, char out[17])
+{
+    if (g_cbuf_off) return 0;
+    if (!g_cbuf_want[0]) {
+        const char *ev = getenv("DM_CBUF");
+        if (!ev || !ev[0]) { g_cbuf_off = 1; return 0; }
+        snprintf(g_cbuf_want, sizeof g_cbuf_want, "%s", ev);
+    }
+    const uint8_t *k = g_shb_e[ei].key;
+    for (int i = 0; i < 8; i++) snprintf(out + 2 * i, 3, "%02x", k[i]);
+    out[16] = 0;
+    return cbuf_wants(out);
+}
+
+// 该槽没绑任何缓冲 ⇒ 描述符静默指向全零段。这是 AA 轮看不到任何取证行的唯一出口。
+// The slot holds no buffer => the descriptor silently points at the zero bank. This is the one path AA could not see.
+static void cbuf_missing(int ei, int stage, int reg, uint32_t binding, uint32_t nvn_kind)
+{
+    char pk[17];
+    if (!cbuf_gate(ei, pk)) return;
+    atomic_fetch_add(&g_cbuf_nobind, 1);
+    if (g_cbuf_noprint || g_cbuf_ns >= (int)(sizeof g_cbuf_seen / sizeof *g_cbuf_seen)) return;
+    uint64_t h = 1469598103934665603ull;
+    const uint8_t *q = (const uint8_t *)&reg;
+    for (size_t i = 0; i < sizeof reg; i++) { h ^= q[i]; h *= 1099511628211ull; }
+    uint32_t tag = binding | ((uint32_t)stage << 8) | (1u << 16) | ((uint32_t)nvn_kind << 20);
+    for (int i = 0; i < g_cbuf_ns; i++) if (g_cbuf_seen[i].h == h && g_cbuf_seen[i].t == tag) return;
+    g_cbuf_seen[g_cbuf_ns++] = (cbrec){ h, tag };
+    GVL("[vk] 常量空槽 %s st%d 绑%{public}u 类%{public}u 槽%{public}d（该槽客体没绑，描述符=全零段）",
+        pk, stage, binding, nvn_kind, reg);
+    // 同一段把该阶段 16 个槽全列出来：要是客体的常量其实绑在别的槽号上，这一行就是铁证
+    // List all 16 slots of this stage: if the game really bound its constants at another index, this line proves it.
+    char ln[420];
+    int n = snprintf(ln, sizeof ln, "[vk]   槽账 st%d:", stage);
+    for (int i = 0; i < 16 && n > 0 && n < (int)sizeof ln - 40; i++)
+        n += snprintf(ln + n, sizeof ln - (size_t)n, " [%d]%llx/%llu", i,
+                      (unsigned long long)S.ubo[stage][i].addr, (unsigned long long)S.ubo[stage][i].size);
+    if (n > 0) GVL("%{public}s", ln);
+}
+
+static void cbuf_probe(const shb_bind *b, int ei, int stage, int reg, const uint8_t *bytes, uint64_t avail,
+                       int same, uint64_t gaddr, uint64_t gsz)
+{
+    if (g_cbuf_off || !bytes) return;
+    char kb[17];
+    if (!cbuf_gate(ei, kb)) return;
+    const char *pk = kb;
+
+    float f[CBUF_F];
+    memset(f, 0, sizeof f);
+    memcpy(f, bytes, avail < sizeof f ? (size_t)avail : sizeof f);
+    int allz = 1, nf = 0;
+    for (int i = 0; i < CBUF_F; i++) if (f[i] != 0.0f) { allz = 0; nf++; }
+    if (allz) atomic_fetch_add(&g_cbuf_zero, 1);
+    if (avail < sizeof f) atomic_fetch_add(&g_cbuf_trunc, 1);
+    if (same == 0) atomic_fetch_add(&g_cbuf_stale, 1);
+
+    const uint8_t *q = (const uint8_t *)f;
+    uint64_t h = 1469598103934665603ull;
+    for (size_t i = 0; i < sizeof f; i++) { h ^= q[i]; h *= 1099511628211ull; }
+    // 同一（绑定槽 + 有效字节数 + 内容）只报一次：常量每帧重绑几十次，去重后剩下的才是不同的值
+    // Report each (slot, available-bytes, content) once - constants rebind dozens of times a frame, so dedup leaves only distinct values.
+    uint32_t tag = (uint32_t)b->binding | ((uint32_t)stage << 8) | ((uint32_t)(reg + 1) << 12) | (avail < sizeof f ? 1u << 24 : 0);
+    if (g_cbuf_ns >= (int)(sizeof g_cbuf_seen / sizeof *g_cbuf_seen)) { g_cbuf_noprint = 1; return; }
+    for (int i = 0; i < g_cbuf_ns; i++) if (g_cbuf_seen[i].h == h && g_cbuf_seen[i].t == tag) return;
+    g_cbuf_seen[g_cbuf_ns++] = (cbrec){ h, tag };
+
+    char ln[420];
+    int n = snprintf(ln, sizeof ln, "[vk] 常量取证 %s st%d 绑%d 槽%d 址%llx 长%llu 有效%llu 非零%d/%d 与客体%s",
+                     pk, stage, b->binding, reg, (unsigned long long)gaddr, (unsigned long long)gsz,
+                     (unsigned long long)(avail < sizeof f ? avail : sizeof f), nf, CBUF_F,
+                     same < 0 ? "无" : (same ? "一致" : "不一致"));
+    if (n > 0) GVL("%{public}s", ln);
+    for (int g0 = 0; g0 < 11; g0 += 4) {
+        int q2 = snprintf(ln, sizeof ln, "[vk]   ");
+        for (int i = g0; i < g0 + 4 && i < 11; i++)
+            q2 += snprintf(ln + (q2 > 0 && q2 < (int)sizeof ln - 8 ? q2 : 0),
+                           sizeof ln - (size_t)(q2 > 0 && q2 < (int)sizeof ln - 8 ? q2 : 0),
+                           "[%d](%.6g,%.6g,%.6g,%.6g)", i, f[4 * i], f[4 * i + 1], f[4 * i + 2], f[4 * i + 3]);
+        GVL("%{public}s", ln);
+    }
+}
 
 static int set_fill(VkDescriptorSet set, int ei, int stage)
 {
@@ -4246,6 +4738,11 @@ static int set_fill(VkDescriptorSet set, int ei, int stage)
                     }
                 }
             }
+            // 这张还空着、池里却有字节，而绑定正发生在通道里：当场用一条独立缓冲搬完再回来选视图。
+            // 搬成就在这一行下面走「真绑」那条分支，本帧这次采样读到的是真像素，不再是哑图。
+            // Empty at bind time with bytes sitting in the pool, and we are inside a pass: move them now through a one-shot
+            // buffer, so the branch below picks the real view and this very draw samples real pixels instead of the dummy.
+            if (v && !tex_has_content(v) && v->d.mem && v->d.pool) pkg_upload_now(v);
             VkImageView iv = NULL;
             VkImageLayout lay = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
             // 影子采样要真深度视图：本通道正把这张深度图当附件用时不能同趟读它（自己依赖没声明就是竞态），那种情况照旧走哑图。
@@ -4404,14 +4901,33 @@ static int set_fill(VkDescriptorSet set, int ei, int stage)
             const p_bind_buf *u = NULL;
             switch (b->nvn_kind) {
             case SHB_N_SUPPORT: buf = g_sup; range = g_sup_sz; break;
-            case SHB_N_C1: if (g_sho[ei].c1b) { buf = g_sho[ei].c1b; range = g_sho[ei].c1sz; } break;
+            case SHB_N_C1: if (g_sho[ei].c1b) {
+                    buf = g_sho[ei].c1b; range = g_sho[ei].c1sz;
+                    if (!g_cbuf_off) cbuf_probe(b, ei, stage, reg, g_sho[ei].c1map, g_shb_e[ei].c1_len, -1, 0, g_sho[ei].c1sz);
+                } break;
             case SHB_N_CBUF: if (reg >= 0 && reg < 16) u = &S.ubo[stage][reg]; break;
             case SHB_N_SBUF: if (reg >= 0 && reg < 16) u = &S.ssbo[stage][reg]; break;
             case SHB_N_UBOP: if (reg >= 0 && reg < 16) u = &S.ubo[stage][reg]; break;
             default: break;   // drvcb / 未解出的槽：全零段（出包静态统计证明驱动段没人读）| drvcb and unresolved slots: the zero bank (packaging proved nobody reads the driver segments)
             }
+            if (!g_cbuf_off && (b->nvn_kind == SHB_N_CBUF || b->nvn_kind == SHB_N_UBOP) && !(u && u->addr))
+                cbuf_missing(ei, stage, reg, b->binding, b->nvn_kind);
             uint32_t ao = 0;
-            if (u && u->addr && arena_put(u->addr, u->size, 1024, &ao)) { buf = g_arena; off = ao; range = (u->size ? u->size : 1) + 256; }
+            if (u && u->addr && arena_put(u->addr, u->size, 1024, &ao)) {
+                buf = g_arena; off = ao; range = (u->size ? u->size : 1) + 256;
+                if (!g_cbuf_off && (b->nvn_kind == SHB_N_CBUF || b->nvn_kind == SHB_N_UBOP)) {
+                    // 有效字节数按客体这次绑多长算：不足 176 就是着色器已经在读我们补的零（截断），
+                    // 比两份也只比这一段——客体在范围之外的字节属于别次绘制，拿来比必然「不一致」，那是假阳性。
+                    // Available bytes are what the game bound this time: under 176 means the shader already reads our zero padding,
+                    // and the two copies compare over that span only - guest bytes past the range belong to another draw.
+                    uint64_t cmpn = u->size && u->size < CBUF_F * 4 ? u->size : CBUF_F * 4;
+                    void *gb = NULL; uint64_t gbo = 0;
+                    int same = -1;
+                    if (g_arena_map && cmpn >= 16 && mtl_addr(u->addr, cmpn, &gb, &gbo) && gb)
+                        same = memcmp((const uint8_t *)gb + gbo, (const uint8_t *)g_arena_map + ao, (size_t)cmpn) == 0;
+                    cbuf_probe(b, ei, stage, reg, (const uint8_t *)g_arena_map + ao, u->size, same, u->addr, u->size);
+                }
+            }
             if (range > lim) range = lim;
             bi[nb] = (VkDescriptorBufferInfo){ buf, off, range };
             wr[nw].pBufferInfo = &bi[nb++];
@@ -4468,17 +4984,52 @@ static int sets_rebuild(int vi, int fi)
 }
 
 // ---- 顶点流搬运：每条用到的流按 (地址, 长度) 搬进 arena | vertex streams: each used stream is copied once per (address, length) ----
-static struct { uint64_t gen, addr, len; uint32_t off; int ok; } g_vtx[16];
+static struct { uint64_t gen, addr, len, stamp; uint32_t off; int ok; } g_vtx[16];
+static _Atomic uint64_t g_vtx_dirty;   // 缓存键对上、但客体把那几页改写过 ⇒ 作废重搬的次数
 
 static _Atomic uint64_t g_vap_patch;   // 134217728 那一刀真改了哪几条流（计数=命中的属性条数）
+// 去重命中时与客体原字节的比对（夹 4 KB）：陈旧>0 就是「GPU 读的是我们上一次搬走的旧顶点」，
+// 这一条把「文字/忽闪」从着色器侧彻底挪到搬运侧；全零则说明客体写进来本来就是那些字节。
+// The compare on a dedup hit (capped at 4 KB): 陈旧>0 means the GPU is reading a vertex block we moved earlier,
+// which moves the missing-text / flicker symptom from the shader side to the transfer side. All zero means the
+// guest really did write those bytes.
+static _Atomic uint64_t g_vtx_hit, g_vtx_new, g_vtx_stale;
+
+// 两条复用路都比一遍：g_vtx 是「同一条流在本提交里没换绑」，arena 哈希是「这块地址本提交里搬过」。
+// 前者更常命中（每帧同一批流反复绑），只查后者的话陈旧计数几乎不会响。
+// Both reuse paths get compared: g_vtx = this stream was not rebound inside the submission, the arena hash =
+// this address was already moved. The first one is the frequent case, so checking only the second would stay quiet.
+static void vtx_check(uint64_t a, uint64_t l, uint32_t o)
+{
+    atomic_fetch_add(&g_vtx_hit, 1);
+    void *gb = NULL; uint64_t gbo = 0;
+    uint64_t cn = l < 4096 ? l : 4096;
+    if (cn >= 64 && mtl_addr(a, cn, &gb, &gbo) && gb &&
+        memcmp((const uint8_t *)gb + gbo, g_arena_map + o, (size_t)cn) != 0)
+        atomic_fetch_add(&g_vtx_stale, 1);
+}
 
 static int vtx_stream(int st, uint32_t *off)
 {
     if (st < 0 || st > 15) return 0;
     uint64_t a = S.vbuf[st].address, l = S.vbuf[st].size;
-    if (g_vtx[st].gen == g_arena_gen && g_vtx[st].addr == a && g_vtx[st].len == l) { *off = g_vtx[st].off; return g_vtx[st].ok; }
+    if (!g_arena_nodup && g_vtx[st].gen == g_arena_gen && g_vtx[st].addr == a && g_vtx[st].len == l) {
+        // 同一条流在本提交里没换绑 ≠ 客体没重写它：饥荒的字形流就是同地址同长度反复改写再绑的（AH 轮判死）
+        int rewritten = 1;
+        void *gb = NULL; uint64_t gbo = 0;
+        if (a && l && mtl_addr(a, l, &gb, &gbo) && gb) rewritten = arena_rewritten((uint8_t *)gb + gbo, l, g_vtx[st].stamp);
+        if (!rewritten) {
+            *off = g_vtx[st].off;
+            if (g_vtx[st].ok) vtx_check(a, l, g_vtx[st].off);
+            return g_vtx[st].ok;
+        }
+        atomic_fetch_add(&g_vtx_dirty, 1);
+    }
     uint32_t o = 0;
     int ok = a && l && arena_put(a, l, 4096, &o);
+    if (ok && g_ahit && !g_arena_nodup) vtx_check(a, l, o);
+    if (ok && !g_ahit) atomic_fetch_add(&g_vtx_new, 1);
+    if (ok) g_vtx[st].stamp = g_arena_stamp;
     // 位 134217728（B46 探针）：把「四分量 8 位」顶点属性（RGBA8 那一族）的第 4 字节一律顶成 0xFF。
     // 和上面的 va_alpha_said 配成一对：普查说"是不是 0"，这一刀说"把它当 1 用画面会怎样"。
     // 只是探针，不是修法 —— 真修法要等普查点名是哪一条流、哪个偏移。
@@ -4509,9 +5060,37 @@ static int draw_boot(void)
 {
     if (g_draw_ready) return 1;
     if (g_draw_fail) return 0;
-    if (!shb_load()) { g_draw_fail = 1; return 0; }
+    // 着色器库不是绘制重放的前提：还没有离线库的作品，每一次绘制本来就各自走「无库 + 记缺键」那条路（nolib_said），
+    // 缺库只该少画，不该把 arena / 哑资源 / 描述符池一起锁死。v24 实测：9 条贴图上传每条都单独提交了一趟，
+    // 但 do_copy_b2t 卡在 !draw_boot() 这一行，一张 Vk 贴图也没建出来（[tex] 恒 0），屏幕整块黑。
+    // The shader library is not a precondition for replay: a title without an offline library already takes the
+    // 无库 + 缺键 path per draw, so a missing library should only cost draws - not also lock away the arena, dummy resources and
+    // descriptor pool. v24 measured exactly that: all 9 upload records got their own submission, but do_copy_b2t returned at
+    // !draw_boot(), not a single Vk image was created ([tex] stayed 0) and the screen stayed black.
+    if (!shb_load()) GVL("[vk] 没有着色器库：绘制只记缺键，贴图上传照走");
     const char *dm = getenv("DM_VK_DRAW_MAX");
     if (dm && *dm) { int v = (int)strtol(dm, NULL, 0); if (v > 0) g_draw_max = v; }
+    {
+        // DM_ARENA_NODUP 非 0：arena 的去重整个关掉，每笔绑定都从客体内存重搬。去重的键是（地址,长度,本提交），
+        // 而客体完全可能在同一提交里原地重写同一块（同地址同长度 ⇒ 去重看不出来），那 GPU 读到的就是上一次搬走
+        // 的旧字节。关掉去重是这一条的 A/B，代价看 arena:满 与帧时。
+        // DM_ARENA_NODUP != 0 disables arena dedup so every bind re-reads guest memory. The dedup key is
+        // (address, length, submission), so an in-place rewrite of the same block inside one submission is
+        // invisible to it and the GPU keeps the bytes moved earlier. This is the A/B for that; watch arena:满.
+        const char *nd = getenv("DM_ARENA_NODUP");
+        g_arena_nodup = nd && *nd && strcmp(nd, "0") != 0;
+        GVL("[vk] arena 去重%{public}s（DM_ARENA_NODUP=%{public}s）", g_arena_nodup ? "关" : "开", nd ? nd : "未设");
+        // 武装这一刀留着但默认关：它确实补上了「代号只在缺页时前进」这个洞（臂=新+复用、越池0、红0），
+        // 但同一构建上开武装的前端在 481 帧冻死、关掉跑到 9301 帧还在 31 fps，所以先回基线，等 0x1C/0x1D
+        // 与宿主符号（dladdr）两条探针把冻死定位到可复现再谈重新武装。
+        // Arming stays behind a switch but defaults off: it does plug the "generation only advances on a fault" hole
+        // (臂 = 新 + 复用, 越池 0, 红 0), yet on this same build arming-on froze the front end at 481 frames while
+        // arming-off ran past 9301 frames at 31 fps. So the baseline comes first; re-arm once the 0x1C/0x1D and the
+        // dladdr host-symbol probes have made that freeze reproducible and attributable.
+        const char *ar = getenv("DM_ARENA_ARM");
+        g_arena_arm_on = ar && *ar && strcmp(ar, "0") != 0;
+        GVL("[vk] arena 写保护武装%{public}s（DM_ARENA_ARM=%{public}s）", g_arena_arm_on ? "开" : "关", ar ? ar : "未设");
+    }
     if (!dummy_boot()) { GRED("哑资源没建起来：不重放绘制"); g_draw_fail = 1; return 0; }
     if (!mk_hostbuf(ARENA_SZ, VK_BUFFER_USAGE_VERTEX_BUFFER_BIT | VK_BUFFER_USAGE_INDEX_BUFFER_BIT
                           | VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT | VK_BUFFER_USAGE_STORAGE_BUFFER_BIT
@@ -4519,9 +5098,15 @@ static int draw_boot(void)
                     &g_arena, &g_arena_mem, (void **)&g_arena_map)) { GRED("arena 没建起来：不重放绘制"); g_draw_fail = 1; return 0; }
     memset(g_arena_map + (ARENA_SZ - ARENA_GUARD), 0, ARENA_GUARD);
     {
+        // 池预算按"每笔绘制都重建一套描述符"来给：命令流里的常量写入会作废缓存的集子（wr_invalidate），
+        // 于是重编频率从"每程序对一次"变成"每次更新一次"。原来 12000 条 UBO 描述符是按低频配的，
+        // 一旦每笔重编就会在一趟提交里见底（集尽>0 = 后面的绘制直接不重放，那是比画面不全更糟的回归）。
+        // Budget for the worst case: a command-stream write voids the cached set (wr_invalidate), so rebuilds go from
+        // "once per program pair" to "once per update". The old 12000 UBO descriptors were sized for the low rate and
+        // would run dry inside one submission (集尽 > 0 means the remaining draws silently stop replaying).
         VkDescriptorPoolSize ps[4] = {
-            { VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 12000 }, { VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 6000 },
-            { VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 12000 }, { VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 64 } };
+            { VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 60000 }, { VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 20000 },
+            { VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 60000 }, { VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 256 } };
         VkDescriptorPoolCreateInfo pi = { VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO };
         pi.maxSets = (uint32_t)(2 * g_draw_max); pi.poolSizeCount = 4; pi.pPoolSizes = ps;
         if (vkCreateDescriptorPool(g_dev, &pi, NULL, &g_dpool) != VK_SUCCESS) { GRED("建描述符池失败（组 %{public}d）", pi.maxSets); g_draw_fail = 1; return 0; }
@@ -4535,11 +5120,13 @@ static int draw_boot(void)
 
 void mtl_sub_reset_draw(void);   // 由 mtl_sub_begin 调：换提交就清空 arena / 描述符 / 顶点流缓存 | called from mtl_sub_begin: a new submission starts with an empty arena, sets and stream cache
 void mtl_sub_reset_bigstage(void);   // 巨图暂存游标与 arena 同步清零（定义在打包上传那一段）| the big staging cursor resets with the arena
+void mtl_sub_reset_eager(void);      // 当场搬的每提交额度（定义同上）| the per-submission budget for the in-pass upload
 void mtl_sub_reset_draw(void)
 {
     g_arena_gen++;
     g_arena_off = 0;
     mtl_sub_reset_bigstage();
+    mtl_sub_reset_eager();
     g_dr_thissub = 0;
     g_sets_valid = 0; g_cur_vi = g_cur_fi = -1;
     g_last_pipe = NULL; g_last_pl = NULL;
@@ -4600,7 +5187,7 @@ static void emit_dyn(VkCommandBuffer cb, VkExtent2D ext)
 #include "../tex/nvn_bcdec.h"
 #include "../tex/nvn_deswizzle.h"   // 打包贴图的解排布（M2-3f）| deswizzle for packaged textures (M2-3f)
 
-static _Atomic uint64_t g_b2t_ok, g_b2t_noaddr, g_b2t_inpass, g_b2t_comp, g_b2t_dst, g_b2t_soft;
+static _Atomic uint64_t g_b2t_ok, g_b2t_noaddr, g_b2t_inpass, g_b2t_comp, g_b2t_dst, g_b2t_soft, g_b2t_rt;
 
 static uint32_t arena_take(uint64_t len)   // 只要一段对齐的空位，内容自己写（解码上传用）| reserve aligned space; caller fills it
 {
@@ -4656,7 +5243,13 @@ static void up_probe(const char *tag, const uint8_t *p, uint64_t n, uint32_t w, 
 
 static void do_copy_b2t(const p_copy_b2t *c)
 {
-    if (!c->tex || !c->tex->serial || !c->r.width || !c->r.height) return;
+    if (!c->tex || !c->tex->serial || !c->r.width || !c->r.height) {
+        static unsigned nb;   // 这一格原先是静默的：整轮看不出上传是没建成、还是没跑到（v24 为此白跑一轮）
+        if (++nb <= 4) GVL("[vk] B2T跳过 第%{public}u 次 贴图=%{public}p serial=%{public}llu 区=%{public}d x %{public}d x %{public}d",
+                           nb, (const void *)c->tex, c->tex ? (unsigned long long)c->tex->serial : 0ull,
+                           c->r.width, c->r.height, c->r.depth);
+        return;
+    }
     if (!g_draw_ready && !draw_boot()) return;   // arena 是 draw_boot 才建的：上传不能跑在它前面
     if (!g_arena_map) return;
     if (g_in_pass || !g_cb) { atomic_fetch_add(&g_b2t_inpass, 1); return; }   // 通道开着发不了 transfer：这刀先记账
@@ -4680,6 +5273,58 @@ static void do_copy_b2t(const p_copy_b2t *c)
     unsigned layer0 = (c->has_view && c->view.set_layers) ? (unsigned)c->view.min_layer : 0u;
     if (level >= v->levels) return;
     int nz = c->r.depth > 1 ? c->r.depth : 1;
+    if (v->rt_astc) {
+        // B 路（显式 B2T 那一路）：与打包上传同一个转码口径。ASTC 4x4 与 BC3 块数相同，所以区域、行距照抄压缩块那条。
+        if (c->r.xoffset % 4u || c->r.yoffset % 4u) {
+            atomic_fetch_add(&g_b2t_comp, 1);
+            static int saidna;
+            if (!saidna) {
+                saidna = 1;
+                GVL("[vk] B2T自转跳过：区域起点不在 4×4 块上 起 %{public}d,%{public}d 区 %{public}d x %{public}d",
+                    c->r.xoffset, c->r.yoffset, c->r.width, c->r.height);
+            }
+            return;
+        }
+        uint32_t dw = (uint32_t)c->r.width, dh = (uint32_t)c->r.height;
+        uint32_t lw = (v->w >> level) ? (v->w >> level) : 1u, lh = (v->h >> level) ? (v->h >> level) : 1u;
+        if (dw > lw) dw = lw;
+        if (dh > lh) dh = lh;
+        uint32_t nbx = (dw + 3u) / 4u, nby = (dh + 3u) / 4u;
+        uint64_t sp = (S.copy_stride > 0 && ((uint64_t)S.copy_stride % 16u) == 0) ? (uint64_t)S.copy_stride : (uint64_t)nbx * 16u;
+        uint64_t s_img = sp * nby;
+        size_t need = (size_t)nbx * (size_t)nby * 16u;
+        void *sb = NULL; uint64_t sbo = 0;
+        if (!mtl_addr(c->src, s_img * (uint64_t)nz, &sb, &sbo)) { atomic_fetch_add(&g_b2t_noaddr, 1); return; }
+        uint32_t ao = arena_take((uint64_t)need * (uint64_t)nz);
+        if (ao == 0xFFFFFFFFu) return;
+        for (int z = 0; z < nz; z++) {
+            if (rt_bc3_to_astc((const uint8_t *)sb + sbo + (uint64_t)z * s_img, (size_t)sp, dw, dh,
+                               g_arena_map + ao + (size_t)z * need, need)) {
+                atomic_fetch_add(&g_b2t_comp, 1);
+                return;
+            }
+        }
+        to_layout(g_cb, v, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
+        VkBufferImageCopy reg[16]; int nreg = 0;
+        for (int z = 0; z < nz && nreg < 16; z++) {
+            uint32_t layer = layer0 + (uint32_t)(c->r.zoffset + z);
+            if (v->d.d.target == 2) layer = 0;
+            reg[nreg++] = (VkBufferImageCopy){
+                .bufferOffset = ao + (uint64_t)z * need,
+                .bufferRowLength = 0,
+                .bufferImageHeight = 0,
+                .imageSubresource = (VkImageSubresourceLayers){ VK_IMAGE_ASPECT_COLOR_BIT, level, layer, 1 },
+                .imageOffset = { c->r.xoffset, c->r.yoffset, v->d.d.target == 2 ? c->r.zoffset : 0 },
+                .imageExtent = { nbx * 4u, nby * 4u, v->d.d.target == 2 ? nz : 1u } };
+            if (v->d.d.target != 2) continue;
+            break;
+        }
+        vkCmdCopyBufferToImage(g_cb, g_arena, v->img, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, (uint32_t)nreg, reg);
+        v->uploaded = 1;
+        to_layout(g_cb, v, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
+        atomic_fetch_add(&g_b2t_ok, 1); atomic_fetch_add(&g_b2t_rt, 1);
+        return;
+    }
     if (v->soft_bc) {
         // BC 块 → 未压缩像素：源按 4×4 块寻址，解出来的像素写进 arena 再拷图（设备不认 BC，第 81 轮实测）。
         // 解码器复用 dm/gfx/tex/nvn_bcdec.c（BC1–BC7 / BC6H，Metal 后端一直在用），目标格式与它给的每像素字节数一致。
@@ -4965,6 +5610,8 @@ static _Atomic uint64_t g_pkg_up, g_pkg_bytes, g_pkg_arena, g_pkg_range, g_pkg_d
                         g_pkg_bc, g_pkg_dep, g_pkg_big, g_pkg_bigok, g_pkg_attempted_textures, g_pkg_re,
                         g_pkg_qfull, g_pkg_tk_moved, g_pkg_sub_over, g_pkg_ovfl,
                         g_pkg_head, g_pkg_over, g_pkg_nobuf, g_pkg_bkoff, g_pkg_age;
+// 通道内当场搬（pkg_upload_now）：试了几次、搬成几张、被每提交预算卡住几次、独立提交失败几次
+static _Atomic uint64_t g_eup_try, g_eup_ok, g_eup_cap, g_eup_fail;
 
 // 统计逐项映射：标签与计数器写在同一行，位置由代码结构决定，不再靠「数一下有几个 %llu」。
 // 改前这里是一串 snprintf 参数，第 40 轮那次「标签对上隔壁的数」就是这么漏过去的——数目对了，含义错了。
@@ -4995,7 +5642,11 @@ static const pkg_stat g_pkg_stat[] = {
     { "退避", &g_pkg_bkoff, 0 },     // 退避窗口内直接跳过：连量尺都不做，这就是「长期无空间不忙等」
     { "队龄", &g_pkg_age, 0 },       // 排了 32 代还没传成：首传没收敛的现场计数
     { "重开", &g_sub_reenter, 0 },   // 缓冲还开着又 sub_begin：这一趟绝不清游标（清了就是覆盖已录 copy 的字节）
-    { "串线", &g_sub_race, 0 }       // 开缓冲与提交不是同一个线程
+    { "串线", &g_sub_race, 0 },      // 开缓冲与提交不是同一个线程
+    { "当场试", &g_eup_try, 0 },     // 绑定当场发起独立搬运的次数
+    { "当场成", &g_eup_ok, 0 },      // 当场搬成：这一张在本帧那次采样之前就已就位（原路要等通道结束）
+    { "当场顶", &g_eup_cap, 0 },     // 每提交预算用完：剩下的退回通道外原路，别把帧时拖没
+    { "当场败", &g_eup_fail, 0 }     // 独立缓冲录不进或等不完：这张退回原路重搬
 };
 static int pkg_stat_line(char *line, int cap, int m)
 {
@@ -5114,7 +5765,7 @@ static uint64_t g_tr_off;
 #define TR_STAGE_SZ (128ull << 20)
 #define TR_MAX 400   // 120 张在第 119 轮正好截了号，元凶压根没进窗口 | the old cap cut the list off before the culprit
 #define TR_PER_FRAME 4   // 一趟 4 张：2048² RGBA8 一张就 16 MB，4 张刚好在 128 MB 环里周转
-typedef struct { uint64_t serial, stamp, off; uint32_t w, h, lvl, la; uint64_t bytes; } tr_ent;
+typedef struct { uint64_t serial, stamp, off; uint32_t w, h, lvl, la; uint64_t bytes; uint32_t astc; } tr_ent;
 static tr_ent g_tr_q[TR_MAX]; static int g_tr_qn; static int g_tr_total; static int g_tr_bad_fmt;
 static uint64_t g_tr_lost;   // 环满/建缓冲失败而没读成的张数 | images skipped because the stage was full
 static uint64_t g_tr_small;  // 按像素数筛掉的（DM_TEXREAD_MIN 以下）| skipped for being under DM_TEXREAD_MIN
@@ -5147,19 +5798,22 @@ static void tex_read_arm(VkCommandBuffer cb, vktex *v, unsigned lvl, unsigned la
     }
     if (g_tr_total >= TR_MAX || g_tr_qn >= TR_PER_FRAME) return;
     if (!tex_gate(v->serial)) return;
-    // 只读 RGBA8：软解后的打包美术全在这一档，别的格式（R8、深度…）字节宽度不同，混进同一份比对只会添乱。
-    // RGBA8 only: every soft-decoded packaged image lands here, and other formats would need their own pitch rules.
-    // 层也认：多层的图集要读第几层由 DM_TEXREAD_LAYER 指哪一层，读回就按那一个子资源建。
-    if (v->fmt != VK_FORMAT_R8G8B8A8_UNORM || la >= v->layers || lvl >= v->levels) { g_tr_bad_fmt++; return; }
+    // 只读 RGBA8 与 ASTC 4x4：软解后的打包美术全在 RGBA8 那一档，DM_TEX_ASTC 那一路则整张是 ASTC 块。
+    // 别的格式（R8、深度…）字节宽度不同，混进同一份比对只会添乱。ASTC 读回的是解排布后的密文块，离线先用 astcenc 解回再比。
+    // RGBA8 (the soft-decoded art) and ASTC 4x4 (the DM_TEX_ASTC route) are the two readable kinds; other formats need
+    // their own pitch rules. The ASTC bytes are still-blocked ciphertext - decode them offline before comparing.
+    int isa4 = v->fmt == VK_FORMAT_ASTC_4x4_UNORM_BLOCK;
+    if ((v->fmt != VK_FORMAT_R8G8B8A8_UNORM && !isa4) || la >= v->layers || lvl >= v->levels) { g_tr_bad_fmt++; return; }
     uint32_t w = (v->w >> lvl) ? (v->w >> lvl) : 1u, h = (v->h >> lvl) ? (v->h >> lvl) : 1u;
+    uint64_t pitch = isa4 ? (uint64_t)(((w + 3u) / 4u) * 4u) : ((((uint64_t)w * 4u) + 15) & ~(uint64_t)15) / 4u;   // 以 texel 计 | in texels
+    uint64_t rows = isa4 ? (uint64_t)((h + 3u) / 4u) * 4u : (uint64_t)h;                                          // 缓冲里的纹理行数 | texel rows in the buffer
+    uint64_t need = isa4 ? (uint64_t)(((w + 3u) / 4u) * 16u) * ((h + 3u) / 4u) : pitch * 4u * (uint64_t)h;
     // DM_TEXREAD_MIN = 像素数下限。第 119 轮的教训：斜切面板那两张落在 serial 10951/10952，可 serial 是进程内计数，
     // 每一轮走到的深度不同（这一轮跑到 serial 4300 还没进世界），拿 serial 当靶子会一整轮空手。
     // Gate on pixel count, not serial: serials are per-process counters and do not reproduce across rounds.
     static uint64_t minpx; static int minpx_try;
     if (!minpx_try) { minpx_try = 1; const char *m = getenv("DM_TEXREAD_MIN"); minpx = m ? strtoull(m, NULL, 0) : 0; }
     if (minpx && (uint64_t)w * (uint64_t)h < minpx) { g_tr_small++; return; }
-    uint64_t pitch = (((uint64_t)w * 4u) + 15) & ~(uint64_t)15;
-    uint64_t need = pitch * h;
     if (!need || need > TR_STAGE_SZ) return;
     if (!g_tr_buf) {
         if (!mk_hostbuf(TR_STAGE_SZ, VK_BUFFER_USAGE_TRANSFER_DST_BIT, &g_tr_buf, &g_tr_mem, (void **)&g_tr_map)) {
@@ -5172,8 +5826,8 @@ static void tex_read_arm(VkCommandBuffer cb, vktex *v, unsigned lvl, unsigned la
     to_layout(cb, v, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
     VkBufferImageCopy rc = {0};
     rc.bufferOffset = off;
-    rc.bufferRowLength = (uint32_t)(pitch / 4u);
-    rc.bufferImageHeight = h;
+    rc.bufferRowLength = (uint32_t)pitch;
+    rc.bufferImageHeight = (uint32_t)rows;
     rc.imageSubresource = (VkImageSubresourceLayers){ VK_IMAGE_ASPECT_COLOR_BIT, lvl, la, 1 };
     rc.imageExtent = (VkExtent3D){ w, h, 1 };
     vkCmdCopyImageToBuffer(cb, v->img, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, g_tr_buf, 1, &rc);
@@ -5183,7 +5837,7 @@ static void tex_read_arm(VkCommandBuffer cb, vktex *v, unsigned lvl, unsigned la
     // transfer layout, because the next bind would then take a transition path the un-instrumented round never took.
     to_layout(cb, v, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
     rb_host_dep(cb, g_tr_buf, need);
-    g_tr_q[g_tr_qn++] = (tr_ent){ v->serial, stamp, off, w, h, lvl, la, need };
+    g_tr_q[g_tr_qn++] = (tr_ent){ v->serial, stamp, off, w, h, lvl, la, need, (uint32_t)isa4 };
 }
 
 // 出图栅栏之后：那条队列里排在栅栏前的拷贝一定执行完了（同队列按提交序）
@@ -5201,15 +5855,17 @@ static void tex_read_report(void)
         tr_ent *e = &g_tr_q[i];
         char p[512];
         char nm[128];
-        snprintf(nm, sizeof nm, "rd_s%llu_v%llu_L%u_D%u.bin", (unsigned long long)e->serial,
+        const char *kind = e->astc ? "rda" : "rd";   // rda = 读回的是 ASTC 块，离线要先解回；rd = RGBA8 像素，直接能画
+        snprintf(nm, sizeof nm, "%s_s%llu_v%llu_L%u_D%u.bin", kind, (unsigned long long)e->serial,
                  (unsigned long long)e->stamp, e->lvl, e->la);
         snprintf(p, sizeof p, "%s/%s", dir, nm);
         FILE *f = fopen(p, "wb");
         if (!f) { GVL("[vk] 读回写不出 %{public}s errno=%{public}d（停手）", p, errno); g_tr_total = TR_MAX; break; }
         fwrite(g_tr_map + e->off, 1, (size_t)e->bytes, f); fclose(f);
         g_tr_total++;
-        uint64_t tp = (((uint64_t)e->w * 4u) + 15) & ~(uint64_t)15;
-        p3_note(dir, "rd", nm, e->serial, e->stamp, e->lvl, e->la, e->w, e->h, tp, g_tr_map + e->off, (size_t)e->bytes);
+        uint64_t tp = e->astc ? (uint64_t)(((e->w + 3u) / 4u) * 16u)
+                              : ((((uint64_t)e->w * 4u) + 15) & ~(uint64_t)15);
+        p3_note(dir, kind, nm, e->serial, e->stamp, e->lvl, e->la, e->w, e->h, tp, g_tr_map + e->off, (size_t)e->bytes);
         GVL("[vk] 读回%{public}d serial=%{public}llu 版%{public}llu 级%{public}u 层%{public}u %{public}u x %{public}u 行%{public}llu 字节%{public}llu 拍%{public}llu 画%{public}llu",
             g_tr_total, (unsigned long long)e->serial, (unsigned long long)e->stamp, e->lvl, e->la, e->w, e->h,
             (unsigned long long)tp,
@@ -5244,10 +5900,15 @@ static void pkg_backoff(vktex *v)
 
 enum { PKG_UP_RETRY = 0, PKG_UP_OK = 1, PKG_UP_FATAL = 2 };
 
-static int pkg_upload(vktex *v)
+// cb = NULL：记进游戏这条命令缓冲，只在通道外可用（原路，pass_end / commit 冲刷）。
+// cb 非空：记进一条独立的一次性缓冲，由 pkg_upload_now 自己提交并等完——这是通道内当场搬运那一条路。
+// pkg_upload(v, NULL) records into the game's own buffer and only works outside a pass; a non-NULL cb records into a
+// one-shot buffer that pkg_upload_now submits and waits itself - the in-pass path.
+static int pkg_upload(vktex *v, VkCommandBuffer cb)
 {
     const tex_t *t = &v->d;
-    if (!g_cb || g_in_pass || !v->img) return PKG_UP_RETRY;   // 通道里发不了 transfer，也不是失败：留着下次冲刷
+    if (!cb) { if (!g_cb || g_in_pass) return PKG_UP_RETRY; cb = g_cb; }   // 通道里发不了 transfer，也不是失败：留着下次冲刷
+    if (!v->img) return PKG_UP_RETRY;
     v->pkg_why = STG_OK;   // 每次尝试都先清掉上一趟的原因，别让「上次环满」把这一趟整批误判成环满
     // 退避窗口里连量尺都不做：这就是「长期无空间不忙等」那一条，单次提交的 CPU 因此有上限
     if (v->pkg_next && (uint64_t)g_fence_val < v->pkg_next) { atomic_fetch_add(&g_pkg_bkoff, 1); return PKG_UP_RETRY; }
@@ -5266,7 +5927,11 @@ static int pkg_upload(vktex *v)
     int soft = v->soft_bc;                        // 马良 920 一个 BC 块格式都不认（第 81 轮实测）：块先解排布，再在 CPU 上解压
     int bpp = bpb; uint32_t upf = 0;
     if (soft) { if (!nvn_bc_unpacked((uint32_t)t->d.format, &upf, &bpp)) { atomic_fetch_add(&g_pkg_fmt, 1); v->pkg_bad = 1; return PKG_UP_FATAL; } }
-    else if (!bpb || bw != 1 || bh != 1) { atomic_fetch_add(&g_pkg_fmt, 1); v->pkg_bad = 1; return PKG_UP_FATAL; }
+    // 设备认这个块格式就按块原样搬（DM_TEX_ASTC 把 NVN 0x44 指到 ASTC 4x4 走的正是这一路）：
+    // 只有认不出的格式才判死。原先这里连 bw!=1 一起拒了，那是「BC 一律软解」那一段的残留。
+    // If the device samples the block format itself, move the blocks verbatim - that is the DM_TEX_ASTC route.
+    // Only an unrecognized format is fatal; the old `bw != 1` rejection was a leftover of "always soft-decode BC".
+    else if (!bpb) { atomic_fetch_add(&g_pkg_fmt, 1); v->pkg_bad = 1; return PKG_UP_FATAL; }
     uint64_t s0 = t->off > 0 ? (uint64_t)t->off : 0;
     uint64_t avail = t->pool->size > s0 ? t->pool->size - s0 : 0;
     if (!avail) { v->pkg_bad = 1; return PKG_UP_FATAL; }
@@ -5297,7 +5962,12 @@ static int pkg_upload(vktex *v)
         if (end1 > avail) { atomic_fetch_add(&g_pkg_range, 1); v->pkg_bad = 1; return PKG_UP_FATAL; }
         if (end1 > pend) pend = end1;
         // 未压缩的按压缩块字节数入总量；软解的按解压后的行距入总量，压缩块只是逐层复用的一块暂存，别双计
-        if (!soft) { if (!pkg_add_ok(tot, need, &tot)) { atomic_fetch_add(&g_pkg_ovfl, 1); v->pkg_bad = 1; return PKG_UP_FATAL; } continue; }
+        if (!soft) {
+            if (!pkg_add_ok(tot, need, &tot)) { atomic_fetch_add(&g_pkg_ovfl, 1); v->pkg_bad = 1; return PKG_UP_FATAL; }
+            // B 路自转的目的地也是块字节数（ASTC 4x4 与 BC3 同尺寸），但源 BC3 块还要一份同尺寸的暂存
+            if (v->rt_astc && need > cmax) cmax = need;
+            continue;
+        }
         uint32_t w = (v->w >> l) ? (v->w >> l) : 1u, h = (v->h >> l) ? (v->h >> l) : 1u;
         uint64_t drow;
         // 未压缩行距 = 16 对齐(宽×每像素字节)，再乘高乘切片；每一步都查，绕回的小值会「圈到」然后写越界
@@ -5330,11 +6000,11 @@ static int pkg_upload(vktex *v)
         return PKG_UP_RETRY;
     }
     unsigned dl, rl; p3_layers(&dl, &rl);
-    to_layout(g_cb, v, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
+    to_layout(cb, v, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
     uint64_t asc = 0;
     atomic_fetch_add(&g_pkg_bigok, 1);   // 每张打包上传都走独立环 | every packaged upload now stages on the ring
     int stag_exh = 0;   // 圈不到属于「这次提交放不下」，可重试；只有真正的错才许置 pkg_bad | staging exhaustion is retryable; only real errors may set pkg_bad
-    if (soft) {
+    if (soft || v->rt_astc) {
         asc = stage_take(&st, cmax ? cmax : 16);   // 压缩块的暂存按最大那一级算，逐层复用同一块
         if (asc == ~(uint64_t)0) { atomic_fetch_add(&g_pkg_arena, 1); stag_exh = 1; }
     }
@@ -5364,6 +6034,19 @@ static int pkg_upload(vktex *v)
                 atomic_fetch_add(&g_pkg_fmt, 1); plan_fatal = 1; break;
             }
             brl = (uint32_t)(drow / (uint64_t)bpp); bih = eh;
+        } else if (v->rt_astc) {
+            // B 路：源 BC3 块先解排布进暂存，再由设备现编成 ASTC 4x4 块落进目的地。块数与 BC3 一模一样
+            // （都是 4×4 / 16 字节），所以 need、行距、拷贝区域全不用改，只有"这批字节按什么解释"变了。
+            // 这条路不查文件名也不查清单：每张图就在这一次上传里自己转，所以离线烘那种"漏了某个容器"的事故不可能发生。
+            if (nvn_deswizzle(&t->d, (unsigned)l, (unsigned)la, t->mem, st.map + asc, (size_t)rb)) {
+                atomic_fetch_add(&g_pkg_dz, 1); plan_fatal = 1; break;
+            }
+            ao = stage_take(&st, need);
+            if (ao == ~(uint64_t)0) { atomic_fetch_add(&g_pkg_arena, 1); stag_exh = 1; break; }
+            if (rt_bc3_to_astc(st.map + asc, (size_t)rb, ew, eh, st.map + ao, (size_t)need)) {
+                atomic_fetch_add(&g_pkg_fmt, 1); plan_fatal = 1; break;
+            }
+            blen = need;
         } else {
             ao = stage_take(&st, need);
             if (ao == ~(uint64_t)0) { atomic_fetch_add(&g_pkg_arena, 1); stag_exh = 1; break; }
@@ -5394,13 +6077,36 @@ static int pkg_upload(vktex *v)
             snprintf(tg, sizeof tg, "打包 NVN%d→Vk%d 软%d 行%u", (int)t->d.format, (int)v->fmt, soft, rb);
             up_probe(tg, st.map + ao, blen, ew, eh, 1);
         }
+        // DM_TEXFPRINT=<serial>（2026-10-19 绿地面取证）：对指定 serial 的第 0 级打三段指纹
+        //（源池原始字节 / 解排布后块 / 解码后 RGBA），全走 hilog 不碰文件系统（重放线程 mkdir/写文件 EACCES）。
+        // 判读：源段全零=池定位错；源有量解排布段全零=解排布错；解码段头 4 字节通道序异常=解码错。
+        {
+            static int ana_on = -1; static uint64_t ana_serial;
+            if (ana_on < 0) { const char *e = getenv("DM_TEXFPRINT"); ana_on = e ? 1 : 0; ana_serial = e ? strtoull(e, NULL, 0) : 0; }
+            if (ana_on && l == 0 && la == 0) {   // 指纹所有打包上传（世界每次加载 serial 都会变，按 serial 过滤会扑空）
+                const uint8_t *segs[3]; const char *nm[3] = { "A-src-pool", "B-deswizzled", "C-decoded" }; size_t segn[3];
+                segs[0] = t->mem; segn[0] = avail;
+                if (soft) { segs[1] = st.map + asc; segn[1] = (size_t)rb; segs[2] = st.map + ao; segn[2] = (size_t)blen; }
+                else { segs[1] = st.map + ao; segn[1] = (size_t)need; segs[2] = NULL; segn[2] = 0; }
+                for (int sgi = 0; sgi < 3; sgi++) {
+                    const uint8_t *q = segs[sgi]; size_t nn = segn[sgi];
+                    if (!q || !nn) { GVL("[vk] TEXFPRINT s=%{public}llu %s: (none)", (unsigned long long)v->serial, nm[sgi]); continue; }
+                    size_t probe = nn < 32768 ? nn : 32768;
+                    uint64_t nz = 0; uint64_t sum = 0;
+                    for (size_t b = 0; b < probe; b++) { sum += q[b]; if (q[b]) nz++; }
+                    GVL("[vk] TEXFPRINT s=%{public}llu %s: n=%{public}lu nz=%{public}llu/%lu sum=%{public}llu head8=%02x%02x%02x%02x%02x%02x%02x%02x",
+                        (unsigned long long)v->serial, nm[sgi], nn, (unsigned long long)nz, probe,
+                        (unsigned long long)sum, q[0], q[1], q[2], q[3], q[4], q[5], q[6], q[7]);
+                }
+            }
+        }
     }
     if (plan_fatal || (!nsub && !stag_exh)) {   // 真错，或几何一格都没备出来：置坏，别再来回重算
-        to_layout(g_cb, v, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
+        to_layout(cb, v, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
         v->pkg_bad = 1; return PKG_UP_FATAL;
     }
     if (stag_exh) {                             // 环没圈够：一条 copy 都没录，请求原样留给下一次提交
-        to_layout(g_cb, v, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
+        to_layout(cb, v, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
         return PKG_UP_RETRY;
     }
     for (int i = 0; i < nsub; i++) {            // 全部子资源都备好了，这才开始录拷贝
@@ -5409,14 +6115,15 @@ static int pkg_upload(vktex *v)
         reg.bufferOffset = s->off; reg.bufferRowLength = s->brl; reg.bufferImageHeight = s->bih;
         reg.imageSubresource = (VkImageSubresourceLayers){ VK_IMAGE_ASPECT_COLOR_BIT, s->lvl, s->layer, 1 };
         reg.imageExtent = (VkExtent3D){ s->ew, s->eh, s->slices };
-        vkCmdCopyBufferToImage(g_cb, st.buf, v->img, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &reg);
+        vkCmdCopyBufferToImage(cb, st.buf, v->img, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &reg);
         atomic_fetch_add(&g_pkg_bytes, s->blen);
         if (soft) atomic_fetch_add(&g_pkg_bc, 1);
     }
     // 读回放在拷贝之后：循环里转布局会把下一级的拷贝留在错态上（vkCmdCopyBufferToImage 传的是 TRANSFER_DST）。
     // Arm the readback after every copy is recorded: transitioning inside the loop would leave a copy in the wrong layout.
-    tex_read_arm(g_cb, v, 0u, rl, st0); tex_read_arm(g_cb, v, 1u, rl, st0);
-    to_layout(g_cb, v, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
+    // 当场搬那条路不排读回：独立缓冲等完栅栏就回收了，读回的窗口属于游戏这条缓冲。
+    if (cb == g_cb) { tex_read_arm(g_cb, v, 0u, rl, st0); tex_read_arm(g_cb, v, 1u, rl, st0); }
+    to_layout(cb, v, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
     if (v->uploaded) atomic_fetch_add(&g_pkg_re, 1);   // 重传（游戏又写了这张）| a re-upload: the game wrote this one again
     v->uploaded = 1;
     v->pkg_dirty = 0;
@@ -5471,7 +6178,7 @@ static void pkg_flush(void)
         }
         if (tried >= PKG_FLUSH_MAX) { stop = i; break; }   // 这一趟的活儿到顶：剩下的原样留在队里
         tried++;
-        int up = pkg_upload(v);
+        int up = pkg_upload(v, NULL);
         textrace(NVN_TRACE_RESULT, v, -1,
                  up == PKG_UP_OK ? "copy-recorded" : up == PKG_UP_RETRY ? "retry-later" : "fatal");
         if (up == PKG_UP_OK) { did++; continue; }
@@ -5510,6 +6217,92 @@ static void pkg_queue(vktex *v)
       if (k < 40) GVL("[vk] 排队上传 s=%{public}llu %{public}ux%{public}u 格%{public}d 级%{public}u 传过%{public}d",
                       (unsigned long long)v->serial, v->w, v->h, (int)v->fmt, v->levels, v->uploaded); }}
 
+// ---- 通道内当场搬（第 113 轮的主刀）| upload right now, from inside an open pass ----
+// 原路只在通道外发 transfer，而实测的形状是「本帧新建、本帧就采」：绑定发生在通道里，队列要等 pass_end 才搬，
+// 那一帧的采样早就过去了（第 112 轮：3952/3965 次哑绑落在这批图上）。
+// 但游戏这条 g_cb 还没提交——所以此刻用一条独立命令缓冲单独提交并等完栅栏，这份拷贝在 GPU 上一定排在
+// 后面那次采样之前。这是唯一赶得上的时机。
+// The old path can only issue transfers outside a pass, while the measured shape is "created this frame, sampled this frame":
+// binds happen inside the pass and the queue only drains at pass_end, long after the draw that needed it. But the game's g_cb
+// has not been submitted yet, so a one-shot buffer submitted and waited right here lands on the GPU before that draw.
+// 代价是一次同步提交：按每次提交设预算，超了就退回原路；DM_VK_EAGER=0 整条关掉做 A/B。
+#define EUP_MAX 32
+static int g_eager = -1;                 // -1 = 还没读参数，0 = 关，1 = 开（等不完栅栏会自己关掉整条路）
+static int g_eup_max = EUP_MAX;          // 额度上限，DM_VK_EAGER_N 可改
+static int g_eup_budget = EUP_MAX;       // 每次提交（每帧）的当场搬额度
+void mtl_sub_reset_eager(void);          // 由 mtl_sub_reset_draw 调：换一条命令缓冲就重新给额度
+void mtl_sub_reset_eager(void) { g_eup_budget = g_eup_max; }
+
+static void pkg_upload_now(vktex *v)
+{
+    if (g_eager < 0) {
+        const char *e = getenv("DM_VK_EAGER");
+        g_eager = (e && !strcmp(e, "0")) ? 0 : 1;
+        const char *n = getenv("DM_VK_EAGER_N");
+        if (n) { int x = atoi(n); if (x >= 0) { g_eup_max = x; g_eup_budget = x; } }
+    }
+    if (!g_on || !g_eager || !v || atomic_load(&g_dead)) return;
+    if (!g_in_pass || !g_cb) return;                        // 通道外走原路：记进游戏这条缓冲，不必多一次提交
+    if (g_cb_tid && (int)syscall(SYS_gettid) != g_cb_tid) return;   // 命令池与队列都只认开缓冲那个线程
+    if (v->pkg_bad || v->uploaded || !v->img) return;
+    if (v->is_depth || v->d.d.target == 2) return;          // 这两类 pkg_upload 一律判死，别在这里提前替它判
+    if (!v->d.mem || !v->d.pool) return;                    // 池里没有字节，搬了就是搬未初始化的内存
+    if (g_eup_budget <= 0) { atomic_fetch_add(&g_eup_cap, 1); return; }
+    // 本通道的附件不能当 transfer 目标：同趟里既写又读、还没有 self-dependency，就是竞态
+    if (v == g_p.dv) return;
+    for (uint32_t i = 0; i < g_p.ncol; i++) if (v == g_p.cv[i]) return;
+
+    g_eup_budget--;
+    atomic_fetch_add(&g_eup_try, 1);
+
+    VkCommandBufferAllocateInfo cai = { VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO };
+    cai.commandPool = g_cp; cai.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY; cai.commandBufferCount = 1;
+    VkCommandBuffer cb = NULL;
+    if (vkAllocateCommandBuffers(g_dev, &cai, &cb) != VK_SUCCESS) { atomic_fetch_add(&g_eup_fail, 1); return; }
+    VkCommandBufferBeginInfo bi = { VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO };
+    bi.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+    if (vkBeginCommandBuffer(cb, &bi) != VK_SUCCESS) {
+        vkFreeCommandBuffers(g_dev, g_cp, 1, &cb); atomic_fetch_add(&g_eup_fail, 1); return;
+    }
+    int up = pkg_upload(v, cb);
+    if (up != PKG_UP_OK) {                 // 一条拷贝都没录：收缓冲、退回原路，别让 uploaded 假置
+        vkEndCommandBuffer(cb);
+        vkFreeCommandBuffers(g_dev, g_cp, 1, &cb);
+        atomic_fetch_add(&g_eup_fail, 1);
+        return;
+    }
+    vkEndCommandBuffer(cb);
+    VkFenceCreateInfo fci = { VK_STRUCTURE_TYPE_FENCE_CREATE_INFO };
+    VkFence fn = (VkFence)0;
+    int ok = 0;
+    if (vkCreateFence(g_dev, &fci, NULL, &fn) == VK_SUCCESS) {
+        VkSubmitInfo si = { VK_STRUCTURE_TYPE_SUBMIT_INFO };
+        si.commandBufferCount = 1; si.pCommandBuffers = &cb;
+        VkResult sr = vkQueueSubmit(g_q, 1, &si, fn);
+        if (sr == VK_SUCCESS) {
+            VkResult wr = vkWaitForFences(g_dev, 1, &fn, VK_TRUE, 3000000000ull);
+            if (wr != VK_SUCCESS) GRED("[red] 当场搬等栅栏=%{public}d s=%{public}llu：这条整轮停用，退回通道外原路",
+                                       (int)wr, (unsigned long long)v->serial);
+            else ok = 1;
+        } else GRED("[red] 当场搬提交=%{public}d s=%{public}llu：这条整轮停用，退回通道外原路",
+                    (int)sr, (unsigned long long)v->serial);
+        vkDestroyFence(g_dev, fn, NULL);
+    }
+    vkFreeCommandBuffers(g_dev, g_cp, 1, &cb);
+    if (!ok) {                             // 拷贝没落地：把 pkg_upload 置的成功收回，让 pass_end 那条路重搬
+        g_eager = 0;
+        v->uploaded = 0; v->pkg_stale = 1;
+        atomic_fetch_add(&g_eup_fail, 1);
+        return;
+    }
+    atomic_fetch_add(&g_eup_ok, 1);
+    g_sets_valid = 0;                      // 这一张现在该绑真视图了
+    { static _Atomic int se; int k = atomic_fetch_add(&se, 1);
+      if (k < 12) GVL("[vk] 当场搬%{public}d s=%{public}llu %{public}ux%{public}u 格%{public}d 级%{public}u 软%{public}d B路%{public}d 额度%{public}d",
+                      k + 1, (unsigned long long)v->serial, v->w, v->h, (int)v->fmt, v->levels,
+                      v->soft_bc, v->rt_astc, g_eup_budget); }
+}
+
 // 「无通道」那一堆到底缺哪一件（第 82 轮：88 万条绘制没通道，比真正重放的还多六倍）
 // Which half of the nopass test failed: on round 82 880k draws had no pass - six times more than the 130k that replayed.
 static int g_np_said;
@@ -5539,8 +6332,70 @@ static void nolib_said(const progrec *p)
     for (int i = 0; i < SH_STAGE_N && (size_t)k + 18 < cap; i++)
         if (p->key[i][0]) k += snprintf(s + k, cap - (size_t)k, "%s%s", k ? " " : "", p->key[i]);
     if (!k) snprintf(s, cap, "(无键)");
-    for (int i = 0; i + 1 < g_nolib_kn; i++) if (!strcmp(g_nolib_key[i], s)) return;
+    // 去重要扫到已存的每一条：改前写成 i + 1 < g_nolib_kn，倒数那条永远比不到，同一条键会重复占格
+    for (int i = 0; i < g_nolib_kn; i++) if (!strcmp(g_nolib_key[i], s)) return;
     g_nolib_kn++;
+}
+
+// 上屏程序点名册 | the on-screen program census
+// 「美术全在、唯独文字没有」这种症状要的是逐笔归因，不是平均值：按（顶键,像键）累计上屏绘制笔数与顶点数，
+// 首次见到某个程序时顺手记一张常量快照（两阶段声明了几条 cbuf、当时真绑上几条）。
+// 声明>0 而真绑=0 的那一行就是「常量整块走全零兜底」的程序——AC 轮已经抓到一条这样的（顶点阶段 16 个槽全空）。
+// The symptom "all art is there, only the text is missing" needs per-draw attribution, not averages. Tally
+// on-screen draws and vertices per (vert key, frag key), and on first sight snapshot how many cbuf rows the two
+// stages declare versus how many actually have a buffer behind them. Declared>0 with bound==0 convicts that
+// program of reading the zero bank - round AC already caught one such case with all 16 vertex slots empty.
+#define PK_N 48
+static struct { uint64_t kv, kf; uint64_t nv; uint32_t n; uint16_t vi, fi, dec, got; } g_pk[PK_N];
+static int g_pk_n;
+static uint64_t g_pk_tot;
+
+static void pk_said(void)
+{
+    static int shown;
+    if (shown >= 6 || !g_pk_n) return;
+    shown++;
+    uint64_t skip = 0;
+    for (int pass = 0; pass < 12; pass++) {
+        int best = -1;
+        for (int i = 0; i < g_pk_n; i++) {
+            if (skip & (1ull << i)) continue;
+            if (best < 0 || g_pk[i].n > g_pk[best].n) best = i;
+        }
+        if (best < 0) break;
+        skip |= 1ull << best;
+        GVL("[vk] 上屏程序 顶%016llx 像%016llx 绘%{public}u 顶%{public}llu 常声明%{public}u 实绑%{public}u 序%{public}d/%{public}d",
+            (unsigned long long)g_pk[best].kv, (unsigned long long)g_pk[best].kf, g_pk[best].n,
+            (unsigned long long)g_pk[best].nv, g_pk[best].dec, g_pk[best].got, g_pk[best].vi, g_pk[best].fi);
+    }
+}
+
+static void pk_tally(int vi, int fi, uint32_t nv)
+{
+    uint64_t kv, kf;
+    memcpy(&kv, g_shb_e[vi].key, 8);
+    memcpy(&kf, g_shb_e[fi].key, 8);
+    g_pk_tot++;
+    int i;
+    for (i = 0; i < g_pk_n; i++)
+        if (g_pk[i].kv == kv && g_pk[i].kf == kf && g_pk[i].vi == vi && g_pk[i].fi == fi) {
+            g_pk[i].n++; g_pk[i].nv += nv; return;
+        }
+    if (g_pk_n < PK_N) { i = g_pk_n++; }
+    else { i = 0; for (int j = 1; j < g_pk_n; j++) if (g_pk[j].n < g_pk[i].n) i = j; }
+    g_pk[i].kv = kv; g_pk[i].kf = kf; g_pk[i].nv = nv; g_pk[i].n = 1;
+    g_pk[i].vi = (uint16_t)vi; g_pk[i].fi = (uint16_t)fi;
+    int dec = 0, got = 0;
+    for (int st = 0; st < 2; st++) {
+        const shb_entry *en = &g_shb_e[st ? fi : vi];
+        for (int b = 0; b < en->nb; b++) {
+            const shb_bind *bd = &g_shb_b[en->bind_off + b];
+            if (bd->nvn_kind != SHB_N_CBUF && bd->nvn_kind != SHB_N_UBOP) continue;
+            dec++;
+            if (bd->nvn_reg >= 0 && bd->nvn_reg < 16 && S.ubo[st][bd->nvn_reg].addr) got++;
+        }
+    }
+    g_pk[i].dec = (uint16_t)dec; g_pk[i].got = (uint16_t)got;
 }
 
 // 上屏那条通道里那一笔绘制的现场：程序、图元、视口、剪裁、写掩码，以及各阶段绑上的贴图有没有内容
@@ -5567,6 +6422,190 @@ static void sp_draw_said(int vi, int fi, const p_draw *dw, const p_draw_idx *di)
         (int)(dw ? dw->prim : di->prim), (int)(dw ? dw->first : -1), (int)(dw ? dw->count : di->count),
         g_p.ncol, g_p.cv[0] ? g_p.cv[0]->w : 0u, g_p.cv[0] ? g_p.cv[0]->h : 0u, S.has_vp,
         S.has_sc ? S.sc.w : -1, S.has_sc ? S.sc.h : -1, S.ms.samples, S.color.blend_en, (unsigned)S.chmask.mask, tb);
+}
+
+// 点名那一笔的现场（DM_SPKEY = 逗号分隔的库条目键前缀，"1" = 每个配对都报一次）
+// 上屏绘那 6 笔预算全被开场动画花掉了：AG 实测字体那一对（序114/66 绘36867、序114/77 绘24570，每笔 6 顶点＝字形四边形）
+// 一条现场都没留下，于是"美术在、文字不在"剩下的三个来路——顶点字节、采样贴图、混合写掩码——一个都没测到。
+// 这一条按键点名，每个（顶,像）配对只报一次：一行状态 + 每个顶点属性这一笔真读到的字节（arena 与客体同一窗口、同一顶点数）。
+static char g_spkey_want[192];
+static int g_spkey_off, g_spkey_n;
+static uint64_t g_spkey_done[8];
+static int g_spkey_cnt[8];      // 每对已经报了几笔 | draws already reported for this pair
+static uint64_t g_spfrom;       // DM_SPFROM：第几拍出图之后才开始报（进世界再抓现场，别被开场动画占满额度）
+static int g_spn = 1;           // DM_SPN：每对最多报几笔
+static int g_spdec;             // DM_SPDEC=1：每笔再补一行按属性解好的顶点真值
+
+static void keyhex(const uint8_t *k, char out[17])
+{
+    for (int i = 0; i < 8; i++) snprintf(out + 2 * i, 3, "%02x", k[i]);
+    out[16] = 0;
+}
+
+// 顶点属性格式 → 分量个数 + 单元素字节数（真值行只解浮点族，其余交给上面的十六进制行）
+// Vertex attribute format -> component count and element size; only the float families get decoded, the rest stay hex.
+static int fmt_comp(VkFormat f, uint32_t *esz)
+{
+    switch ((int)f) {
+    case 33: *esz = 4;  return 1;   // R32_SFLOAT
+    case 34: *esz = 8;  return 2;   // R32G32_SFLOAT
+    case 35: *esz = 12; return 3;   // R32G32B32_SFLOAT
+    case 36: *esz = 16; return 4;   // R32G32B32A32_SFLOAT
+    case 60: *esz = 4;  return 2;   // R16G16_SFLOAT
+    case 61: *esz = 6;  return 3;   // R16G16B16_SFLOAT
+    case 62: *esz = 8;  return 4;   // R16G16B16A16_SFLOAT
+    default: *esz = 0;  return 0;
+    }
+}
+
+static float half2f(uint16_t h)
+{
+    uint32_t s = (uint32_t)(h & 0x8000u) << 16, e = ((uint32_t)h >> 10) & 0x1fu, m = (uint32_t)h & 0x3ffu, out;
+    if (!e) out = s;                                    // 零与次正规都按 0 收：真值行只要量级，够用
+    else if (e == 31u) out = s | 0x7f800000u | (m << 13);
+    else out = s | ((e + 112u) << 23) | (m << 13);
+    float f; memcpy(&f, &out, 4); return f;
+}
+
+static int spkey_hit(const uint8_t *k8)
+{
+    char kb[17];
+    keyhex(k8, kb);    for (const char *p = g_spkey_want; *p; ) {
+        const char *e = strchr(p, ',');
+        size_t n = e ? (size_t)(e - p) : strlen(p);
+        if (n == 1 && p[0] == '1') return 1;
+        if (n >= 4 && n <= 16 && !strncmp(kb, p, n)) return 1;
+        if (!e) break;
+        p = e + 1;
+    }
+    return 0;
+}
+
+static void sp_pair_said(int vi, int fi, const p_draw *dw, const p_draw_idx *di)
+{
+    if (g_spkey_off) return;
+    if (!g_spkey_want[0]) {
+        const char *ev = getenv("DM_SPKEY");
+        if (!ev || !ev[0]) { g_spkey_off = 1; return; }
+        snprintf(g_spkey_want, sizeof g_spkey_want, "%s", ev);
+        const char *e2 = getenv("DM_SPFROM"); g_spfrom = e2 ? strtoull(e2, NULL, 0) : 0;
+        const char *e3 = getenv("DM_SPN"); if (e3 && *e3) { int k = (int)strtol(e3, NULL, 0); if (k > 0) g_spn = k > 24 ? 24 : k; }
+        const char *e4 = getenv("DM_SPDEC"); g_spdec = e4 ? (int)strtol(e4, NULL, 0) : 0;
+        char ib[128];
+        snprintf(ib, sizeof ib, "[vk] 点名开 起点拍%llu 每对%笔 解真值%d（%s）", (unsigned long long)g_spfrom, g_spn, g_spdec, g_spkey_want);
+        GVL("%{public}s", ib);
+    }
+    if (g_presents < g_spfrom) return;
+    if (!spkey_hit(g_shb_e[vi].key) && !spkey_hit(g_shb_e[fi].key)) return;
+    int slot = -1;
+    for (int i = 0; i < g_spkey_n; i++) if (g_spkey_done[i] == (((uint64_t)(uint32_t)vi << 32) | (uint32_t)fi)) { slot = i; break; }
+    if (slot < 0) {
+        if (g_spkey_n >= (int)(sizeof g_spkey_done / sizeof *g_spkey_done)) return;
+        slot = g_spkey_n++;
+        g_spkey_done[slot] = ((uint64_t)(uint32_t)vi << 32) | (uint32_t)fi;
+        g_spkey_cnt[slot] = 0;
+    }
+    if (g_spkey_cnt[slot] >= g_spn) return;
+    g_spkey_cnt[slot]++;
+    char kv[17], kf[17];
+    keyhex(g_shb_e[vi].key, kv); keyhex(g_shb_e[fi].key, kf);
+    char ln[460];
+    int n = snprintf(ln, sizeof ln, "[vk] 点名绘 %s/%s 拍%llu 序%llu 顶%d 像%d 形%d %s 起%d 数%d 色%u 尺寸%ux%u 视%d,%d,%d,%d 遮%dx%d 写%x 混%x",
+                     kv, kf, (unsigned long long)g_presents,
+                     (unsigned long long)(S.prog ? S.prog->serial : 0ull), vi, fi,
+                     (int)(dw ? dw->prim : di->prim), dw ? "直" : "索",
+                     dw ? (int)dw->first : (int)di->base_vertex, (int)(dw ? dw->count : di->count),
+                     g_p.ncol, g_p.cv[0] ? g_p.cv[0]->w : 0u, g_p.cv[0] ? g_p.cv[0]->h : 0u,
+                     S.has_vp ? (int)S.vp[0][0] : -1, S.has_vp ? (int)S.vp[0][1] : -1,
+                     S.has_vp ? (int)S.vp[0][2] : -1, S.has_vp ? (int)S.vp[0][3] : -1,
+                     S.has_sc ? S.sc.w : -1, S.has_sc ? S.sc.h : -1,
+                     (unsigned)S.chmask.mask, (unsigned)S.color.blend_en);
+    // 两阶段绑上的贴图：句柄低 20 位才是贴图号（与 sp_draw_said 同一切法），"空"= 建了没上传过
+    for (int s = 0; s < 2 && n > 0 && n < (int)sizeof ln - 60; s++)
+        for (int k = 0; k < 8 && n < (int)sizeof ln - 60; k++) {
+            uint64_t hd = S.tex[s][k];
+            int tid = (int)(hd & 0xfffff);
+            if (!tid) continue;
+            vktex *x = tex_of_tid(tid);
+            n += snprintf(ln + n, sizeof ln - (size_t)n, " t%d.%d=t%d%s", s, k, tid,
+                          x ? (x->uploaded ? "上" : "空") : "无");
+        }
+    GVL("%{public}s", ln);
+    const shb_entry *ve = &g_shb_e[vi];
+    int cnt = (int)(dw ? dw->count : di->count);
+    for (int v = 0; v < ve->nvi && v < 6; v++) {
+        int loc = g_shb_vi[ve->vi_off + v].loc, cls = g_shb_vi[ve->vi_off + v].cls;
+        if (loc < 0 || loc >= 16) continue;
+        vtx_plan pl; vtx_plan_for(loc, cls, &pl);
+        uint32_t stride = pl.binding < 16 ? S.stream[pl.binding].stride : 0;
+        n = snprintf(ln, sizeof ln, "[vk]   属%d 形%d 类%d 偏%u 距%u%s",
+                     loc, (int)S.attr[loc].fmt, cls, pl.off, stride, pl.constant ? " 常数流" : "");
+        if (pl.constant || pl.binding >= 16 || !stride || !g_arena_map) { GVL("%{public}s", ln); continue; }
+        // 直接读上面那次绑定留下的账：这里再调一次 vtx_stream 会把 复用/陈旧 两条计数翻倍，探针不能改被测量
+        if (g_vtx[pl.binding].gen != g_arena_gen || !g_vtx[pl.binding].ok) {
+            GVL("%{public}s 没搬", ln); continue;
+        }
+        uint32_t so = g_vtx[pl.binding].off;
+        uint64_t blen = g_vtx[pl.binding].len;
+        if (blen < pl.off + 8) { n += snprintf(ln + n, sizeof ln - (size_t)n, " 窗%llu 太短", (unsigned long long)blen); GVL("%{public}s", ln); continue; }
+        int nv = cnt > 0 ? cnt : 1;
+        while (nv > 1 && ((size_t)pl.off + (size_t)nv * stride > blen || (size_t)nv * stride > 48)) nv--;
+        size_t span = (size_t)nv * stride;
+        const uint8_t *ab = g_arena_map + so + pl.off;
+        n += snprintf(ln + n, sizeof ln - (size_t)n, " 顶%d %llu/%llu｜搬", nv, (unsigned long long)span, (unsigned long long)blen);
+        for (size_t i = 0; i < span && n < (int)sizeof ln - 8; i++) n += snprintf(ln + n, sizeof ln - (size_t)n, "%02x", ab[i]);
+        uint64_t ga = S.vbuf[pl.binding].address, gl = S.vbuf[pl.binding].size;
+        void *gb = NULL; uint64_t gbo = 0;
+        n += snprintf(ln + n, sizeof ln - (size_t)n, "｜客");
+        if (ga && gl >= pl.off + span && mtl_addr(ga, span, &gb, &gbo) && gb) {
+            const uint8_t *gbb = (const uint8_t *)gb + gbo + pl.off;
+            for (size_t i = 0; i < span && n < (int)sizeof ln - 8; i++) n += snprintf(ln + n, sizeof ln - (size_t)n, "%02x", gbb[i]);
+            n += snprintf(ln + n, sizeof ln - (size_t)n, "%s", memcmp(gbb, ab, span) ? " 不同" : " 一致");
+        } else n += snprintf(ln + n, sizeof ln - (size_t)n, "解址败");
+        GVL("%{public}s", ln);
+    }
+    if (!g_spdec) return;
+    // 常量真值：顶点阶段实际绑上的 UBO 前 12 个 float——2D 的位移/缩放矩阵就在这一段里
+    // The constants the vertex stage really bound: the 2D translate/scale lives in these floats.
+    for (int r = 0; r < 4; r++) {
+        uint64_t a = S.ubo[0][r].addr, z = S.ubo[0][r].size;
+        if (!a) continue;
+        void *p = NULL; uint64_t po = 0;
+        int q = snprintf(ln, sizeof ln, "[vk]   常值 槽%d 址%llx 长%llu", r, (unsigned long long)a, (unsigned long long)z);
+        if (q > 0 && z >= 48 && mtl_addr(a, 48, &p, &po) && p) {
+            const float *f = (const float *)((const uint8_t *)p + po);
+            q += snprintf(ln + q, sizeof ln - (size_t)q, "｜");
+            for (int i = 0; i < 12 && q < (int)sizeof ln - 12; i++) q += snprintf(ln + q, sizeof ln - (size_t)q, "%.5g ", f[i]);
+        } else if (q > 0) q += snprintf(ln + q, sizeof ln - (size_t)q, "｜解址败/太短");
+        if (q > 0) GVL("%{public}s", ln);
+    }
+    // 顶点真值：按属性自己的格式解前 8 个顶点，落点一眼可判（撕裂=坐标本身歪，正=传上去的字节错）
+    const shb_entry *ve2 = &g_shb_e[vi];
+    for (int v = 0; v < ve2->nvi && v < 6; v++) {
+        int loc = g_shb_vi[ve2->vi_off + v].loc, cls = g_shb_vi[ve2->vi_off + v].cls;
+        if (loc < 0 || loc >= 16) continue;
+        vtx_plan pl; vtx_plan_for(loc, cls, &pl);
+        if (pl.constant || pl.binding >= 16) continue;
+        uint32_t stride = S.stream[pl.binding].stride;
+        if (!stride || !g_arena_map || g_vtx[pl.binding].gen != g_arena_gen || !g_vtx[pl.binding].ok) continue;
+        uint64_t blen = g_vtx[pl.binding].len;
+        uint32_t esz = 0; int nf = fmt_comp(S.attr[loc].fmt, &esz);
+        if (!nf || !esz || (size_t)pl.off + esz > blen) continue;
+        int nv = (int)((blen - pl.off) / stride); if (nv > 8) nv = 8; if (nv < 1) nv = 1;
+        int q = snprintf(ln, sizeof ln, "[vk]   真值 属%d 形%d 类%d 偏%u 距%u n%d｜", loc, (int)S.attr[loc].fmt, cls, pl.off, stride, nv);
+        const uint8_t *base = g_arena_map + g_vtx[pl.binding].off + pl.off;
+        int half = esz == (uint32_t)nf * 2;
+        for (int i = 0; i < nv && q > 0 && q < (int)sizeof ln - 40; i++) {
+            const uint8_t *vp2 = base + (size_t)i * stride;
+            q += snprintf(ln + q, sizeof ln - (size_t)q, "(");
+            for (int c = 0; c < nf && q < (int)sizeof ln - 12; c++) {
+                float val = half ? half2f(((const uint16_t *)vp2)[c]) : ((const float *)vp2)[c];
+                q += snprintf(ln + q, sizeof ln - (size_t)q, c ? ",%.3f" : "%.3f", val);
+            }
+            q += snprintf(ln + q, sizeof ln - (size_t)q, ")");
+        }
+        if (q > 0) GVL("%{public}s", ln);
+    }
 }
 
 // 上屏绘制的混合态普查（B45）| blend-state census for on-screen draws
@@ -5624,14 +6663,41 @@ static void bsp_tally(int vi, int fi)
 // 所以这里直接读 arena 里搬进来的顶点字节：挑「着色器声明 + NVN 是四分量 8 位」的属性
 // （RGBA8=0x25 RGBA8SN=0x26 RGBA8UI=0x27 RGBA8I=0x28），逐顶点看第 4 个字节。
 // 全 0 ⇒ 顶点色带的就是 0 alpha（去查客体顶点流/我们的搬运格式）；有值 ⇒ 转去查着色器输出通道。
+// 第 AC 轮实测两条都是「四通道 min0 max255 均值 2」——几乎全零。所以这一版把同一批顶点在客体内存里的那一份
+// 一起打出来（｜搬 …｜客 …），一行判死「我们搬错了」还是「游戏写的就是这些字节」。
+static void va_span(const uint8_t *base, uint32_t stride, size_t lim, uint32_t *out)
+{
+    uint32_t mn[4] = { 255u, 255u, 255u, 255u }, mx[4] = { 0, 0, 0, 0 }, sum[4] = { 0, 0, 0, 0 }, n = 0;
+    for (uint32_t i = 0; i < 512 && (size_t)i * stride <= lim; i++) {
+        for (int c = 0; c < 4; c++) {
+            uint32_t b = base[(size_t)i * stride + c];
+            if (b < mn[c]) mn[c] = b;
+            if (b > mx[c]) mx[c] = b;
+            sum[c] += b;
+        }
+        n++;
+    }
+    for (int c = 0; c < 4; c++) { out[c] = mn[c]; out[4 + c] = mx[c]; out[8 + c] = n ? sum[c] / n : 0; }
+    out[12] = n;
+}
+
 static int g_va_said;
+static struct { uint64_t s; int loc; } g_va_seen[64]; static int g_va_ns;
 static void va_alpha_said(int vi)
 {
-    if (g_va_said >= 10 || !g_arena_map) return;
+    if (g_va_said >= 40 || !g_arena_map) return;
     const shb_entry *ve = &g_shb_e[vi];
     for (int v = 0; v < ve->nvi; v++) {
         int loc = g_shb_vi[ve->vi_off + v].loc, cls = g_shb_vi[ve->vi_off + v].cls;
         if (loc < 0 || loc >= 16) continue;
+        // 按（程序句柄, 属性号）去重：原先一个平计数被开场那两个程序花光，字体那一对一条都没测到
+        uint64_t ser = S.prog ? S.prog->serial : 0ull;
+        int dup = 0;
+        for (int i = 0; i < g_va_ns; i++) if (g_va_seen[i].s == ser && g_va_seen[i].loc == loc) dup = 1;
+        if (dup) continue;
+        if (g_va_ns < (int)(sizeof g_va_seen / sizeof *g_va_seen)) {
+            g_va_seen[g_va_ns].s = ser; g_va_seen[g_va_ns].loc = loc; g_va_ns++;
+        }
         int f = (int)S.attr[loc].fmt;
         if (f < 0x01 || f > 0x30) continue;
         int nc = 1 + (f - 1) / 12, w = (f - 1) % 12;
@@ -5642,25 +6708,36 @@ static void va_alpha_said(int vi)
         if (!vtx_stream((int)pl.binding, &so)) continue;
         uint32_t stride = S.stream[pl.binding].stride;
         if (!stride) continue;
-        size_t lim = (size_t)ARENA_SZ - ARENA_GUARD - so - pl.off - 4;
+        // 窗口按「真搬进来的字节数」夹：arena 里这块之外是邻居流的顶点（或没写过的零），
+        // 拿整条 arena 当上限去扫 512 个顶点，扫出来的"全零"是 arena 的地板，不是这一笔的数据。
+        uint64_t blen = g_vtx[pl.binding].len;
+        if (!blen || blen < pl.off + 8) continue;
+        size_t lim = (size_t)(blen - pl.off - 4);
         const uint8_t *base = g_arena_map + so + pl.off;
-        uint32_t mn[4] = { 255u, 255u, 255u, 255u }, mx[4] = { 0, 0, 0, 0 }, sum[4] = { 0, 0, 0, 0 }, n = 0;
-        for (uint32_t i = 0; i < 512 && (size_t)i * stride <= lim; i++) {
-            for (int c = 0; c < 4; c++) {
-                uint32_t b = base[(size_t)i * stride + c];
-                if (b < mn[c]) mn[c] = b;
-                if (b > mx[c]) mx[c] = b;
-                sum[c] += b;
-            }
-            n++;
+        uint32_t av[13], gv[13];
+        va_span(base, stride, lim, av);
+        if (!av[12]) continue;
+        // 同一批顶点在客体内存里的那一份：搬进来近 0 而客体有值 ⇒ 搬运（去重命中旧副本 / 偏移错），
+        // 两份一样 ⇒ 客体写进来就是这些字节，去查客体自己那条路（GPU→CPU 回读，池失 26 万次那一条）。
+        // The same vertices as the guest holds them: near-zero here with content there means the transfer,
+        // identical means the game wrote those bytes and the read-back path becomes the next suspect.
+        const uint8_t *gbase = NULL;
+        uint64_t ga = S.vbuf[pl.binding].address, gl = S.vbuf[pl.binding].size;
+        void *gb = NULL; uint64_t gbo = 0;
+        size_t glim = 0;
+        if (ga && gl >= pl.off + 8 && mtl_addr(ga, 64, &gb, &gbo) && gb) {
+            gbase = (const uint8_t *)gb + gbo + pl.off;
+            glim = (size_t)(gl - pl.off - 4);
+            if (glim > lim) glim = lim;   // 两边扫同一个顶点数，否则比的是两块不同的窗口
         }
-        if (!n) continue;
+        va_span(gbase ? gbase : base, stride, gbase ? glim : 0, gv);
         g_va_said++;
-        GVL("[vk] 顶点色 序%{public}llu 入%{public}d 形%{public}d 类%{public}d 流%{public}u 距%{public}u 偏%{public}u 补%{public}llu｜%{public}u,%{public}u,%{public}u %{public}u,%{public}u,%{public}u %{public}u,%{public}u,%{public}u %{public}u,%{public}u,%{public}u 顶%{public}u",
-            (unsigned long long)(S.prog ? S.prog->serial : 0ull), loc, f, cls, pl.binding, stride, pl.off,
-            (unsigned long long)atomic_load(&g_vap_patch),
-            mn[0], mx[0], (unsigned)(sum[0] / n), mn[1], mx[1], (unsigned)(sum[1] / n),
-            mn[2], mx[2], (unsigned)(sum[2] / n), mn[3], mx[3], (unsigned)(sum[3] / n), n);
+        GVL("[vk] 顶点色 序%{public}llu 入%{public}d 形%{public}d 类%{public}d 流%{public}u 距%{public}u 偏%{public}u 窗%{public}llu 补%{public}llu 顶%{public}u/%{public}u｜搬%{public}u,%{public}u,%{public}u %{public}u,%{public}u,%{public}u %{public}u,%{public}u,%{public}u %{public}u,%{public}u,%{public}u｜客%{public}d %{public}u,%{public}u,%{public}u %{public}u,%{public}u,%{public}u %{public}u,%{public}u,%{public}u %{public}u,%{public}u,%{public}u",
+            (unsigned long long)ser, loc, f, cls, pl.binding, stride, pl.off,
+            (unsigned long long)blen, (unsigned long long)atomic_load(&g_vap_patch), av[12], gv[12],
+            av[0], av[4], av[8], av[1], av[5], av[9], av[2], av[6], av[10], av[3], av[7], av[11],
+            gbase ? 1 : 0,
+            gv[0], gv[4], gv[8], gv[1], gv[5], gv[9], gv[2], gv[6], gv[10], gv[3], gv[7], gv[11]);
     }
 }
 
@@ -5690,8 +6767,9 @@ static void do_draw(const p_draw *dw, const p_draw_idx *di)
         g_last_pipe = p;
         VkPipelineLayout pl2 = ply_get(vi, fi);
         g_last_pl = pl2;
-        emit_dyn(g_cb, att_min());   // 换管线就重发动态状态（管线不同则动态状态全部作废）| a new pipeline invalidates all dynamic state
+        g_dyn_dirty = 1;             // 换管线把全部动态状态打回未定义 | a new pipeline leaves all dynamic state undefined
     }
+    if (g_dyn_dirty) { emit_dyn(g_cb, att_min()); g_dyn_dirty = 0; atomic_fetch_add(&g_dyn_emit, 1); }
     if (!g_sets_valid || g_cur_vi != vi || g_cur_fi != fi || g_args_dirty[0] || g_args_dirty[1]) {
         if (!sets_rebuild(vi, fi)) { g_dr_nopipe++; return; }
     }
@@ -5710,7 +6788,8 @@ static void do_draw(const p_draw *dw, const p_draw_idx *di)
         }
         vkCmdBindVertexBuffers(g_cb, 0, 17, bufs, offs);
     }
-    if (g_att_src) { sp_draw_said(vi, fi, dw, di); bsp_tally(vi, fi);
+    if (g_att_src) { sp_draw_said(vi, fi, dw, di); sp_pair_said(vi, fi, dw, di); bsp_tally(vi, fi); pk_tally(vi, fi, (uint32_t)(dw ? dw->count : di->count));
+                    if (!(g_pk_tot % 20000)) pk_said();
                     if (S.color.blend_en & 1) va_alpha_said(vi); }   // 只查开了混合的那批：不透明的文字不是嫌疑人
     if (dw) {
         if (dw->count) vkCmdDraw(g_cb, (uint32_t)dw->count, 1, (uint32_t)dw->first, 0);
@@ -5730,6 +6809,11 @@ static void do_draw(const p_draw *dw, const p_draw_idx *di)
 
 static void draw_stats_line(char *line, int m, int cap)
 {
+    // 进来先夹一次：m 一旦越过 cap，(size_t)(cap - m) 会变成天文数字，snprintf 就顺着 line 往外写。
+    // 现在最长的一行约 1.1 KB、缓冲 4 KB，离满还远；这一道是给以后再加段留的保险。
+    // Clamp on entry: past cap, (size_t)(cap - m) becomes huge and snprintf writes beyond the buffer.
+    // The longest line today is ~1.1 KB against a 4 KB buffer, so this is insurance for the next segments.
+    if (m < 0 || m > cap - 160) { if (m >= 0 && m < cap) snprintf(line + m, (size_t)(cap - m), "…段满"); return; }
     m += snprintf(line + m, (size_t)(cap - m), " 绘:重放%llu 无库%llu 跳过%llu 无管线%llu 超额%llu 无通道%llu 多采样%llu 负视口%llu",
                   (unsigned long long)atomic_load(&g_dr_replay), (unsigned long long)atomic_load(&g_dr_nolib),
                   (unsigned long long)atomic_load(&g_dr_bad), (unsigned long long)atomic_load(&g_dr_nopipe),
@@ -5741,15 +6825,43 @@ static void draw_stats_line(char *line, int m, int cap)
         for (int i = 0; i < g_nolib_kn; i++)
             m += snprintf(line + m, (size_t)(cap - m), "%s%s", i ? " / " : "", g_nolib_key[i]);
     }
-    m += snprintf(line + m, (size_t)(cap - m), "｜arena:新%llu 复用%llu 越池%llu 满%llu 集尽%llu 管线%llu/%llu",
+    m += snprintf(line + m, (size_t)(cap - m), "｜arena:新%llu 复用%llu 脏%llu 臂%llu 越池%llu 满%llu 集尽%llu 管线%llu/%llu",
                   (unsigned long long)atomic_load(&g_adup_new), (unsigned long long)atomic_load(&g_adup_hit),
+                  (unsigned long long)atomic_load(&g_adup_dirty), (unsigned long long)atomic_load(&g_arena_arm),
                   (unsigned long long)atomic_load(&g_adup_bad), (unsigned long long)atomic_load(&g_arena_full),
                   (unsigned long long)atomic_load(&g_set_oom),
                   (unsigned long long)atomic_load(&g_pipe_new), (unsigned long long)atomic_load(&g_pipe_hit));
+    // 顶点流搬运的三条账：新搬 / 复用（同一提交里又绑到同一块）/ 复用那份和客体原字节已经不一样 = 陈旧。
+    // 陈旧>0 直接判死「去重把改写过的顶点当成了同一块」，文字与忽闪就从着色器侧挪到搬运侧。
+    // Vertex-stream accounting: fresh / reused inside a submission / reused-but-differs-from-guest == stale.
+    // A non-zero stale count convicts the dedup and moves the missing-text symptom to the transfer side.
+    m += snprintf(line + m, (size_t)(cap - m), "｜顶点:新%llu 复用%llu 脏%llu 陈旧%llu%s",
+                  (unsigned long long)atomic_load(&g_vtx_new), (unsigned long long)atomic_load(&g_vtx_hit),
+                  (unsigned long long)atomic_load(&g_vtx_dirty),
+                  (unsigned long long)atomic_load(&g_vtx_stale), g_arena_nodup ? "（去重关）" : "");
+    // 这一轮新加的两条判据的账：缩绑真发生过几次（属性/流）+ 动态状态真重发了几次。
+    // 缩绑=0 说明 #51 那两处虽然该修但没在这条路径上开火；缩绑>0 而画面变好，就是它。
+    // The tally for this round's two new gates: how often a shrinking rebind actually happened (attrib / stream) and how
+    // often dynamic state was re-emitted. 缩绑=0 convicts nothing on that path; 缩绑>0 with a better picture is the proof.
+    m += snprintf(line + m, (size_t)(cap - m), "｜缩绑:属%llu 流%llu 动发%llu",
+                  (unsigned long long)atomic_load(&g_vshrink_a), (unsigned long long)atomic_load(&g_vshrink_s),
+                  (unsigned long long)atomic_load(&g_dyn_emit));
+    // 半段继承的整轮账：补了半边的次数 / 那半根本没人绑过的次数。前者不为 0 就说明「无库0」不等于配对都对。
+    m += snprintf(line + m, (size_t)(cap - m), "｜继承%llu 无伴%llu",
+                  (unsigned long long)atomic_load(&g_inherit), (unsigned long long)atomic_load(&g_inherit_null));
     m += snprintf(line + m, (size_t)(cap - m), "｜上传:成%llu 软解%llu 无池%llu 通道内%llu 压缩%llu 无图%llu",
                   (unsigned long long)atomic_load(&g_b2t_ok), (unsigned long long)atomic_load(&g_b2t_soft),
                   (unsigned long long)atomic_load(&g_b2t_noaddr), (unsigned long long)atomic_load(&g_b2t_inpass),
                   (unsigned long long)atomic_load(&g_b2t_comp), (unsigned long long)atomic_load(&g_b2t_dst));
+    // B 路取参数：设备自转了几张、多少块、编码累计多少毫秒。跟离线烘的耗时与包体一起比，才知道该走哪条。
+    // Round B's numbers: textures and blocks transcoded on the device, and the cumulative encode time in ms.
+    if (g_rt_astc > 0.0f) {
+        uint64_t rt_t = 0, rt_b = 0, rt_ms = 0, rt_f = 0;
+        rt_astc_stat(&rt_t, &rt_b, &rt_ms, &rt_f);
+        m += snprintf(line + m, (size_t)(cap - m), "｜自转:档%.0f 张%llu 块%llu 编码%llu ms 败%llu B2T%llu",
+                      (double)g_rt_astc, (unsigned long long)rt_t, (unsigned long long)rt_b,
+                      (unsigned long long)rt_ms, (unsigned long long)rt_f, (unsigned long long)atomic_load(&g_b2t_rt));
+    }
     // 无通道那一半的原因：附件没解出 / 没有命令缓冲 / 渲染通道或帧缓冲建不出来
     // The 无通道 half: attachments did not resolve / no command buffer / render pass or framebuffer creation failed
     m += snprintf(line + m, (size_t)(cap - m), "｜通道:无附件%llu 无cb%llu 无rp%llu 无fb%llu 已开%llu",
@@ -5772,6 +6884,23 @@ static void draw_stats_line(char *line, int m, int cap)
                   (unsigned long long)atomic_load(&g_bind_none), (unsigned long long)atomic_load(&g_bind_buf),
                   (unsigned long long)atomic_load(&g_bind_lay), (unsigned long long)atomic_load(&g_tex_reg),
                   (unsigned long long)atomic_load(&g_tex_rereg));
+    // 常量段取证（DM_CBUF）：三条整轮的账，不依赖去重表有没有打满
+    // Constant-segment forensics: three whole-round tallies, independent of whether the dedup table filled up.
+    m += snprintf(line + m, (size_t)(cap - m), "｜流写:更新%llu 拷%llu 解址败%llu 作废%llu",
+                  (unsigned long long)atomic_load(&g_upd_ub), (unsigned long long)atomic_load(&g_b2b),
+                  (unsigned long long)atomic_load(&g_wrfail), (unsigned long long)atomic_load(&g_wr_void));
+    // 读回六路（客体→CPU 方向）走不走，一次定性；全零照样打出来，那是结案不是漏测。
+    // Whether the guest uses any of the six read-back paths, settled in one round. A zero row is printed too - that is a
+    // verdict, not a missing measurement.
+    {
+        char rb[128];
+        int rn = nvn_rb_stat(rb, sizeof rb);
+        if (rn > 0 && cap - m > rn) { memcpy(line + m, rb, (size_t)rn); m += rn; }
+    }
+    if (atomic_load(&g_cbuf_stale) || atomic_load(&g_cbuf_trunc) || atomic_load(&g_cbuf_zero) || atomic_load(&g_cbuf_nobind))
+        m += snprintf(line + m, (size_t)(cap - m), "｜常量:陈旧%llu 截断%llu 全零%llu 空槽%llu 组%d",
+                      (unsigned long long)atomic_load(&g_cbuf_stale), (unsigned long long)atomic_load(&g_cbuf_trunc),
+                      (unsigned long long)atomic_load(&g_cbuf_zero), (unsigned long long)atomic_load(&g_cbuf_nobind), g_cbuf_ns);
     // 打包上传（M2-3f）：搬了几张、多少字节、各自卡在哪一环 | the packaged upload path: how many moved, how many bytes, and where each refusal came from
     m = pkg_stat_line(line, cap, m);   // 标签与计数器在 g_pkg_stat 里成对写死，位置不可能错位
     // 按内容比对判脏：这条是「视频冻在头几帧、屏幕每四拍闪一下」那一类的主判据（缺页那条在本机不响）
@@ -5780,6 +6909,14 @@ static void draw_stats_line(char *line, int m, int cap)
     m += snprintf(line + m, (size_t)(cap - m), "｜池判脏:变%llu 排%llu 顶%llu 没变%llu",
                   (unsigned long long)atomic_load(&g_pw_chg), (unsigned long long)atomic_load(&g_pw_que),
                   (unsigned long long)atomic_load(&g_pw_cap), (unsigned long long)atomic_load(&g_pw_same));
+    // 清屏掩码账（AN）：模板真清了几笔 / 要清但附件没模板面 / 两掩码全 0（退回旧的只清深度，>0 就说明掩码判读得重看）
+    // 色掩 或/与 只记账不改行为：或=1 与=1 ⇒ 客体传的是布尔；或=15 与=15 ⇒ 是 RGBA 位掩码。
+    // Clear-mask ledger: stencil clears actually issued, ones refused for want of a stencil aspect, and the no-op ones.
+    // The colour-mask OR/AND is measurement only - 1/1 means the guest passes a bool, 15/15 means an RGBA bit mask.
+    m += snprintf(line + m, (size_t)(cap - m), "｜清屏:模板%llu 无面%llu 全跳%llu 色掩或%llu与%llu 色零%llu",
+                  (unsigned long long)atomic_load(&g_dsc_s), (unsigned long long)atomic_load(&g_dsc_nost),
+                  (unsigned long long)atomic_load(&g_dsc_none), (unsigned long long)atomic_load(&g_cc_mask_or),
+                  (unsigned long long)atomic_load(&g_cc_mask_and), (unsigned long long)atomic_load(&g_cc_nomask));
 }
 
 // 每次只打新增的那几条，避免每 300 个 present 把同一串清单重复刷进日志
@@ -5821,7 +6958,7 @@ void mtl_exec(const uint8_t *handle)
         case OP_SET_RT: if (!(g_skip & 1)) do_set_rt((const p_set_rt *)body); break;   // 位 1 = 游戏侧一个通道都不开：出图的锅和游戏的锅就此分开
         case OP_CLEAR_COLOR: if (!(g_skip & 2)) do_clear_color((const p_clear_color *)body); break;
         case OP_CLEAR_DS: if (!(g_skip & 2)) do_clear_ds((const p_clear_ds *)body); break;
-        case OP_BEGIN: g_cur_prog = NULL; g_bind_vi = g_bind_fi = -1; break;   // 一条新录制从「没有程序」开始，与 NVN 的命令缓冲状态一致 | a fresh recording starts with no program bound, like NVN's command buffer state
+        case OP_BEGIN: g_cur_prog = NULL; g_bind_vi = g_bind_fi = -1; g_bind_vk[0] = g_bind_fk[0] = 0; break;   // 一条新录制从「没有程序」开始，与 NVN 的命令缓冲状态一致 | a fresh recording starts with no program bound, like NVN's command buffer state
         case OP_BIND_PROGRAM: do_bind_program((const p_bind_program *)body); state_op(h.op, body); break;
         case OP_DRAW: {
             const p_draw *d = (const p_draw *)body;
@@ -5836,7 +6973,38 @@ void mtl_exec(const uint8_t *handle)
             do_draw(NULL, d);
             break; }
         case OP_COPY_B2T: atomic_fetch_add(&g_copies, 1); do_copy_b2t((const p_copy_b2t *)body); break;
-        case OP_COPY_B2B: case OP_UPDATE_UB: case OP_COPY_T2B: case OP_COPY_T2T:
+        case OP_COPY_B2B: {   // 客体真的在用（main 的名字表里有 nvnCommandBufferCopyBufferToBuffer）：源、目标都是客体地址
+            uint64_t s, d, n; memcpy(&s, body, 8); memcpy(&d, (const uint8_t *)body + 8, 8); memcpy(&n, (const uint8_t *)body + 16, 8);
+            atomic_fetch_add(&g_b2b, 1);
+            void *sb, *db; uint64_t so = 0, doff = 0;
+            int ok = n && mtl_addr(s, n, &sb, &so) && mtl_addr(d, n, &db, &doff);
+            if (atomic_load(&g_b2b) <= 3)
+                GVL("[vk] 流内拷贝#%{public}llu 源%{public}llx 址%{public}llx 长%{public}llu 解址%{public}d",
+                    (unsigned long long)atomic_load(&g_b2b), (unsigned long long)s, (unsigned long long)d,
+                    (unsigned long long)n, ok);
+            if (!ok) { atomic_fetch_add(&g_wrfail, 1); break; }
+            dm_guest_write_prepare((uint8_t *)db + doff, (size_t)n);   // 目标池页可能正被写保护（脏页跟踪），内核式直写会 SIGSEGV / EFAULT
+            memmove((uint8_t *)db + doff, (uint8_t *)sb + so, (size_t)n);
+            wr_invalidate(d, n);
+            break; }
+        case OP_UPDATE_UB: {   // 数据跟着命令走（录制时已拷进命令内存），回放时写回客体缓冲
+            uint64_t d, n; memcpy(&d, body, 8); memcpy(&n, (const uint8_t *)body + 8, 8);
+            atomic_fetch_add(&g_upd_ub, 1);
+            void *db; uint64_t doff = 0;
+            int ok = n && mtl_addr(d, n, &db, &doff);
+            if (atomic_load(&g_upd_ub) <= 3) {
+                float v[4] = {0, 0, 0, 0};
+                if (n >= 16) memcpy(v, (const uint8_t *)body + 16, 16);
+                GVL("[vk] 常量更新#%{public}llu 址%{public}llx 长%{public}llu 解址%{public}d 前四数 %f %f %f %f",
+                    (unsigned long long)atomic_load(&g_upd_ub), (unsigned long long)d, (unsigned long long)n, ok,
+                    v[0], v[1], v[2], v[3]);
+            }
+            if (!ok) { atomic_fetch_add(&g_wrfail, 1); break; }
+            dm_guest_write_prepare((uint8_t *)db + doff, (size_t)n);
+            memcpy((uint8_t *)db + doff, (const uint8_t *)body + 16, (size_t)n);
+            wr_invalidate(d, n);
+            break; }
+        case OP_COPY_T2B: case OP_COPY_T2T:
         case OP_CLEAR_TEX: case OP_BIND_STATE: case OP_BIND_VATTR: case OP_BIND_VSTREAM:
         case OP_BIND_VBUF: case OP_BIND_UBO: case OP_BIND_SSBO: case OP_BIND_TEX: case OP_BIND_SAMP:
         case OP_BIND_IMG: case OP_VIEWPORTS: case OP_SCISSOR: case OP_DEPTH_RANGE: case OP_STENCIL:
@@ -5969,7 +7137,7 @@ static int vk_ensure(void)
     if (!dm_ohos_window(&win, &w, &h)) return 0;
     g_tried = 1;
     { const char *s = getenv("DM_VK_SKIP"); g_skip = s ? (int)strtol(s, NULL, 0) : 0;
-      GVL("[vk] DM_VK_SKIP = %{public}d（1 无通道 2 无清除 4 无深度 8 不出图 16 不搬像素 32 不呈现 64 呈现不用信号量 128 出图前排空队列 256 游戏提交不上 GPU 512 出图写离屏 1024 不画三角形 2048 不重放游戏绘制 4096 颜色回附件态 8192 深度回附件态且不绑真深度 16384 颜色一律用哑图 32768 关掉按需建图 65536 关掉「按池偏移认图+释放进回收站」 131072 按需建图上限抬到 12000 262144 不剔背面 524288 不测深度 1048576 绕序回退成 Metal 那份 8388608 不翻视口 4194304 不搬打包贴图 16777216 采样一律 0 级（禁 mip） 33554432 哑图退回彩色渐变（不设=纯黑） 67108864 打包贴图只传一次 134217728 顶点 RGBA8 的 A 顶成 0xFF 268435456 混合源因子一律顶成 ONE 536870912 关掉「新生命补一次打包重传」1073741824 出图钉死采第一张源图）", g_skip); }   // 逐类关掉的定位开关 | per-class isolation knob
+      GVL("[vk] DM_VK_SKIP = %{public}d（1 无通道 2 无清除 4 无深度 8 不出图 16 不搬像素 32 不呈现 64 呈现不用信号量 128 出图前排空队列 256 游戏提交不上 GPU 512 出图写离屏 1024 不画三角形 2048 不重放游戏绘制 4096 颜色回附件态 8192 深度回附件态且不绑真深度 16384 颜色一律用哑图 32768 关掉按需建图 65536 关掉「按池偏移认图+释放进回收站」 131072 按需建图上限抬到 12000 262144 不剔背面 524288 不测深度 1048576 绕序回退成 Metal 那份 8388608 不翻视口 4194304 不搬打包贴图 16777216 采样一律 0 级（禁 mip） 33554432 哑图退回彩色渐变（不设=纯黑） 67108864 打包贴图只传一次 134217728 顶点 RGBA8 的 A 顶成 0xFF 268435456 混合源因子一律顶成 ONE 536870912 关掉「新生命补一次打包重传」1073741824 出图钉死采第一张源图 2097152 不测模板）", g_skip); }   // 逐类关掉的定位开关 | per-class isolation knob
     { const char *s = getenv("DM_FLK"); g_flk_left = s ? (int)strtol(s, NULL, 0) : 0;   // 闪屏探针：逐拍出图整帧读回，打 16x9 亮度网格与周期 | per-present full-frame readback
       const char *t = getenv("DM_RAW"); g_raw_left = t ? (int)strtol(t, NULL, 0) : 0;   // 帧落盘：每 500 拍一轮连拍 4 帧，整帧写裸 RGBA8 文件 | ship n frames to files
       if (g_flk_left || g_raw_left) { g_raw_gap = 300; GVL("[vk] DM_FLK = %{public}d DM_RAW = %{public}d（出图整帧读回；每次内容变化连拍 2 帧、至少隔 150 拍，整帧写文件）", g_flk_left, g_raw_left); } }

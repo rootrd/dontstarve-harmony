@@ -35,12 +35,17 @@ FITS(dpool_t, NVNtexturePool); FITS(dpool_t, NVNsamplerPool);
 typedef struct {
     NVNdevice *dev; nvn_texdesc d; pool_t *pool; int64_t off;
     uint8_t has_layout, layout[8];
+    uint8_t swz[4], swz_set;      // 通道改写 R,G,B,A（NVN 枚举：ZERO=0 ONE=1 R=2 G=3 B=4 A=5，默认恒等 2,3,4,5）；swz_set 只在宿主自己的 SetSwizzle 里置 1，
+                                  // 用来区分「客体没走 SetDefaults、这几个字节还是它自己的未初始化内存」 | channel swizzle (NVN enum ZERO=0 ONE=1 R=2 G=3 B=4 A=5; identity = 2,3,4,5). swz_set is set only by our SetSwizzle, so uninitialized builder bytes are never read as a swizzle.
+    uint8_t ds_mode;              // 深度/模板读模式（DEPTH=0 / STENCIL=1）| depth-stencil read mode (depth / stencil)
 } tex_builder_t;                                                                             FITS(tex_builder_t, NVNtextureBuilder);
 typedef struct {
     uint32_t magic; nvn_texdesc d; nvn_texlayout L; uint8_t *mem; pool_t *pool; int64_t off; uint8_t has_layout, layout[8];
+    uint8_t swz[4], swz_set, ds_mode;   // 见 tex_builder_t 同名项 | see the same-named fields in tex_builder_t
     uint64_t serial;                     // 初始化序号：回放层按它在宿主表里找 MTLTexture（游戏可能按值拷贝对象，不能存对象指针） | Initialization serial: the replay layer uses it to find the MTLTexture in the host table (the game may copy the object by value, so object pointers cannot be stored)
 } tex_t;                                                                                     FITS(tex_t, NVNtexture);
-typedef struct { uint8_t set_levels, set_layers, set_format, set_target; int32_t base_level, nlevels, min_layer, nlayers, format, target; } view_t;
+typedef struct { uint8_t set_levels, set_layers, set_format, set_target; int32_t base_level, nlevels, min_layer, nlayers, format, target;
+                 uint8_t swz[4], swz_set, ds_mode, ds_set; } view_t;
 FITS(view_t, NVNtextureView);
 
 // 采样器参数（builder 与对象共用一份）
@@ -67,7 +72,7 @@ FITS(win_t, NVNwindow);
 typedef struct {
     uint32_t magic, recording;
     uint8_t *cur, *end;                  // 当前命令内存段的写指针 / 段尾 | Write pointer / end of the current command memory segment
-    uint8_t *begin;                      // 本次录制的 BEGIN 记录 | BEGIN record of this recording
+    uint8_t *begin, *seg0;               // 本次录制的 BEGIN 记录 / 本段段首（设备自带缓冲从段首起收口执行）| BEGIN record of this recording / start of the current segment (the device's own buffer is executed from there)
     PFNNVNCOMMANDBUFFERMEMORYCALLBACKPROC cb; void *cb_data;
     NVNdevice *dev;
 } cmd_t;                                                                                     FITS(cmd_t, NVNcommandBuffer);
@@ -180,3 +185,7 @@ void mtl_prog_release(prog_t *p);
 // 新序号（> 0，全局递增）
 // New serial (> 0, globally increasing)
 uint64_t nvn_new_serial(void);
+// 读回类入口（池/缓冲 Flush+Invalidate、纹理 Invalidate/ReadTexels）的整轮计数，写成一段可拼进周期行的文本。
+// Read-back class entries (pool/buffer Flush + Invalidate, texture Invalidate/ReadTexels) tallied for the whole round,
+// rendered as a fragment the periodic stats line can append. Always writes something: an all-zero row is a verdict.
+int nvn_rb_stat(char *out, size_t cap);

@@ -33,6 +33,13 @@ miss.txt
 *.cer
 *.keystore
 
+# Cross-compiled third-party statics — build products, see third_party/astcenc/README.md
+third_party/astcenc/ohos/
+
+# Scratch backups made before a risky rewrite
+*.bak
+*.orig
+
 # Editor / OS
 .DS_Store
 __pycache__/

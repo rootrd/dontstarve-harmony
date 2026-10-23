@@ -34,6 +34,7 @@ void mtl_sub_copy(uint64_t src, uint64_t dst, uint64_t n);               // GPU 
 void mtl_sub_event(volatile uint32_t *val, uint32_t mode, uint32_t v);   // 完成后写事件值（0 写 / 1 加） | Write the event value after completion (0 write / 1 add)
 void mtl_sub_counter(uint64_t addr, uint32_t type);                       // 完成后写计数器记录 | Write the counter record after completion
 uint64_t mtl_sub_commit(void);
+int mtl_sub_idle(void);   // 当前没有开着的提交（设备自带命令缓冲要自己开一趟前先问）| No submission is currently open; asked before the device-owned buffer opens its own
 
 uint64_t mtl_last_fence(void);                       // 最近一次提交的栅栏值（0 = 从未提交） | Fence value of the most recent submit (0 = never submitted)
 int mtl_wait(uint64_t fence, uint64_t timeout_ns);   // GPU 完成到 fence 返回 1，超时 0 | Returns 1 when the GPU has completed up to fence, 0 on timeout

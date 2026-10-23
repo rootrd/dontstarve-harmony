@@ -374,7 +374,17 @@ void (*dm_pad_hook)(uint64_t, uint64_t *, int32_t *, int32_t *, int32_t *, int32
 // The drivers hung off the controller-poll point (dm_actions / dm_world / dm_textinput / dm_update / UI mouse / front end)
 // jump into guest code using this title's hardcoded offsets; on another guest (e.g. Don't Starve) the same offset lands mid
 // function and the first instruction dereferences → SIGSEGV. Pass DM_TITLE_DRV=0 when porting a new title.
-static int dm_title_drv(void) { static int v = -1; if (v < 0) { const char *e = getenv("DM_TITLE_DRV"); v = !e || strcmp(e, "0"); } return v; }
+// 每次现读、不缓存首值：壳把 aa start --ps 的参数注入进程环境可能晚于库构造函数（DM_THRDUMP 栽过同一件事），
+// 缓存的话第一条 fill() 抢在注入前跑，就会把 DM_TITLE_DRV=0 永久读成 1（HSS v18 实测：崩在 dm_world_pump+0x1e0 → main+0x45f9ec）。
+// Read every call, never cache the first value: the shell may inject the aa start --ps parameters into the process environment after the library
+// constructors run (DM_THRDUMP hit the same thing), so a cached first read turns DM_TITLE_DRV=0 permanently into 1 if one fill() lands before the
+// injection (measured in HSS v18: crash at dm_world_pump+0x1e0 → main+0x45f9ec).
+static int dm_title_drv(void) {
+    const char *e = getenv("DM_TITLE_DRV");
+    int on = !e || strcmp(e, "0");
+    static int said; if (!on && !said) { said = 1; LOG("DM_TITLE_DRV=%s：暗黑的写死偏移驱动整块挂起（本作不跑它们）", e); }
+    return on;
+}
 static void fill(NpadState *s, uint32_t id, uint32_t style) {
     pthread_once(&g_receipt_once, receipt_init);
     if (dm_title_drv()) {
@@ -470,6 +480,90 @@ HLE_FORCE("_ZN2nn3hid25GetVibrationDeviceHandlesEPNS0_21VibrationDeviceHandleEiR
           "震动设备；宿主 0 个", int, h_hid_GetVibHandles, void *out, int max, const uint32_t *id, uint32_t style) { (void)out; (void)max; (void)id; (void)style; return 0; }
 HLE_FORCE("_ZN2nn3hid25InitializeVibrationDeviceERKNS0_21VibrationDeviceHandleE", "震动；宿主不支持", void, h_hid_InitVib, const void *h) { (void)h; }
 HLE_FORCE("_ZN2nn3hid18SendVibrationValueERKNS0_21VibrationDeviceHandleERKNS0_14VibrationValueE", "震动；宿主不支持", void, h_hid_SendVib, const void *h, const void *v) { (void)h; (void)v; }
+HLE_FORCE("_ZN2nn3hid22GetVibrationDeviceInfoEPNS0_19VibrationDeviceInfoERKNS0_21VibrationDeviceHandleE", "震动设备信息；宿主没有设备（类型 0 = 无效）", Result, h_hid_VibInfo, void *out, const void *h) {
+    (void)h; memset(out, 0, 8); return RES_OK;   // VibrationDeviceInfo = { 类型, 属性 } 两个 uint32 | two uint32s: type and attribute
+}
+
+// 多份取手柄（Unity 的输入层按数组取，饥荒用的是上面那份单点的）：第 0 份照样式给，其余按「这个玩家没接」全 0。
+// 其余份走 fill 的全 0 分支，不再第二次吃按键锁存（一次按下只给一次）。
+// 返回值是「填了几份」，必须给：客体拿它当循环上界。v16 实测 Unity 输入线程 main+0x6211a4 调进来后
+// `cmp w0,#1 / b.lt`，再按 `w0+1` 从 sp+0x10 起以 0x28 步长扫这份数组——我们原先声明成 void，x0 里留下的是
+// 调用现场的栈地址（实测 x0=0x6a2228fd48），截成 32 位就成了 0x2228fd48 份，扫到 [x22,x9] 越界，
+// addr=0x6f78908f48 崩在主线程。真机 hid 只有一副手柄接到，回 1。
+// Multi-entry controller read (Unity's input layer reads an array; Don't Starve used the single-state overload above):
+// entry 0 gets this style's state, the rest take fill's "this player is not connected" all-zero branch, so one press is latched only once.
+// The return value is "how many entries were filled" and it is load-bearing: measured in v16 the guest called this at
+// main+0x6211a4, then did `cmp w0,#1 / b.lt` and walked the array at sp+0x10 with a 0x28 stride for w0+1 entries. Declaring
+// this void left the caller's stack address in x0 (measured x0=0x6a2228fd48), which truncated to a 0x2228fd48-entry count and
+// read out of bounds at addr=0x6f78908f48, crashing the main thread. Real hardware has one controller attached: return 1.
+static int npad_states(NpadState *s, int n, const uint32_t *id, uint32_t style) {
+    if (n < 1) return 0;
+    if (n > 8) n = 8;
+    fill(s, *id, style);
+    for (int i = 1; i < n; i++) fill(s + i, *id, 0);
+    return 1;
+}
+HLE_FORCE("_ZN2nn3hid13GetNpadStatesEPNS0_16NpadFullKeyStateEiRKj", "全键手柄状态多份；第 0 份取 dm_input，回份数", int, h_hid_StatesFull, NpadState *s, int n, const uint32_t *id) { return npad_states(s, n, id, STYLE_FULLKEY); }
+HLE_FORCE("_ZN2nn3hid13GetNpadStatesEPNS0_17NpadHandheldStateEiRKj", "掌机手柄状态多份；第 0 份取 dm_input，回份数", int, h_hid_StatesHandheld, NpadState *s, int n, const uint32_t *id) { return npad_states(s, n, id, STYLE_HANDHELD); }
+HLE_FORCE("_ZN2nn3hid13GetNpadStatesEPNS0_16NpadJoyDualStateEiRKj", "Joy-Con 双持状态多份；宿主不分离，回份数", int, h_hid_StatesJoyDual, NpadState *s, int n, const uint32_t *id) { return npad_states(s, n, id, 4u); }
+HLE_FORCE("_ZN2nn3hid13GetNpadStatesEPNS0_17NpadJoyLeftStateEiRKj", "Joy-Con 左半状态多份；宿主不分离，回份数", int, h_hid_StatesJoyLeft, NpadState *s, int n, const uint32_t *id) { return npad_states(s, n, id, 8u); }
+HLE_FORCE("_ZN2nn3hid13GetNpadStatesEPNS0_17NpadJoyRightStateEiRKj", "Joy-Con 右半状态多份；宿主不分离，回份数", int, h_hid_StatesJoyRight, NpadState *s, int n, const uint32_t *id) { return npad_states(s, n, id, 16u); }
+HLE_FORCE("_ZN2nn3hid18GetNpadJoyHoldTypeEv", "Joy-Con 持握方向查询；宿主不分离，回水平（0）", int, h_hid_GetJoyHold, void) { return 0; }
+HLE_FORCE("_ZN2nn3hid22GetNpadControllerColorEPNS0_19NpadControllerColorERKj", "手柄配色查询；宿主没有真手柄配色，给全 0", Result, h_hid_Color1, uint32_t *out, const uint32_t *id) {
+    (void)id; *out = 0; return RES_OK;
+}
+HLE_FORCE("_ZN2nn3hid22GetNpadControllerColorEPNS0_19NpadControllerColorES2_RKj", "手柄配色查询（机身 + 按键两份）；给全 0", Result, h_hid_Color2, uint32_t *body, uint32_t *btn, const uint32_t *id) {
+    (void)id; *body = 0; *btn = 0; return RES_OK;
+}
+// 手柄支持小程序（选手柄 / 换握法的系统页）：宿主没有这个页面。回成功 = 游戏当「用户已选完」继续，不会卡在等待上。
+// Controller-support applet (the system page for picking a controller / changing grip): the host has no such page.
+// Returning success means the game continues as if the user had finished selecting, instead of waiting on a page that never appears.
+HLE_FORCE("_ZN2nn3hid20ControllerSupportArg10SetDefaultEv", "手柄支持小程序参数的默认值；宿主不开该页，空操作", void, h_hid_CSADefault, void *self) { (void)self; }
+HLE_FORCE("_ZN2nn3hid21ShowControllerSupportERKNS0_20ControllerSupportArgE", "手柄支持小程序；宿主没有该系统页", Result, h_hid_ShowCS, const void *arg) {
+    static int logged; if (!logged) { logged = 1; LOG("hid::ShowControllerSupport → 宿主没有该系统页，直接回成功"); }
+    (void)arg; return RES_OK;
+}
+// 手柄样式变更事件：宿主样式恒定（跟 DM_OPMODE），不会变。绑上客体造好的内核事件让它等得到，但从不触发；
+// 自动清除时补发一次，使客体的「首次等待」立刻返回（不然它以为还没同步过，一直等在事件上）。
+// Style-change event: the host's style is fixed (it follows DM_OPMODE) and never changes. Bind the kernel event the guest created so a
+// wait on it resolves, but never signal it; with automatic clear it is fired once so the guest's first wait returns immediately.
+HLE_FORCE("_ZN2nn3hid27BindNpadStyleSetUpdateEventERKjPNS_2os15SystemEventTypeENS3_14EventClearModeE", "手柄样式变更事件；宿主样式恒定，绑好不触发", Result, h_hid_BindStyle, const uint32_t *id, void *ev, int mode) {
+    (void)id;
+    if (!ev) return RES_FAIL;
+    hle_bind_system_event(ev, mode == 0);              // EventClearMode：0 = 自动清除 | 0 = automatic clear
+    if (mode == 0) hle_signal_system_event(ev);
+    LOG("hid::BindNpadStyleSetUpdateEvent %p（清除模式 %d）→ 绑内核事件，宿主不触发", ev, mode);
+    return RES_OK;
+}
+
+// 六轴（陀螺仪 / 加速度计）：真机经 hid 服务建会话取句柄；宿主还没接鸿蒙传感器（那是单独一轮的活，接 OHSensor 的陀螺回调）。
+// v13 实测中止点：Unity 的输入初始化走到 hid::StartSixAxisSensor，句柄是假 sm 会话给的垃圾值，SDK 客户端判错 →
+//   pc=sdk+0x49e1cc〈_ZN2nn3hid18StartSixAxisSensorERKNS0_19SixAxisSensorHandleE+0x2c〉→ VAbortImpl，Result=0x1a80a，调用者 main+0x13c1218。
+// 接法：句柄给 0 个（游戏因此不该启动六轴），Start/Stop 回成功，状态给全 0（=「没有数据」）。
+// Six-axis (gyro / accelerometer): a real device creates a session over the hid service and takes handles; the host has not wired HarmonyOS
+// sensors yet (a separate round: the OHSensor gyro callback). Measured abort in v13: Unity's input init reached hid::StartSixAxisSensor with a
+// handle handed out by the fake sm session, the SDK client saw the error and aborted. Takeover: 0 handles, Start/Stop succeed, state all zero.
+typedef struct { uint64_t v[2]; } SixAxisHandle;   // nn::hid::SixAxisSensorHandle：宿主只当不透明令牌 | treated as an opaque token by the host
+HLE_FORCE("_ZN2nn3hid23GetSixAxisSensorHandlesEPNS0_19SixAxisSensorHandleEiRKjNS_4util10BitFlagSetILi32ENS0_12NpadStyleTagEEE", "六轴设备句柄；宿主不接传感器，给 0 个", int, h_hid_6Handles, SixAxisHandle *out, int max, const uint32_t *id, uint32_t style) {
+    (void)id; (void)style;
+    static int logged; if (!logged) { logged = 1; LOG("hid::GetSixAxisSensorHandles → 0 个（宿主还没接陀螺仪）"); }
+    if (out && max > 0) memset(out, 0, (size_t)(max > 8 ? 8 : max) * sizeof *out);   // 清掉调用者栈上的旧垃圾，免得它拿脏值当句柄用 | clear the caller's stale stack garbage so it cannot use a dirty value as a handle
+    return 0;
+}
+HLE_FORCE("_ZN2nn3hid18StartSixAxisSensorERKNS0_19SixAxisSensorHandleE", "启动六轴；宿主不接传感器（v13 在此 AbortImpl）", Result, h_hid_Start6, const SixAxisHandle *h) { (void)h; return RES_OK; }
+HLE_FORCE("_ZN2nn3hid17StopSixAxisSensorERKNS0_19SixAxisSensorHandleE", "停止六轴；宿主不接传感器", Result, h_hid_Stop6, const SixAxisHandle *h) { (void)h; return RES_OK; }
+// SixAxisSensorState 各 SDK 版本字段数不同（0x48 ~ 0x50）：只清前 0x40 字节，覆盖时间戳、姿态角与三路向量，宁少不多——写过头会踩到调用者栈上的邻居。
+// SixAxisSensorState differs per SDK version (0x48 ~ 0x50): only the first 0x40 bytes are cleared, covering timeStamp, angle and the three vectors.
+// Under rather than over: writing past the object would step on the caller's stack neighbours.
+HLE_FORCE("_ZN2nn3hid21GetSixAxisSensorStateEPNS0_18SixAxisSensorStateERKNS0_19SixAxisSensorHandleE", "六轴状态一份；宿主给全 0", Result, h_hid_Get6, void *st, const SixAxisHandle *h) {
+    (void)h; memset(st, 0, 0x40); return RES_OK;
+}
+HLE_FORCE("_ZN2nn3hid22GetSixAxisSensorStatesEPNS0_18SixAxisSensorStateEiRKNS0_19SixAxisSensorHandleE", "六轴状态多份；宿主给全 0", Result, h_hid_Get6s, void *st, int n, const SixAxisHandle *h) {
+    (void)h;
+    if (n < 0 || n > 8) n = 0;                                     // 份数离谱当作没给 | an absurd count is treated as none
+    for (int i = 0; i < n; i++) memset((char *)st + 0x50 * i, 0, 0x40);   // 步长取各版本最大者 0x50，保证写不进相邻对象内部 | stride = the largest documented size so a write never lands inside the neighbouring object
+    return RES_OK;
+}
 
 // 触屏：nn::hid::TouchScreenState<16> = { int64 sampling; int32 count; int32 _r; TouchState touches[16]（各 0x28） }
 // 内容由 hle_touch.c 按前端推来的触点填（布局与短按锁存见该文件）；游戏只看第 0 份，返回写入的状态份数 1

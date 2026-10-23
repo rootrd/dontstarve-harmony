@@ -307,10 +307,24 @@ int thr_name_of(pthread_t pt, char *out, size_t n) {
     return ok;
 }
 uint32_t thr_cur_handle(void) { thr_t *t = pthread_getspecific(g_keythr); return t ? t->handle : 0; }   // 只读 TSD，信号处理里可用 | Only reads TSD, usable in a signal handler
+// 心跳用：按客体句柄取线程名（"UnityGfxDeviceWorker" 这类）。拿不到锁就回 0，心跳不为一行名字挡住客体线程。
+// Heartbeat: guest thread name by handle (names like "UnityGfxDeviceWorker"). Returns 0 when the lock is busy -- a heartbeat
+// line is not worth blocking a guest thread for.
+int thr_name_by_handle(uint32_t handle, char *out, size_t n) {
+    if (pthread_mutex_trylock(&G)) return 0;
+    int ok = 0; char nb[64];
+    for (thr_t *t = g_all; t; t = t->all) if (t->handle == handle && t->started && !t->exited) { snprintf(out, n, "%s", thr_name(t, nb, sizeof nb)); ok = 1; break; }
+    pthread_mutex_unlock(&G);
+    return ok;
+}
 // 每线程最后一次 SVC 号（采样行打出来）：分辨「在等」和「在某个 SVC 里空转」。句柄 0x1001..0x10FF 取低字节当槽。
 // Per-thread last SVC number (printed on the sample line) to tell "blocked" from "spinning inside an SVC".
 // Handles 0x1001..0x10FF use their low byte as the slot.
 _Atomic int g_last_svc[256];
+// 同槽再存一份「那次 SVC 的 x0」：采样行能直接看出主线程睡多久、等的是哪个键（0x0B 的 ns / 0x1C、0x18 的地址）。
+// Same slot also stores that SVC's x0: the sample line then shows how long the thread sleeps and which key it waits on
+// (0x0B = ns, 0x1C/0x18 = address).
+_Atomic uint64_t g_last_svc_a0[256];
 unsigned thr_cur_slot(void) { thr_t *t = pthread_getspecific(g_keythr); return t ? (t->handle & 0xffu) : 0; }
 // 崩溃现场用：本线程的客体线程参数（CreateThread 的 x2）。世界创建崩在 UpdateJobThread_0 的
 // For the crash dump: this guest thread's CreateThread argument. World creation dies on AcquireSemaphore(NULL) in
@@ -564,11 +578,11 @@ int svc_thread(int num, uint64_t *regs) {
         t->prio = (int)regs[4]; t->core = (int)regs[5]; t->mask = t->core >= 0 ? 1ull << t->core : 7;
         t->born_ns = now_ns(); t->born_tick = dm_thread_tick_fn ? dm_thread_tick_fn() : 0;
         pthread_mutex_lock(&G); t->handle = h_new(O_THREAD, t); t->id = g_next_id++; t->all = g_all; g_all = t; pthread_mutex_unlock(&G);
-        pthread_attr_t a; pthread_attr_init(&a); pthread_attr_setstacksize(&a, 1 << 20);
+        pthread_attr_t a; pthread_attr_init(&a); pthread_attr_setstacksize(&a, 64 << 20);
         pthread_attr_setdetachstate(&a, PTHREAD_CREATE_DETACHED);   // 退出即回收宿主资源（客体经句柄等待，不 join） | Host resources are reclaimed on exit (the guest waits through the handle, no join)
         if (pthread_create(&t->pt, &a, thread_main, t)) die("pthread_create");
         pthread_attr_destroy(&a);
-        if (g_flag.thr) { LOG("CreateThread h=%#x entry=%#llx arg=%#llx sp=%#llx prio=%d core=%d", t->handle, t->entry, t->arg, t->stack_top, t->prio, t->core);
+        if (g_flag.thr || g_flag.svc) { LOG("CreateThread h=%#x entry=%#llx arg=%#llx sp=%#llx prio=%d core=%d", t->handle, t->entry, t->arg, t->stack_top, t->prio, t->core);
             // 诊断：蹦床按 [TT+0x50]+[TT+0x58]-0x20 间接取线程真入口（见 sdk+0x350240 反汇编）；原始值 + 组合结果都打
             // Diagnostic: the trampoline fetches the thread's real entry indirectly as [TT+0x50]+[TT+0x58]-0x20 (see the disassembly of sdk+0x350240); print raw values and the combination
             if (t->arg && !(t->arg & 7)) {
@@ -820,3 +834,5 @@ void hle_signal_system_event(void *ev) {   // 未绑定的按手动清除即时�
     e->signaled = 1; wake_sync_waiters();
     pthread_mutex_unlock(&G);
 }
+
+__attribute__((used)) static const char hss_stack_mark[] = "hss-stack64m-v1";

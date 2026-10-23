@@ -94,18 +94,32 @@ void crash_off(const char *tag, uint64_t a) {   // diag.c 也用 | Also used by 
         if (sn) fprintf(stderr, "〈%s〉", sn);
     }
     else if (g_page_tag && (pt = g_page_tag((void *)(uintptr_t)a))) fprintf(stderr, " %s%s=%s", tag, *tag ? "=" : "", pt);
-    else if (dladdr((void *)a, &di) && di.dli_sname) fprintf(stderr, " %s%s%s+%#lx", tag, *tag ? "=" : "", di.dli_sname, (unsigned long)(a - (uint64_t)di.dli_saddr));
+    else if (dladdr((void *)a, &di) && di.dli_fname) {
+        // dladdr 只认导出符号：宿主里静态函数（比如我们自己的等待/搬运路径）sname 为空，以前就直接甩一个裸地址，
+        // 「十几条线程全停在同一个 pc」那种现场因此谁也认不出来。现在退一步打「库名+库内偏移」，
+        // 拿未剥离的那份 .so 用 nm 离线就能还原成函数名。
+        // dladdr only knows exported symbols: for a static function in the host (our own wait/copy paths) dli_sname is null,
+        // and the old code printed a bare address - which is why a scene like "a dozen threads all parked at one pc" named
+        // nothing. Fall back to library + file offset; nm against the unstripped .so resolves it offline.
+        const char *bn = strrchr(di.dli_fname, '/'); bn = bn ? bn + 1 : di.dli_fname;
+        if (di.dli_sname) fprintf(stderr, " %s%s%s+%#lx〈%s〉", tag, *tag ? "=" : "", di.dli_sname,
+                                  (unsigned long)(a - (uint64_t)di.dli_saddr), bn);
+        else fprintf(stderr, " %s%s%s+%#lx〈无符号〉", tag, *tag ? "=" : "", bn,
+                     (unsigned long)(a - (uint64_t)di.dli_fbase));
+    }
     else fprintf(stderr, " %s%s%#llx", tag, *tag ? "=" : "", a);
 }
 // 帧指针回溯：x29 链 [fp]=上一帧 fp、[fp+8]=返回地址；只走 8 字节对齐、单调上升的帧
 // Frame pointer backtrace: x29 chain [fp]=previous frame's fp, [fp+8]=return address; only 8-byte aligned, monotonically increasing frames are walked
+static size_t rd_at(uint64_t a, void *out, size_t n);   // 可读区间表取数（下面定义）| read through the readable-range table (defined below)
 void dm_backtrace(uint64_t fp) {
     fprintf(stderr, "[dm] bt:");
     for (int i = 0; i < 32 && fp && !(fp & 7); i++) {
-        uint64_t nfp = ((uint64_t *)fp)[0], ra = ((uint64_t *)fp)[1];
-        off("", ra);
-        if (nfp <= fp) break;
-        fp = nfp;
+        uint64_t fr[2];
+        if (rd_at(fp, fr, sizeof fr) != sizeof fr) break;
+        off("", fr[1]);
+        if (fr[0] <= fp) break;
+        fp = fr[0];
     }
     fputc('\n', stderr);
 }
@@ -162,13 +176,146 @@ static void crash_unwind(void) { fprintf(stderr, "[dm] 宿回溯:"); _Unwind_Bac
 
 // 现场对象翻查：对若干寄存器指向的内存，按 8 字节字段扫 0x100 字节，字段本身是指向可打印串的指针就报出来（带偏移）。
 // 用来回答「这个对象到底是空的还是半构造的」「它里面那条错误字符串写了什么」。
+//
+// 可读性判据必须是「这条区间能读」，不是「这页映射了」：mincore 把 PROT_NONE 的页也算 mapped，拿它当判据直接解引用，
+// 就是在处理器里再崩一次 —— v26 实测：crash_65046.txt 止于寄存器那份，回溯/调用环/NVN 计数/栈窗一行都没有
+// （客体刚把 x1=0x6b82000000 这种保留地址交进来）。判据改成开一次 /proc/self/maps 建可读区间表，探针只按表取数。
+// The test must be "this range is readable", not "this page is mapped": mincore counts PROT_NONE pages as mapped, so the old
+// guard let the handler fault on its own probe and the whole scene after the registers was lost (measured in v26 -
+// crash_65046.txt stops at the register dump, no backtrace / call rings / NVN census / stack window). Build a readable-range
+// table from /proc/self/maps once and read only through it.
+#define MR_MAX 65536
+typedef struct { uint64_t s, e; } mr_t;
+static mr_t g_mr[MR_MAX];
+static int g_nmr = -1;      // -1 = 还没建表 | table not built yet
+
+static uint64_t mr_hex(const char **pp) {
+    uint64_t v = 0;
+    for (;;) {
+        char c = **pp; int d = (c >= '0' && c <= '9') ? c - '0' : (c >= 'a' && c <= 'f') ? c - 'a' + 10
+                                          : (c >= 'A' && c <= 'F') ? c - 'A' + 10 : -1;
+        if (d < 0) return v;
+        v = v * 16u + (unsigned)d; (*pp)++;
+    }
+}
+static void mr_line(const char *l) {
+    const char *p = l; uint64_t s = mr_hex(&p);
+    if (*p != '-' || g_nmr >= MR_MAX) return;
+    p++; uint64_t e = mr_hex(&p);
+    if (*p != ' ' || s >= e) return;
+    if (p[1] != 'r') return;
+    if (g_nmr && g_mr[g_nmr - 1].e == s) { g_mr[g_nmr - 1].e = e; return; }   // 与上一条相接就并进去 | merge with the previous range
+    g_mr[g_nmr++] = (mr_t){ s, e };
+}
+// 读一次映射表：信号上下文只用 open/read/close，不分配内存；崩现场在打探针前强制刷一次，其余调用方只在第一次建。
+// 相邻的可读区间当场合并（客体的按页写保护会把映射切成几千段，实测 4096 条上限连客体栈都覆盖不到），查表用二分。
+// Build the table with open/read/close only (no allocation): the crash path forces a refresh before probing, other callers
+// build once. Adjacent readable ranges are merged while reading (per-page write protection slices the mappings into thousands
+// of entries - measured: the 4096-entry cap could not even cover the guest stack), and lookups are a binary search.
+static void maps_load(int force) {
+    if (g_nmr >= 0 && !force) return;
+    g_nmr = 0;
+    int fd = open("/proc/self/maps", O_RDONLY | O_CLOEXEC);
+    if (fd < 0) return;                       // iOS/macOS 没有 /proc：表空 => 下面的探针退回旧判据 | no /proc there: empty table = old fallback below
+    static char chunk[8192]; char line[512]; size_t ln = 0;
+    for (;;) {
+        ssize_t k = read(fd, chunk, sizeof chunk);
+        if (k <= 0) break;
+        for (ssize_t i = 0; i < k; i++) {
+            char c = chunk[i];
+            if (c == '\n') { line[ln] = 0; mr_line(line); ln = 0; }
+            else if (ln < sizeof line - 1) line[ln++] = c;   // 超长行截前 511 字节：地址段就在行首 | over-long line: the address field is at the head
+        }
+    }
+    close(fd);
+    if (ln) { line[ln] = 0; mr_line(line); }
+}
 static int obj_page_mapped(uint64_t a) { unsigned char m; return !mincore((void *)(uintptr_t)(a & ~0xFFFull), 4096, &m); }
+// 从 a 起最多拷 n 字节，返回真拷到的字节数（0 = 读不到）。表在用时只认表里的可读区间；没有表（iOS）按页内安全量拷。
+// Copy at most n bytes from a and return how many were actually readable (0 = nothing). With the table only its ranges count;
+// without one (iOS) copy within the page, matching the old behaviour.
+static size_t rd_at(uint64_t a, void *out, size_t n) {
+    if (a < 0x1000 || n == 0) return 0;
+    maps_load(0);
+    if (g_nmr > 0) {
+        int lo = 0, hi = g_nmr - 1;
+        while (lo <= hi) {
+            int mid = lo + (hi - lo) / 2;
+            if (a < g_mr[mid].s) hi = mid - 1;
+            else if (a >= g_mr[mid].e) lo = mid + 1;
+            else {
+                size_t avail = (size_t)(g_mr[mid].e - a);
+                if (avail > n) avail = n;
+                memcpy(out, (const void *)(uintptr_t)a, avail);
+                return avail;
+            }
+        }
+        return 0;
+    }
+    if (!obj_page_mapped(a)) return 0;
+    size_t avail = 0x1000 - (size_t)(a & 0xFFF);
+    if (avail > n) avail = n;
+    memcpy(out, (const void *)(uintptr_t)a, avail);
+    return avail;
+}
+// 把一个地址说成人话：客体模块里 → 「模块名+偏移」；宿主 .so 里 → dladdr 的符号名；其余原样。
+// 用来回答「客体全局里存的那个函数指针，到底是宿主的哪一个实现」——跳板符号是全局的，剥了符号表的包里 dladdr 仍给得出 _nvnth_<i>。
+// Human-readable form of an address: guest module -> "name+offset"; host .so -> dladdr symbol; otherwise raw.
+// Answers "which host implementation does that pointer in the guest's global actually dispatch to": the thunks are global
+// symbols, so dladdr still names them _nvnth_<i> in the stripped packaged .so.
+static void sym_of(uint64_t a, char *out, size_t n) {
+    module_t *m = module_of((void *)(uintptr_t)a);
+    if (m && a >= (uint64_t)m->base) { snprintf(out, n, "%s+%#llx", m->name, (unsigned long long)(a - (uint64_t)m->base)); return; }
+    Dl_info di;
+    if (a >= 0x1000 && dladdr((void *)(uintptr_t)a, &di) && di.dli_sname) {
+        snprintf(out, n, "宿主 %s+%#lx", di.dli_sname, (unsigned long)(a - (uint64_t)di.dli_saddr)); return;
+    }
+    snprintf(out, n, "%#llx", (unsigned long long)a);
+}
+// 客体的「取全局 → 再取首字 → blr」三件套：把 pc 附近每条 adrp+ldr 指到的全局读出来，连它首字一起解析成符号。
+// 崩在解引用上、而调用链要经由客体自己的派发全局时，这两行就说清了「到底调的是宿主的哪个 NVN 实现」。
+// The guest's "adrp -> ldr global -> ldr first word -> blr" triple: read every global an adrp+ldr pair near pc points at
+// and resolve both it and its first word. When the call chain goes through the guest's own dispatch globals, this names
+// exactly which host NVN implementation was called.
+static void globals_near_pc(uint64_t pc) {
+    char gs[64], gf[64];
+    uint32_t w[256];
+    uint64_t lo = (pc & ~3ull) - 0x200;
+    if (rd_at(lo, w, sizeof w) != sizeof w) return;
+    uint64_t page[32];
+    for (int r = 0; r < 32; r++) page[r] = 0;
+    for (unsigned k = 0; k < sizeof w / sizeof w[0]; k++) {
+        uint64_t a = lo + k * 4;
+        uint32_t i = w[k];
+        if ((i & 0x9F000000u) == 0x90000000u) {          // adrp xd, #imm
+            int64_t immlo = (i >> 29) & 3, immhi = (i >> 5) & 0x7FFFF;
+            int64_t im = (immhi << 2) | immlo;
+            if (im & (1ll << 20)) im |= ~(0x1FFFFFll);   // 符号扩展 21 位 | sign-extend 21 bits
+            page[i & 31] = (a & ~0xFFFull) + (im << 12);
+            continue;
+        }
+        if ((i & 0xFFC00000u) == 0xF9400000u) {          // ldr rt, [rn, #imm<<3]
+            unsigned rn = (i >> 5) & 31, rt = i & 31;
+            uint64_t g = page[rn] ? page[rn] + ((i >> 10) & 0xFFF) * 8 : 0;
+            uint64_t v = 0, f = 0;
+            if (g >= 0x1000 && rd_at(g, &v, 8) == 8) {
+                sym_of(g, gs, sizeof gs);
+                if (v >= 0x1000 && !(v & 7) && rd_at(v, &f, 8) == 8 && f >= 0x1000) {
+                    sym_of(f, gf, sizeof gf);
+                    fprintf(stderr, "[dm]   派发 %s = %#llx → 首字 %s\n", gs, (unsigned long long)v, gf);
+                } else fprintf(stderr, "[dm]   全局 %s = %#llx\n", gs, (unsigned long long)v);
+            }
+            page[rt] = 0;                                 // 目标寄存器被改写，页号作废 | the register no longer holds a page
+        }
+    }
+}
 static size_t obj_str_at(uint64_t v, char *buf, size_t cap) {
-    if (v < 0x1000 || (v & 7) || !obj_page_mapped(v)) return 0;
-    const unsigned char *pb = (const unsigned char *)(uintptr_t)v;
-    size_t room = 0x1000 - (size_t)(v & 0xFFF), n = 0;
-    while (n + 1 < cap && n < room) { unsigned char c = pb[n]; if (c < 0x20 || c >= 0x7f) break; buf[n++] = c; }
-    if (n >= 5 && n < room && pb[n] == 0) { buf[n] = 0; return n; }
+    if (v < 0x1000 || (v & 7)) return 0;
+    size_t room = rd_at(v, buf, cap - 1);
+    if (room < 6) return 0;
+    size_t n = 0;
+    while (n < room && buf[n] >= 0x20 && buf[n] < 0x7f) n++;
+    if (n >= 5 && n < room && buf[n] == 0) { buf[n] = 0; return n; }
     return 0;
 }
 static void crash_dump_objects(ucontext_t *uc) {
@@ -179,8 +326,8 @@ static void crash_dump_objects(ucontext_t *uc) {
         if (base < 0x1000 || (base & 7)) continue;
         int shown = 0;
         for (uint64_t off = 0; off < 0x100; off += 8) {
-            if (!obj_page_mapped(base + off)) break;
-            uint64_t v = *(const uint64_t *)(uintptr_t)(base + off);
+            uint64_t v = 0;
+            if (rd_at(base + off, &v, 8) != 8) break;
             size_t n = obj_str_at(v, sb, sizeof sb);
             if (n) { fprintf(stderr, "[dm]   x%d+%#llx → \"%s\"\n", rr[q], (unsigned long long)off, sb); if (++shown == 8) break; }
         }
@@ -238,33 +385,119 @@ static void on_crash(int sig, siginfo_t *si, void *uc_) {
         for (int i = 0; i < g_nfault_hook; i++) if (g_fault_hook[i](si->si_addr, is_write, uc)) { g_in_crash = 0; return; }
     }
     crash_fd_to_file(sig, si, uc);
+    maps_load(1);   // 建/刷可读区间表：现场探针全靠它，处理器里绝不碰表外的地址 | build the readable-range table; no probe touches an address outside it
+    // 表为空 = /proc/self/maps 没读到，探针只能走旧的按页判据（那种页会算 mapped，风险还在）：这条要说出来，
+    // 否则「下面几段没打印」会被当成「客体没走到」
+    // An empty table means /proc/self/maps could not be read and the probes fall back to the old per-page test (which counts
+    // PROT_NONE as mapped, so the risk is back): say so, otherwise "no lines below" would be read as "the guest got no further".
+    fprintf(stderr, "[dm] 可读区间 %d 条（现场探针只按表内地址取数）\n", g_nmr);
     fprintf(stderr, "[dm] CRASH sig=%d", sig);
     off("addr", (uint64_t)si->si_addr); off("pc", OC_SS_PC(uc)); off("lr", OC_SS_LR(uc));
     // pc 处三条指令的机器码：用来核对 pc→模块偏移有没有错位（本例 addr=0 但按反汇编前一条也该炸，得确认取到的 pc 真是那条）
-    { uintptr_t pp = (uintptr_t)OC_SS_PC(uc);
-      if (module_of((void *)pp) && (pp & 0xFFF) >= 8) {
-          volatile uint32_t *w = (volatile uint32_t *)pp;
-          fprintf(stderr, " 指令=%08x %08x [%08x]", w[-2], w[-1], w[0]);
-      } }
+    { uint64_t pp = OC_SS_PC(uc); uint32_t w[3] = {0};
+      if (module_of((void *)(uintptr_t)pp) && rd_at(pp - 8, w, sizeof w) == sizeof w)
+          fprintf(stderr, " 指令=%08x %08x [%08x]", w[0], w[1], w[2]);
+    }
     fprintf(stderr, " sp=%#llx", OC_SS_SP(uc));
     { char td[200] = ""; if (g_thr_desc) g_thr_desc(td, sizeof td); fprintf(stderr, " 线程=%s", td); }   // 崩的是哪条客体线程（槽/名/线程函数）| which guest thread crashed
     fprintf(stderr, "\n");
     fprintf(stderr, " fp=%#llx\n", OC_SS_FP(uc));
     for (int i = 0; i < 29; i++) fprintf(stderr, "x%d=%#llx%s", i, OC_SS_X(uc,i), i % 6 == 5 ? "\n" : " ");
     fprintf(stderr, "\n");
+    // 必须有的取证排在前面，对象翻查/线程参数翻查排到最后：v26 那轮就是处理器自己再崩一次，
+    // 把回溯、调用环、NVN 计数、栈窗一起带走了。现在探针只按可读区间表取数，但顺序本身也是保险。
+    // The must-have evidence goes first and the two object scans last: in v26 the handler faulted inside itself and took the
+    // backtrace, the call rings, the NVN census and the stack window down with it. Probes now only read through the
+    // readable-range table, but the ordering is a second belt.
+    dm_backtrace(OC_SS_FP(uc));
+    { extern void hle_hist_dump(void); hle_hist_dump(); }
+    { extern void hle_trace_dump(void); hle_trace_dump(); }   // 分线程的真调用序列（DM_HLTRACE；记名桩本来就在记）| per-thread real call sequence
+    { extern void nvn_dump_counts(const char *); nvn_dump_counts("崩溃时"); }
+    { extern void nvn_trace_dump(const char *, uint64_t); nvn_trace_dump("崩溃时", OC_SS_SP(uc)); }   // DM_NVN_TRACE：末尾 72 条按序 NVN 调用，星标 = 与崩溃栈同一 64 KB 的线程 | last 72 NVN calls in order; star = caller sp shares the crash stack's 64 KB
+    { extern void hlecount_dump_now(void); hlecount_dump_now(); }   // 崩溃时"哪些剪口真被调过、各几次"：0 条 = 客体根本没走到这些接口 | Which HLE entries actually ran at crash time: no lines = the guest never reached those interfaces   // 崩溃时 NVN 各类调用计数：0 = 根本没摸到图形层 | NVN call counts at crash time: 0 = the graphics layer was never touched
+    crash_unwind();
+    // 客栈窗扫描：帧链常断（客体把 x29 当普通寄存器用），从 sp 起拷 2 KB，
+    // 落在客体模块区间里的值基本都是返回地址 —— 用来还原崩溃前的客体调用链。
+    // Guest stack-window scan: the frame chain often breaks (guest code uses x29 as a scratch register); copy 2 KB from
+    // sp; values falling inside guest modules are almost always return addresses.
+    {
+        uint64_t sp = OC_SS_SP(uc);
+        static uint64_t v[256];
+        if (sp > 0x10000 && !(sp & 7)) {
+            size_t n = rd_at(sp, v, sizeof v);
+            fprintf(stderr, "[dm] 客栈窗:");
+            for (size_t k = 0; k < n / 8; k++) {
+                module_t *mm = module_of((void *)(uintptr_t)v[k]);
+                if (mm && v[k] >= (uint64_t)mm->base) fprintf(stderr, " %s+%#llx", mm->name, v[k] - (uint64_t)mm->base);
+            }
+            fputc('\n', stderr);
+        }
+    }
+    // 裸栈窗 + 候选对象：上面两条扫描只打「像代码」的值，局部变量/对象指针全被过滤掉了。
+    // 现场见过这种组合：调用者把对象指针存进 [x29,#-8]，回来读它是 0，可它进函数时不可能是 0
+    // （同一条指令流更早就按它取过数）——那只剩「被调方按出参指针写穿了自己那份结构，多出来的 0 覆盖了上面的槽」。
+    // 这两段就是判这个的：整窗原样打出来，再把「首字像虚表」的字按对象翻开，连带崩掉的那个字段偏移一起读。
+    // Raw window + object candidates: the two scans above drop everything that is not code-shaped. A seen pattern is: the
+    // caller stores an object pointer at [x29,#-8] and reads back 0, although it cannot have been 0 on entry (the same
+    // instruction stream dereferenced it earlier), which leaves only "a callee wrote past its out-struct and the extra
+    // zeros covered the slot above it". These two blocks decide that: the window as-is, plus every word whose first word
+    // looks like a vtable opened as an object, including the field offset that just faulted.
+    {
+        uint64_t sp = OC_SS_SP(uc), addr = (uint64_t)si->si_addr;
+        static uint64_t rw[128];
+        size_t n = sp > 0x10000 && !(sp & 7) ? rd_at(sp, rw, sizeof rw) : 0;
+        for (size_t k = 0; k + 4 <= n / 8; k += 4)
+            fprintf(stderr, "[dm]   栈 sp+0x%03zx = 0x%016llx 0x%016llx 0x%016llx 0x%016llx\n", k * 8,
+                    (unsigned long long)rw[k], (unsigned long long)rw[k + 1], (unsigned long long)rw[k + 2], (unsigned long long)rw[k + 3]);
+        uint64_t foff = addr < 0x100000 ? addr : 0;   // 基址为 0 的崩法里，错地址就是字段偏移 | with a null base the fault address is the field offset
+        int shown = 0;
+        for (size_t k = 0; k < n / 8 && shown < 24; k++) {
+            uint64_t o = rw[k], vt = 0, f = 0;
+            if (o < 0x10000 || (o & 7) || rd_at(o, &vt, 8) != 8) continue;
+            module_t *mv = module_of((void *)(uintptr_t)vt);
+            if (!mv || vt < (uint64_t)mv->base) continue;
+            fprintf(stderr, "[dm]   候选对象 栈sp+%#zx=%#llx 虚表=%s+%#llx", k * 8, (unsigned long long)o,
+                    mv->name, (unsigned long long)(vt - (uint64_t)mv->base));
+            if (foff && rd_at(o + foff, &f, 8) == 8) fprintf(stderr, " [+%#llx]=%#llx", (unsigned long long)foff, (unsigned long long)f);
+            if (rd_at(o + 8, &f, 8) == 8) fprintf(stderr, " [+8]=%#llx", (unsigned long long)f);
+            fputc('\n', stderr); shown++;
+        }
+        uint64_t pc = OC_SS_PC(uc);
+        if (module_of((void *)(uintptr_t)pc)) globals_near_pc(pc);
+    }
+   // 最近的宿主→客体调用，便于定位“错值从哪一步交出去” | recent host->guest calls, to locate which step handed out a bad value
+   // 诊断：从 sp 起 8 KB，凡落入客体模块或宿主 .so 区间的字都打出来（带符号），用来还原调用链
+    {
+        uint64_t sp = OC_SS_SP(uc); Dl_info di; uint64_t hb = 0, he = 0;
+        static uint64_t stk[1024];
+        if (dladdr((void *)&on_crash, &di) && di.dli_fbase) { hb = (uint64_t)di.dli_fbase; he = hb + 0x400000; }
+        fprintf(stderr, "[dm] 宿text %#llx..%#llx\n", (unsigned long long)hb, (unsigned long long)he);
+        size_t n = sp > 0x10000 && !(sp & 7) ? rd_at(sp, stk, sizeof stk) : 0;
+        for (size_t k = 0; k < n / 8; k++) {
+            uint64_t v = stk[k];
+            module_t *mm = module_of((void *)(uintptr_t)v);
+            if (mm && v >= (uint64_t)mm->base)
+                fprintf(stderr, "[dm]   sp+%#zx = %#llx → %s+%#llx\n", k * 8, (unsigned long long)v, mm->name, (unsigned long long)(v - (uint64_t)mm->base));
+            else if (hb && v >= hb && v < he) {
+                Dl_info d2;
+                if (dladdr((void *)(uintptr_t)v, &d2) && d2.dli_sname)
+                    fprintf(stderr, "[dm]   sp+%#zx = %#llx → 宿主 %s+%#lx\n", k * 8, (unsigned long long)v, d2.dli_sname, (unsigned long)(v - (uint64_t)d2.dli_saddr));
+                else fprintf(stderr, "[dm]   sp+%#zx = %#llx → 宿主 +%#llx\n", k * 8, (unsigned long long)v, (unsigned long long)(v - hb));
+            }
+        }
+    }
     // 客体把「错误说明」存在对象字段里、交给日志函数打印（FMOD 事件系统就是这么存的）；崩在解引用上时没人来得及打，
-    // 所以我们自己按字段翻一遍。崩在处理器里再崩一次会丢整份现场（g_in_crash 直接 _exit(9)），
-    // 所以每个地址先用 mincore 确认页是映射的，并且只在同一页内取串。
+    // 所以我们自己按寄存器指向的对象翻一遍字段。
+    // The guest keeps its "why" inside object fields and hands them to its own log function; when it faults before printing,
+    // read the fields of the objects the registers point at.
     crash_dump_objects(uc);
     // 线程参数对象：空指针崩在客体线程上时，这里通常能直接看出"对象被释放/清零"（整块 0）还是"某个字段没设过"
     { extern uint64_t thr_cur_arg(void); uint64_t a = thr_cur_arg();
       fprintf(stderr, "[dm] 线程参数=%#llx\n", (unsigned long long)a);
       if (a && !(a & 7)) {
           for (int i = 0; i < 80; i++) {
-              uint64_t v = 0; vm_size_t g2 = 0;
-              if (vm_read_overwrite(mach_task_self(), a + (uint64_t)i * 8, 8, (vm_address_t)&v, &g2) || g2 != 8) {
-                  fprintf(stderr, "[dm]   参数+%#x 读不到\n", i * 8); break;
-              }
+              uint64_t v = 0;
+              if (rd_at(a + (uint64_t)i * 8, &v, 8) != 8) { fprintf(stderr, "[dm]   参数+%#x 读不到\n", i * 8); break; }
               module_t *mm = module_of((void *)(uintptr_t)v);
               if (mm && v >= (uint64_t)mm->base)
                   fprintf(stderr, "[dm]   参数+%#x = %#llx → %s+%#llx\n", i * 8, (unsigned long long)v, mm->name,
@@ -275,52 +508,6 @@ static void on_crash(int sig, siginfo_t *si, void *uc_) {
                   fprintf(stderr, "[dm]   参数+%#x = 0\n", i * 8);
           }
       } }
-    dm_backtrace(OC_SS_FP(uc));
-    { extern void hle_hist_dump(void); hle_hist_dump(); }
-    { extern void hle_trace_dump(void); hle_trace_dump(); }   // 分线程的真调用序列（DM_HLTRACE；记名桩本来就在记）| per-thread real call sequence
-    { extern void nvn_dump_counts(const char *); nvn_dump_counts("崩溃时"); }
-    { extern void hlecount_dump_now(void); hlecount_dump_now(); }   // 崩溃时"哪些剪口真被调过、各几次"：0 条 = 客体根本没走到这些接口 | Which HLE entries actually ran at crash time: no lines = the guest never reached those interfaces   // 崩溃时 NVN 各类调用计数：0 = 根本没摸到图形层 | NVN call counts at crash time: 0 = the graphics layer was never touched
-    crash_unwind();
-    // 客栈窗扫描：帧链常断（客体把 x29 当普通寄存器用），从 sp 起在同页内拷 2 KB，
-    // 落在客体模块区间里的值基本都是返回地址 —— 用来还原崩溃前的客体调用链。
-    // Guest stack-window scan: the frame chain often breaks (guest code uses x29 as a scratch register); copy 2 KB from
-    // sp within its own page; values falling inside guest modules are almost always return addresses.
-    {
-        uint64_t sp = OC_SS_SP(uc);
-        if (sp > 0x10000 && !(sp & 7)) {
-            uint64_t v[256]; size_t n = sizeof v, room = 4096 - (size_t)(sp & 0xFFF);
-            if (room < n) n = room;
-            memcpy(v, (const void *)(uintptr_t)sp, n);
-            fprintf(stderr, "[dm] 客栈窗:");
-            for (size_t k = 0; k < n / 8; k++) {
-                module_t *mm = module_of((void *)(uintptr_t)v[k]);
-                if (mm && v[k] >= (uint64_t)mm->base) fprintf(stderr, " %s+%#llx", mm->name, v[k] - (uint64_t)mm->base);
-            }
-            fputc('\n', stderr);
-        }
-    }
-   // 最近的宿主→客体调用，便于定位“错值从哪一步交出去” | recent host->guest calls, to locate which step handed out a bad value
-    // 诊断：从 sp 起 8 KB，凡落入客体模块或宿主 .so 区间的字都打出来（带符号），用来还原调用链
-    {
-        uint64_t sp = OC_SS_SP(uc); Dl_info di; uint64_t hb = 0, he = 0;
-        if (dladdr((void *)&on_crash, &di) && di.dli_fbase) { hb = (uint64_t)di.dli_fbase; he = hb + 0x400000; }
-        fprintf(stderr, "[dm] 宿text %#llx..%#llx\n", (unsigned long long)hb, (unsigned long long)he);
-        if (sp > 0x10000 && !(sp & 7)) {
-            size_t n = 8192;
-            for (size_t k = 0; k < n / 8; k++) {
-                uint64_t v = ((volatile uint64_t *)(uintptr_t)sp)[k];
-                module_t *mm = module_of((void *)(uintptr_t)v);
-                if (mm && v >= (uint64_t)mm->base)
-                    fprintf(stderr, "[dm]   sp+%#zx = %#llx → %s+%#llx\n", k * 8, (unsigned long long)v, mm->name, (unsigned long long)(v - (uint64_t)mm->base));
-                else if (hb && v >= hb && v < he) {
-                    Dl_info d2;
-                    if (dladdr((void *)(uintptr_t)v, &d2) && d2.dli_sname)
-                        fprintf(stderr, "[dm]   sp+%#zx = %#llx → 宿主 %s+%#lx\n", k * 8, (unsigned long long)v, d2.dli_sname, (unsigned long)(v - (uint64_t)d2.dli_saddr));
-                    else fprintf(stderr, "[dm]   sp+%#zx = %#llx → 宿主 +%#llx\n", k * 8, (unsigned long long)v, (unsigned long long)(v - hb));
-                }
-            }
-        }
-    }
 
     if (g_dump_hook) g_dump_hook();
     // stderr→hilog 桥（OHOS app_ohos.c）是另一条线程在读管道：这里立刻 _exit 会把驱动 abort 前打进 stderr 的那句话一起带走。

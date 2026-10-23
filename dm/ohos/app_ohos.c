@@ -148,7 +148,7 @@ static void dump_file_log(const char *path, int max_lines);
 static const char *kRomfsMarks[][3] = {
     { "data/.build.config",      "data/00-00000001.data", "DST" },
     { "data/build.config",       "data/00-00000001.data", "DST" },
-    { "Data/globalgamemanagers", "Data/resources.assets", "Unity-HSS-v13" },
+    { "Data/globalgamemanagers", "Data/resources.assets", "Unity-HSS-v33" },
 };
 static int romfs_has_cfg(const char *dir)
 {
@@ -363,9 +363,19 @@ static napi_value Start(napi_env env, napi_callback_info info)
     // Second argument = the Want.parameters JSON from ArkTS (`aa start --ps DM_xxx v` lets the diagnostic switches be set from outside the device).
     // Only keys starting with DM_ are taken, values plain strings.
     if (argc >= 2 && argv[1]) {
-        char js[2048];
+        // 2048 装不下：want.parameters 除了我们那十几条 DM_*，还被框架塞进 callerPid / callerToken / moduleName /
+        // ohos.aafwk.param.* 等二十来条，实测整串 1 KB 出头，再加几条长路径开关就从尾部被无声截掉——
+        // AJ0 轮的 DM_ARENA_ARM=0 就是这么丢的（日志回显「未设」），一整轮 A/B 白跑。截断现在自己报一条红。
+        // 2048 does not fit: besides our dozen DM_* keys the framework also drops callerPid / callerToken / moduleName /
+        // ohos.aafwk.param.* in there, so the string measured just over 1 KB, and a few extra long-path switches got cut
+        // off the tail in silence - that is how round AJ0 lost DM_ARENA_ARM=0 (echo said 未设) and burned a whole A/B.
+        // The truncation now reports itself.
+        char js[16384];
         size_t len = 0;
         if (napi_get_value_string_utf8(env, argv[1], js, sizeof js, &len) == napi_ok) {
+            if (len + 1 >= sizeof js)
+                OH_LOG_Print(LOG_APP, LOG_ERROR, LOG_DOMAIN, LOG_TAG,
+                             "[env] want 参数串被截（%{public}zu/%{public}zu），尾部的开关没落地", len, sizeof js);
             for (const char *p = js; (p = strstr(p, "\"DM_")) != NULL;) {
                 const char *k = p + 1, *c = strchr(k, '"');
                 if (!c) break;
@@ -393,6 +403,7 @@ static napi_value Start(napi_env env, napi_callback_info info)
     pad_ohos_env();     // 外部开关落定后才知道 DM_PAD 关不关手柄面（模块注册期还读不到 want 参数）
     // 第 3 个参数 = HAP 资源目录（ctx.resourceDir）。游戏数据打进安装包后，$: 就地挂到这里（见 pick_romfs）。
     // Third argument = the HAP resource directory (ctx.resourceDir). With the data inside the package, $: mounts there in place (see pick_romfs).
+    { extern void nvn_wrap_arm(void); nvn_wrap_arm(); }   // NVN 包装层（DM_NVN_TRACE / DM_NVN_PROF）同样只能在外部开关落定后装 | the NVN wrapper layer can only be installed after the external switches have landed
     if (argc >= 3 && argv[2]) {
         size_t len = 0;
         if (napi_get_value_string_utf8(env, argv[2], g_res, sizeof g_res, &len) == napi_ok) {

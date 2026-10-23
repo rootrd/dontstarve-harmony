@@ -46,6 +46,7 @@
 #include <mach/thread_policy.h>
 #include <assert.h>
 #include <stdatomic.h>
+#include <dlfcn.h>             // 调用环把宿主实现地址符号化（dladdr）| symbolize the host implementation behind each ring entry
 #include <mach-o/getsect.h>
 #include <mach-o/ldsyms.h>
 
@@ -58,8 +59,23 @@ extern void *nvn_thunk[NVN_NFUNC];
 extern const char *nvn_names[NVN_NFUNC];
 extern void nvn_unimpl_entry(void);
 extern void nvn_prof_entry(void);
+extern void nvn_trace_entry(void);
 void *nvn_real[NVN_NFUNC];               // DM_NVN_PROF：计时包装调用的真实现 | DM_NVN_PROF: the real implementation called by the timing wrapper
 _Atomic uint64_t nvn_prof_ticks[NVN_NFUNC]; // DM_NVN_PROF：各函数累计耗时（cntvct 计数） | DM_NVN_PROF: cumulative time of each function (cntvct counts)
+// DM_NVN_TRACE=1：槽表指向 nvn_trace_entry，按调用顺序记 (槽号, x0..x5, x8, 调用方 sp)。
+// 崩现场靠它把「谁最后写过这块客体栈」点名出来——光有计数说不了顺序。
+// DM_NVN_TRACE=1: the slots point at nvn_trace_entry, recording (slot, x0..x5, x8, caller sp) in call order. The crash
+// dump uses it to name whoever last wrote into this guest stack block; counts alone cannot tell order.
+typedef struct { uint64_t slot, x0, x1, x2, x3, x4, x5, x8, sp, pad[7]; } nvn_trace_t;
+_Static_assert(sizeof(nvn_trace_t) == 128, "调用环每条 128 字节，跳板按 <<7 变址");
+nvn_trace_t nvn_trace[256];
+_Atomic uint64_t nvn_trace_n;
+// v31、v32 两轮调用环都是空的，光靠"空"这一个字分不出是没装、装了没生效、还是后来被换掉了。
+// 这组自证字段记装那一刻读到的开关与槽表构成，崩现场再读一次当前槽表，三种情况一次分清。
+// v31 and v32 both came back with an empty ring, and "empty" alone cannot tell whether the wrapper was never installed,
+// installed but bypassed, or replaced afterwards. These fields record the switches and slot-table makeup seen at arm
+// time; the crash dump re-reads the live slot table, which separates the three cases in one round.
+struct { int armed, env_prof, env_trace; unsigned wrapped, unimpl, nullfn; } g_arm;
 static uint8_t g_unimpl_seen[NVN_NFUNC];
 
 uint64_t nvn_unimpl_c(nvn_slot_t *slot, uint64_t x0, uint64_t x1, uint64_t x2) {
@@ -82,6 +98,27 @@ typedef struct { const char *name; void *fn; } nvn_impl;
     static ret h_##name(__VA_ARGS__)
 
 static int g_log;
+
+// 读回类入口的整轮计数（周期行里那段「回读:」）。Flush 那两条在 CPU/GPU 同址的宿主里空着是对的；
+// 但 Invalidate / ReadTexels 这几条是"GPU 写过、CPU 要重取"的方向，同址救不了——Vulkan 侧的写在 VkImage/VkBuffer 里，
+// 客体池内存不会自己变新。所以先只回答一个问题：客体到底走不走这几路。全零也照样打出来，那是一次结案。
+// Per-round tallies for the read-back class (the 回读: segment of the periodic line). The two Flush entries are correctly
+// empty on an address-shared host; the Invalidate / ReadTexels ones are the GPU -> CPU direction, where address sharing does
+// not help, because the Vulkan side keeps its writes in VkImage/VkBuffer. All this answers one question: does the guest use
+// these paths at all. A row of zeros is printed too - that is a verdict, not a missing measurement.
+enum { RB_POOLFLUSH, RB_POOLINVAL, RB_BUFFLUSH, RB_BUFINVAL, RB_TEXINVAL, RB_TEXREAD, RB_N };
+static _Atomic uint64_t g_rb[RB_N];
+int nvn_rb_stat(char *out, size_t cap)
+{
+    if (!out || cap < 16) return 0;
+    unsigned nz = 0;
+    for (int i = 0; i < RB_N; i++) if (atomic_load(&g_rb[i])) nz++;
+    if (!nz) return snprintf(out, cap, "｜回读:六路全零（客体没走）");
+    return snprintf(out, cap, "｜回读:池冲%llu 池失%llu 缓冲%llu 缓失%llu 纹失%llu 纹读%llu",
+                    (unsigned long long)atomic_load(&g_rb[RB_POOLFLUSH]), (unsigned long long)atomic_load(&g_rb[RB_POOLINVAL]),
+                    (unsigned long long)atomic_load(&g_rb[RB_BUFFLUSH]), (unsigned long long)atomic_load(&g_rb[RB_BUFINVAL]),
+                    (unsigned long long)atomic_load(&g_rb[RB_TEXINVAL]), (unsigned long long)atomic_load(&g_rb[RB_TEXREAD]));
+}
 uint64_t nvn_new_serial(void) { static _Atomic uint64_t n; return ++n; }
 static unsigned g_nsem;                          // 语义实现个数（nvn_init_slots 填） | Number of semantic implementations (filled by nvn_init_slots)
 #define OLOG(...) do { if (g_log) LOG("[nvn] " __VA_ARGS__); } while (0)
@@ -169,16 +206,71 @@ static void *nvn_lookup(const char *name) {
 }
 
 // 诊断转储：非零 NVN 调用计数（nnMain 前后各调一次，定位游戏走到哪一步）。计数由跳板里的 stadd 累加，与 DM_HLECOUNT 无关。
-// Diagnostic dump: non-zero NVN call counts (called before and after nnMain to locate how far the game gets). Counts are accumulated by the stadd in the thunk, independent of DM_HLECOUNT.
+// 分块打：整串写在一行时，鸿蒙那条日志通道会按长度截尾，而"排在后面"的恰好是最要紧的 Submit / Present
+// （名字表按字母序，Queue* 在末尾）。每 ~1500 字节换一行。
+// Chunked output: on one line, the OHOS log channel truncates the tail, and the tail is exactly what matters most here --
+// Submit / Present (the name table is alphabetical, so Queue* sorts last). Break into ~1500-byte lines.
+// 崩现场用：按调用顺序打最后 72 条 NVN 调用（槽名 + x0..x3 + 调用方 sp）。
+// 同一线程的调用靠 sp 落在崩溃栈那 64 KB 里挑出来，其余线程的条目仍然打出来，只是不打星标。
+// For the crash scene: the last 72 NVN calls in order (slot name + x0..x3 + caller sp). Entries from the faulting thread
+// are the ones whose sp falls in the same 64 KB as the crash stack; other threads are still printed, just without the star.
+// 环条目里的宿主实现：能符号化就符号化，不能（内部符号被剥离）就打地址，离线用构建机未剥离的 .so 加偏址还原。
+// The host implementation behind a ring entry: symbolized when possible, otherwise the raw address, resolved offline
+// against the build box's un-stripped .so plus the load bias.
+static const char *host_sym(void *p) {
+    static char b[80];
+    Dl_info di;
+    if (p && dladdr(p, &di) && di.dli_sname)
+        snprintf(b, sizeof b, "%s+%#llx", di.dli_sname, (unsigned long long)((char *)p - (char *)di.dli_saddr));
+    else
+        snprintf(b, sizeof b, "%p", p);
+    return b;
+}
+
+void nvn_trace_dump(const char *tag, uint64_t crash_sp) {
+    uint64_t n = atomic_load(&nvn_trace_n);
+    unsigned now = 0, nullnow = 0;
+    for (unsigned i = 0; i < NVN_NFUNC; i++) {
+        if (nvn_slot[i].fn == (void *)nvn_trace_entry) now++;
+        else if (!nvn_slot[i].fn) nullnow++;
+    }
+    fprintf(stderr, "[dm] 包装层自证：armed=%d env_trace=%d env_prof=%d 时装 wrapped=%u 未实现桩=%u 空槽=%u ｜ 崩现场仍指向调用环的槽=%u 空槽=%u ｜ 环写入 %llu 条 &nvn_trace=%p &nvn_trace_n=%p\n",
+            g_arm.armed, g_arm.env_trace, g_arm.env_prof, g_arm.wrapped, g_arm.unimpl, g_arm.nullfn,
+            now, nullnow, (unsigned long long)n, (void *)&nvn_trace[0], (void *)&nvn_trace_n);
+    if (!n) { fprintf(stderr, "[dm] NVN 调用环：空（DM_NVN_TRACE 没开？）\n"); return; }
+    uint64_t from = n > 72 ? n - 72 : 0;
+    fprintf(stderr, "[dm] NVN 调用环（%s）共 %llu 条，末尾 %llu 条：\n", tag,
+            (unsigned long long)n, (unsigned long long)(n - from));
+    for (uint64_t k = from; k < n; k++) {
+        nvn_trace_t e = nvn_trace[k & 255];
+        unsigned i = (unsigned)e.slot;
+        if (i >= NVN_NFUNC) i = 0;
+        fprintf(stderr, "[dm]   %c#%llu %s 宿主=%s x0=%#llx x1=%#llx x2=%#llx x3=%#llx x4=%#llx x5=%#llx x8=%#llx sp=%#llx\n",
+                (crash_sp >> 16) == (e.sp >> 16) ? '*' : ' ', (unsigned long long)k, nvn_names[i],
+                host_sym(i < NVN_NFUNC ? nvn_real[i] : NULL),
+                (unsigned long long)e.x0, (unsigned long long)e.x1, (unsigned long long)e.x2,
+                (unsigned long long)e.x3, (unsigned long long)e.x4, (unsigned long long)e.x5,
+                (unsigned long long)e.x8, (unsigned long long)e.sp);
+    }
+}
+
 void nvn_dump_counts(const char *tag) {
-    unsigned nz = 0; uint64_t tot = 0; char line[4096]; size_t o = 0; line[0] = 0;
+    unsigned nz = 0; uint64_t tot = 0; char line[2048]; size_t o = 0; line[0] = 0; int chunk = 0;
+    LOG("[nvn] 计数（%s）：逐函数非零计数如下", tag);
     for (unsigned i = 0; i < NVN_NFUNC; i++) {
         uint64_t c = atomic_load(&nvn_slot[i].cnt);
         if (!c) continue;
         nz++; tot += c;
-        if (o < sizeof line - 96) o += snprintf(line + o, sizeof line - o, " %s=%llu", nvn_names[i] + 3, (unsigned long long)c);
+        int need = (int)strlen(nvn_names[i]) + 24;
+        if (o + (size_t)need >= sizeof line - 1) {
+            LOG("[nvn]   分块 %d |%s", ++chunk, line);
+            o = 0; line[0] = 0;
+        }
+        o += (size_t)snprintf(line + o, sizeof line - o, " %s=%llu", nvn_names[i] + 3, (unsigned long long)c);
+        if (o >= sizeof line - 1) o = sizeof line - 1;
     }
-    LOG("[nvn] 计数（%s）：%u 个函数 %llu 次 |%s", tag, nz, (unsigned long long)tot, line);
+    if (o) LOG("[nvn]   分块 %d |%s", ++chunk, line);
+    LOG("[nvn]   合计：%u 个函数 %llu 次", nz, (unsigned long long)tot);
 }
 
 // nvnBootstrapLoader 由 main 导入（sdk 定义）；强制接管后 sdk 的 NVN 驱动不再被引用
@@ -295,13 +387,13 @@ NVN_NOPROTO(nvnMemoryPoolMap, void *, NVNmemoryPool *p) {
     OLOG("MemoryPoolMap 虚拟池 %p -> %p size=%#llx", (void *)p, va, (unsigned long long)n);
     return va;
 }
-NVN(nvnMemoryPoolFlushMappedRange, void, const NVNmemoryPool *p, ptrdiff_t off, size_t n) { (void)p; (void)off; (void)n; }
+NVN(nvnMemoryPoolFlushMappedRange, void, const NVNmemoryPool *p, ptrdiff_t off, size_t n) { (void)p; (void)off; (void)n; atomic_fetch_add(&g_rb[RB_POOLFLUSH], 1); }
 // 内存池失效提示：宿主是 CPU/GPU 同址直通（没有独立的显存缓存行），无需任何动作。
 // 先前未实现 ⇒ 每次都记一条"未实现被调用"（噪声），而空操作本来就是对的语义。
 // Memory-pool invalidate hint: the host has a single CPU/GPU address space (no separate GPU cache lines), so
 // there is nothing to do. Previously unimplemented, so every call was reported as unimplemented (noise), while a
 // no-op is in fact the correct semantics.
-NVN(nvnMemoryPoolInvalidateMappedRange, void, const NVNmemoryPool *p, ptrdiff_t off, size_t n) { (void)p; (void)off; (void)n; }
+NVN(nvnMemoryPoolInvalidateMappedRange, void, const NVNmemoryPool *p, ptrdiff_t off, size_t n) { (void)p; (void)off; (void)n; atomic_fetch_add(&g_rb[RB_POOLINVAL], 1); }
 
 // ---------- 缓冲（NVNbuffer）----------
 // ---------- Buffers (NVNbuffer) ----------
@@ -332,11 +424,27 @@ NVN(nvnBufferInitialize, NVNboolean, NVNbuffer *bf, const NVNbufferBuilder *b) {
     return 1;
 }
 NVN(nvnBufferSetDebugLabel, void, NVNbuffer *bf, const char *label) { (void)bf; (void)label; }
+// 调试命名一族：把字符串挂到对象上，只给调试器/驱动看，语义上没有别的作用。全部空操作。
+// 之前未实现 ⇒ 客体每命名一次就报一条红（HSS 实测 7 种对象各命中一次），把真问题淹在噪声里。
+// Debug-label family: attaches a string to an object for the debugger and driver only, with no other effect. All no-ops.
+// Unimplemented, they reported a red line every time the guest named something (HSS hit seven object types), burying real
+// findings in noise.
+NVN(nvnDeviceSetDebugLabel, void, NVNdevice *d, const char *label) { (void)d; (void)label; }
+NVN(nvnQueueSetDebugLabel, void, NVNqueue *q, const char *label) { (void)q; (void)label; }
+NVN(nvnWindowSetDebugLabel, void, NVNwindow *w, const char *label) { (void)w; (void)label; }
+NVN(nvnProgramSetDebugLabel, void, NVNprogram *p, const char *label) { (void)p; (void)label; }
+NVN(nvnMemoryPoolSetDebugLabel, void, NVNmemoryPool *p, const char *label) { (void)p; (void)label; }
+NVN(nvnTexturePoolSetDebugLabel, void, NVNtexturePool *p, const char *label) { (void)p; (void)label; }
+NVN(nvnSamplerPoolSetDebugLabel, void, NVNsamplerPool *p, const char *label) { (void)p; (void)label; }
+NVN(nvnTextureSetDebugLabel, void, NVNtexture *t, const char *label) { (void)t; (void)label; }
+NVN(nvnSamplerSetDebugLabel, void, NVNsampler *s, const char *label) { (void)s; (void)label; }
+NVN(nvnSyncSetDebugLabel, void, NVNsync *s, const char *label) { (void)s; (void)label; }
+NVN(nvnCommandBufferSetDebugLabel, void, NVNcommandBuffer *cb, const char *label) { (void)cb; (void)label; }
 NVN(nvnBufferFinalize, void, NVNbuffer *bf) { buf_t *o = BF(bf); if (o->mem) nvn_dirty_remove_range(o->mem); o->magic = 0; }
 NVN(nvnBufferMap, void *, const NVNbuffer *bf) { return BF(bf)->mem; }
 NVN(nvnBufferGetAddress, NVNbufferAddress, const NVNbuffer *bf) { return (NVNbufferAddress)BF(bf)->mem; }
-NVN(nvnBufferFlushMappedRange, void, const NVNbuffer *bf, ptrdiff_t off, size_t n) { (void)bf; (void)off; (void)n; }
-NVN(nvnBufferInvalidateMappedRange, void, const NVNbuffer *bf, ptrdiff_t off, size_t n) { (void)bf; (void)off; (void)n; }
+NVN(nvnBufferFlushMappedRange, void, const NVNbuffer *bf, ptrdiff_t off, size_t n) { (void)bf; (void)off; (void)n; atomic_fetch_add(&g_rb[RB_BUFFLUSH], 1); }
+NVN(nvnBufferInvalidateMappedRange, void, const NVNbuffer *bf, ptrdiff_t off, size_t n) { (void)bf; (void)off; (void)n; atomic_fetch_add(&g_rb[RB_BUFINVAL], 1); }
 NVN(nvnBufferGetMemoryPool, NVNmemoryPool *, const NVNbuffer *bf) { return (NVNmemoryPool *)BF(bf)->pool; }
 NVN(nvnBufferGetMemoryOffset, ptrdiff_t, const NVNbuffer *bf) { return (ptrdiff_t)BF(bf)->off; }
 NVN(nvnBufferGetSize, size_t, const NVNbuffer *bf) { return (size_t)BF(bf)->size; }
@@ -365,6 +473,8 @@ NVN(nvnSamplerPoolRegisterSampler, void, const NVNsamplerPool *sp, int id, const
 NVN(nvnTextureBuilderSetDefaults, void, NVNtextureBuilder *b) {
     NVNdevice *dev = TB(b)->dev; memset(b, 0, sizeof(tex_builder_t)); TB(b)->dev = dev;
     TB(b)->d.target = NVN_TEXTURE_TARGET_2D; TB(b)->d.width = TB(b)->d.height = TB(b)->d.depth = TB(b)->d.levels = 1;
+    TB(b)->swz[0] = NVN_TEXTURE_SWIZZLE_R; TB(b)->swz[1] = NVN_TEXTURE_SWIZZLE_G;
+    TB(b)->swz[2] = NVN_TEXTURE_SWIZZLE_B; TB(b)->swz[3] = NVN_TEXTURE_SWIZZLE_A;   // 恒等：0 是 ZERO，memset 出来不能当默认 | identity: 0 means ZERO, so memset's zeros are not the default
 }
 NVN(nvnTextureBuilderSetDevice, void, NVNtextureBuilder *b, NVNdevice *d) { TB(b)->dev = d; }
 NVN(nvnTextureBuilderSetFlags, void, NVNtextureBuilder *b, int f) { TB(b)->d.flags = f; }
@@ -384,6 +494,36 @@ NVN(nvnTextureBuilderSetPackagedTextureLayout, void, NVNtextureBuilder *b, const
     TB(b)->has_layout = l != NULL; if (l) memcpy(TB(b)->layout, l->layout, 8);
     TB(b)->d.pkg_block_h = l ? l->layout[0] + 1 : 0;
 }
+// 通道改写与深度/模板读模式。改写真做（回放层建视图时按它填 VkImageView 的 components）：
+// NVN 的枚举是 ZERO=0 ONE=1 R=2 G=3 B=4 A=5，Vulkan 的是 IDENTITY=0 ZERO=1 ONE=2 R=3 G=4 B=5 A=6，
+// 所以非恒等改写就是 +1；恒等不改（保留原来「不足四分量把 A 补成 1.0」那条修正）。
+// 读模式只记录：Maleoon 这条路上深度/模板是一起建的，没有 NVN 那种「按分量选读哪一半」的视图，
+// 记下来只为 Get 回真值，不再报未实现。
+// Channel swizzle and depth-stencil read mode. The swizzle is real (the replay layer fills VkImageView.components from it):
+// the NVN enum is ZERO=0 ONE=1 R=2 G=3 B=4 A=5 while Vulkan's is IDENTITY=0 ZERO=1 ONE=2 R=3 G=4 B=5 A=6, so a non-identity
+// swizzle is +1. Identity is left alone, which keeps the "substitute A=1.0 for formats with fewer than four components" fix.
+// The read mode is only recorded: on Maleoon depth and stencil are created together, so there is no NVN-style per-half view;
+// storing it makes Get truthful and stops the unimplemented report.
+NVN(nvnTextureBuilderSetSwizzle, void, NVNtextureBuilder *b, NVNtextureSwizzle r, NVNtextureSwizzle g,
+    NVNtextureSwizzle bb, NVNtextureSwizzle a) {
+    tex_builder_t *t = TB(b);
+    t->swz[0] = (uint8_t)r; t->swz[1] = (uint8_t)g; t->swz[2] = (uint8_t)bb; t->swz[3] = (uint8_t)a;
+    t->swz_set = 1;
+}
+NVN(nvnTextureBuilderGetSwizzle, void, const NVNtextureBuilder *b, NVNtextureSwizzle *r, NVNtextureSwizzle *g,
+    NVNtextureSwizzle *bb, NVNtextureSwizzle *a) {
+    const tex_builder_t *t = (const tex_builder_t *)b;
+    if (r) *r = (NVNtextureSwizzle)t->swz[0]; if (g) *g = (NVNtextureSwizzle)t->swz[1];
+    if (bb) *bb = (NVNtextureSwizzle)t->swz[2]; if (a) *a = (NVNtextureSwizzle)t->swz[3];
+}
+NVN(nvnTextureBuilderSetDepthStencilMode, void, NVNtextureBuilder *b, NVNtextureDepthStencilMode m) { TB(b)->ds_mode = (uint8_t)m; }
+NVN(nvnTextureBuilderGetDepthStencilMode, NVNtextureDepthStencilMode, const NVNtextureBuilder *b) {
+    return (NVNtextureDepthStencilMode)((const tex_builder_t *)b)->ds_mode;
+}
+// ZCull 是 Tegra 独有的深度剔除压缩存储；Vulkan 侧没有对应物，尺寸报 0、存取当空操作（语义上就是「这平台没这功能」）。
+// ZCull is Tegra-only compressed early-Z storage. There is no Vulkan counterpart: the size is 0 and save/restore are no-ops
+// (which is exactly "this platform has no such feature").
+NVN(nvnTextureBuilderGetZCullStorageSize, size_t, const NVNtextureBuilder *b) { (void)b; return 0; }
 NVN(nvnTextureBuilderGetFlags, NVNtextureFlags, const NVNtextureBuilder *b) { return (NVNtextureFlags)((const tex_builder_t *)b)->d.flags; }
 static uint64_t g_layout_logged;
 static void log_layout(const tex_builder_t *b, const nvn_texlayout *L) {
@@ -408,6 +548,9 @@ NVN(nvnTextureInitialize, NVNboolean, NVNtexture *t, const NVNtextureBuilder *b)
     memset(o, 0, sizeof *o);
     o->magic = MAGIC('T', 'E', 'X', 0); o->d = s->d; o->pool = s->pool; o->off = s->off;
     o->has_layout = s->has_layout; memcpy(o->layout, s->layout, 8);
+    o->swz_set = s->swz_set; memcpy(o->swz, s->swz, 4); o->ds_mode = s->ds_mode;
+    if (!o->swz_set) { o->swz[0] = NVN_TEXTURE_SWIZZLE_R; o->swz[1] = NVN_TEXTURE_SWIZZLE_G;
+                       o->swz[2] = NVN_TEXTURE_SWIZZLE_B; o->swz[3] = NVN_TEXTURE_SWIZZLE_A; }
     nvn_tex_layout(&o->d, &o->L);
     o->mem = s->pool && s->pool->mem ? s->pool->mem + s->off : NULL;
     o->serial = nvn_new_serial();
@@ -433,6 +576,41 @@ NVN(nvnTextureGetSamples, int, const NVNtexture *t) { return CTX(t)->d.samples; 
 // out a pointer, so return a pointer (see the buffer entry at hle_nvn.c:340).
 NVN_NOPROTO(nvnTextureGetMemoryPool, NVNmemoryPool *, const NVNtexture *t) { return (NVNmemoryPool *)(void *)CTX(t)->pool; }
 NVN(nvnTextureGetMemoryOffset, ptrdiff_t, const NVNtexture *t) { return (ptrdiff_t)CTX(t)->off; }
+NVN(nvnTextureGetSwizzle, void, const NVNtexture *t, NVNtextureSwizzle *r, NVNtextureSwizzle *g,
+    NVNtextureSwizzle *bb, NVNtextureSwizzle *a) {
+    const tex_t *o = CTX(t);
+    if (r) *r = (NVNtextureSwizzle)o->swz[0]; if (g) *g = (NVNtextureSwizzle)o->swz[1];
+    if (bb) *bb = (NVNtextureSwizzle)o->swz[2]; if (a) *a = (NVNtextureSwizzle)o->swz[3];
+}
+NVN(nvnTextureGetDepthStencilMode, NVNtextureDepthStencilMode, const NVNtexture *t) {
+    return (NVNtextureDepthStencilMode)CTX(t)->ds_mode;
+}
+NVN(nvnTextureGetZCullStorageSize, size_t, const NVNtexture *t) { (void)t; return 0; }   // 见上面 Builder 那条 | see the builder entry above
+// NVNtextureView：HSS 走的是「建贴图时定描述符」那条，视图对象只被当参数传来传去并回读字段；
+// 这里存下改写与读模式，让 Get 回真值（视图级的改写在 mtl_reg_tex 之后由绑定处再覆盖，等真用到再做）。
+// NVNtextureView: HSS defines the descriptor when creating the texture and only passes view objects around and reads fields
+// back. This stores the swizzle and read mode so Get answers truthfully (a per-view override would be applied at bind time,
+// which nothing reaches yet).
+#define VW(v) ((view_t *)(v))
+NVN(nvnTextureViewSetSwizzle, void, NVNtextureView *v, NVNtextureSwizzle r, NVNtextureSwizzle g,
+    NVNtextureSwizzle b, NVNtextureSwizzle a) {
+    VW(v)->swz[0] = (uint8_t)r; VW(v)->swz[1] = (uint8_t)g; VW(v)->swz[2] = (uint8_t)b; VW(v)->swz[3] = (uint8_t)a;
+    VW(v)->swz_set = 1;
+}
+NVN(nvnTextureViewGetSwizzle, NVNboolean, const NVNtextureView *v, NVNtextureSwizzle *r, NVNtextureSwizzle *g,
+    NVNtextureSwizzle *b, NVNtextureSwizzle *a) {
+    const view_t *o = (const view_t *)v;
+    if (r) *r = (NVNtextureSwizzle)o->swz[0]; if (g) *g = (NVNtextureSwizzle)o->swz[1];
+    if (b) *b = (NVNtextureSwizzle)o->swz[2]; if (a) *a = (NVNtextureSwizzle)o->swz[3];
+    return o->swz_set ? 1 : 0;
+}
+NVN(nvnTextureViewSetDepthStencilMode, void, NVNtextureView *v, NVNtextureDepthStencilMode m) {
+    VW(v)->ds_mode = (uint8_t)m; VW(v)->ds_set = 1;
+}
+NVN(nvnTextureViewGetDepthStencilMode, NVNboolean, const NVNtextureView *v, NVNtextureDepthStencilMode *m) {
+    if (m) *m = (NVNtextureDepthStencilMode)((const view_t *)v)->ds_mode;
+    return ((const view_t *)v)->ds_set ? 1 : 0;
+}
 NVN(nvnTextureCompare, NVNboolean, const NVNtexture *a, const NVNtexture *b) {
     const tex_t *x = CTX(a), *y = CTX(b);
     return !memcmp(&x->d, &y->d, sizeof x->d) && x->mem == y->mem;
@@ -459,6 +637,7 @@ NVN(nvnTextureGetViewOffset, ptrdiff_t, const NVNtexture *t, const NVNtextureVie
 // CPU 读贴图（NVN ReadTexels）：预排布贴图以池内存为真值（解排布直读），GPU 写出的贴图从 MTLTexture 读回（nvn_mtl.m）
 // CPU texture read (NVN ReadTexels): for packaged textures the pool memory is the ground truth (de-layout and read directly); GPU-written textures are read back from the MTLTexture (nvn_mtl.m)
 static void read_texels(const tex_t *o, const view_t *v, const NVNcopyRegion *r, uint8_t *dst, ptrdiff_t row, ptrdiff_t img) {
+    atomic_fetch_add(&g_rb[RB_TEXREAD], 1);
     int bw, bh, bpb = nvn_fmt_bpb(o->d.format, &bw, &bh);
     uint32_t wb = (uint32_t)((r->width + bw - 1) / bw) * bpb, hb = (uint32_t)(r->height + bh - 1) / bh;
     if (!row) row = wb;
@@ -472,7 +651,10 @@ NVN(nvnTextureReadTexels, void, const NVNtexture *t, const NVNtextureView *v, co
 NVN(nvnTextureReadTexelsStrided, void, const NVNtexture *t, const NVNtextureView *v, const NVNcopyRegion *r, void *dst, ptrdiff_t row, ptrdiff_t img) {
     read_texels(CTX(t), (const view_t *)v, r, dst, row, img);
 }
-NVN(nvnTextureInvalidateTexels, void, const NVNtexture *t, const NVNtextureView *v, const NVNcopyRegion *r) { (void)t; (void)v; (void)r; }
+NVN(nvnTextureInvalidateTexels, void, const NVNtexture *t, const NVNtextureView *v, const NVNcopyRegion *r) {
+    (void)t; (void)v; (void)r;
+    atomic_fetch_add(&g_rb[RB_TEXINVAL], 1);
+}
 // CPU 写贴图（老接口 WriteTexels）：源是行线性的块数据（不带 Strided 的那版按区域宽紧排，带的那版给行距 / 片距），
 // 落点按 NVN 规矩仍是这张贴图自己的池存储。LINEAR 存储按行距直接覆盖；块线性先整级整层解排布、把区域补进去、
 // 再整级整层排回去（两个方向都用 dm/gfx/tex 里逐页核过的例程）。这些池页可能正被写保护，所以每刀先
@@ -701,8 +883,9 @@ NVN(nvnQueueFinalize, void, NVNqueue *q) { ((queue_t *)q)->magic = 0; }
 NVN(nvnQueueGetError, NVNqueueGetErrorResult, NVNqueue *q, NVNqueueErrorInfo *info) {
     (void)q; if (info) memset(info, 0, sizeof *info); return NVN_QUEUE_GET_ERROR_RESULT_GPU_NO_ERROR;
 }
-NVN(nvnQueueFlush, void, NVNqueue *q) { (void)q; }
-NVN(nvnQueueFinish, void, NVNqueue *q) { (void)q; mtl_finish(); }
+static void cmd_icb_flush(void);             // 定义在下方设备自带命令缓冲一节 | defined in the device-owned-buffer section below
+NVN(nvnQueueFlush, void, NVNqueue *q) { (void)q; cmd_icb_flush(); }
+NVN(nvnQueueFinish, void, NVNqueue *q) { (void)q; cmd_icb_flush(); mtl_finish(); }
 
 // ---------- 命令缓冲：录进游戏的命令内存，提交时执行 CPU 可见副作用 ----------
 // ---------- Command buffer: record into the game's command memory, perform CPU-visible side effects at submit ----------
@@ -766,6 +949,69 @@ static uint8_t *hostseg_take(void) {
     if (t == 1 || t % 256 == 0) LOG("[nvn] 游戏的命令内存池已空，宿主补段（累计 %u 次，帧 %llu）", t, (unsigned long long)f);
     return m;
 }
+// 空命令缓冲改记进「设备自带命令缓冲」（HSS v21 / v22 逐步钉死）：Unity 的贴图上传取的是它自己上下文对象里的一个字段——
+// main+0x614388 `ldur x8, [x29, #-8]`（同一个对象还用到 +0x67b0，远大于 NVNdevice 的 0x3000，所以它不是 NVNdevice），
+// main+0x614398 `ldr x0, [x8, #0x24d0]`，main+0x6143ac `blr x8` 调过去就是 nvnCommandBufferCopyBufferToTexture。
+// 那个字段在我们这儿一直是 0：v22 往 NVNdevice+0x24d0 填过，读到的还是 0——它读的根本不是同一个对象。
+// 于是上传记录原先全被 cmd_pad_alloc 垫掉，一张 Vk 贴图也没建出来（[tex] 计数 0），屏幕整块黑。
+// 这里改成记进一条宿主自带的命令缓冲，并在每条记录写完载荷后收口执行：空句柄在 NVN 语义里是无效参数，而客体想要的就是
+// 「那条用来上传的命令缓冲」，补一条真缓冲进去按序执行，比丢弃记录更接近真机；红线照报。
+// v23 定下两个必须收口的时机：一是「下一条录制前」会把一批里的最后一条压到下一次提交（那次提交根本没来），二是收口时不能
+// 只调 mtl_exec——回放要求命令缓冲已开，否则上传全记成「通道内」直接返回（见 icb_drain 上方）。
+// Null command buffers now record into a host-owned "device internal" buffer (pinned down over HSS v21 / v22): Unity's texture
+// upload reads a field of its own context object - main+0x614388 `ldur x8, [x29, #-8]` (the same object also uses +0x67b0, far past
+// NVNdevice's 0x3000, so it is not the NVNdevice), main+0x614398 `ldr x0, [x8, #0x24d0]`, main+0x6143ac `blr x8` landing on
+// nvnCommandBufferCopyBufferToTexture. That field was always 0 for us - v22 filled NVNdevice+0x24d0 and it still read 0, because the
+// object being read is not the same one. So every upload record went into cmd_pad_alloc and was dropped, not a single Vk image was
+// created ([tex] count 0) and the screen stayed black. A null handle is an invalid argument in NVN, and what the caller wants is
+// "the command buffer used for uploads", so appending to a real buffer and executing the records in order is closer to the console
+// than dropping them. The fault line stays. v23 settled the two conditions the drain must meet: draining "before the next record"
+// leaves the last record of a burst parked until a submit that never arrives, and a bare mtl_exec is not enough because the replay
+// needs an open command buffer (see icb_drain).
+#define ICB_SZ (8u << 20)
+static cmd_t g_icb;
+static uint8_t *g_icb_mem;
+static pthread_mutex_t g_icb_mu = PTHREAD_MUTEX_INITIALIZER;   // 录制线程是 Unity 的工作线程、提交线程是渲染线程：这条缓冲两边都要动
+                                                                // Recording happens on Unity's worker thread, submitting on the render thread: both sides touch this buffer
+static cmd_t *icb_get(void) {
+    if (g_icb.seg0) return &g_icb;
+    g_icb_mem = malloc(ICB_SZ);
+    if (!g_icb_mem) return NULL;
+    g_icb.magic = MAGIC('C', 'M', 'D', 'B');
+    g_icb.seg0 = g_icb.cur = g_icb_mem; g_icb.end = g_icb_mem + ICB_SZ;
+    LOG("[nvn] 设备自带命令缓冲启用（宿主自备命令内存 %u MB 段）", ICB_SZ >> 20);
+    return &g_icb;
+}
+// 收口执行：这批记录里没有 BeginRecording / EndRecording，所以不能走游戏的提交句柄那条路，要自己开一趟真提交。
+// v23 实测就是缺这一层：88 字节（正好一条 CopyBufferToTexture）被 mtl_exec 直接放掉，回放里 !g_cb 一律记成「通道内」，
+// do_copy_b2t 第一行就返回，[tex] 一直是 0——上传一条也没落到 GPU。
+// Drain: these records have no BeginRecording / EndRecording, so they cannot go through the game's command-handle path and must
+// open their own submission. v23 measured exactly this gap: 88 bytes (one CopyBufferToTexture) went straight into mtl_exec, where
+// !g_cb made every upload count as 「通道内」 and do_copy_b2t returned on its first line - [tex] stayed 0, nothing reached the GPU.
+static void icb_drain(void) {                                        // 调用方须持 g_icb_mu | caller must hold g_icb_mu
+    cmd_t *o = &g_icb;
+    static unsigned n;
+    if (!o->seg0 || !o->cur || o->cur == o->seg0) return;            // 没有待执行的记录 | nothing pending
+    if (!mtl_sub_idle()) {                                           // 游戏那条提交还开着：这批留到它交出去之后，绝不插进别人的命令缓冲
+        static unsigned y;                                           // A submission of the game's is still open - wait for the next safe point
+        if (++y == 1 || y % 512 == 0) LOG("[nvn] 设备自带命令缓冲收口让路（当前提交没空出命令池，累计 %u 次）", y);
+        return;
+    }
+    unsigned bytes = (unsigned)(o->cur - o->seg0);
+    uint8_t *head = o->seg0, *tail = o->cur;
+    put_hdr(tail, OP_END, 8);                                        // 段尾收口：回放到这里返回 | terminate the chain so the replay returns
+    mtl_sub_begin();
+    mtl_exec(head);
+    mtl_exec_rest(NULL, 0);
+    mtl_sub_commit();
+    o->cur = o->seg0; o->end = o->seg0 + ICB_SZ; o->recording = 0;   // 提交里等完栅栏，同一段接着用 | the commit waited its fence; reuse the segment
+    if (++n == 1 || n <= 8 || n % 512 == 0) LOG("[nvn] 设备自带命令缓冲收口执行 第 %u 次（本段 %u 字节）", n, bytes);
+}
+static void cmd_icb_flush(void) {
+    pthread_mutex_lock(&g_icb_mu);
+    icb_drain();
+    pthread_mutex_unlock(&g_icb_mu);
+}
 NVN(nvnCommandBufferAddCommandMemory, void, NVNcommandBuffer *c, const NVNmemoryPool *p, ptrdiff_t off, size_t n) {
     const pool_t *pl = (const pool_t *)p;
     if (!pl || n < 64) { if (cs_on()) { pthread_mutex_lock(&g_cs_mu); g_cs.hostseg++; pthread_mutex_unlock(&g_cs_mu); } cmd_new_segment(CB(c), hostseg_take(), HOSTSEG_SZ); return; }
@@ -776,8 +1022,53 @@ NVN(nvnCommandBufferAddCommandMemory, void, NVNcommandBuffer *c, const NVNmemory
 NVN(nvnCommandBufferAddControlMemory, void, NVNcommandBuffer *c, void *m, size_t n) { (void)c; (void)m; (void)n; }
 // 取一条记录的空间；不够则按 NVN 约定回调游戏补命令内存
 // Get space for one record; if not enough, call back into the game per the NVN convention to add command memory
-static uint8_t *cmd_alloc(cmd_t *o, uint32_t size) {
+// 空命令缓冲（o == NULL）：客体把「还没建立的设备/缓冲上下文」当指针送进 NVN 调用时走到这里（HSS v15 实测：
+// UnityGfxDeviceWorker 的贴图上传取 [dev+0x24d0] 得到 0，转手就拿 0 当命令缓冲调 nvnCommandBuffer*，原先读 o->cur 崩在 addr=0x8）。
+// 真机 NVN 对空句柄是返回错误段错误不了，所以这里也不能掉进程：给一块一次性垫子把这条记录丢掉，红线报名。
+// NULL command buffer (o == NULL): the guest hands an not-yet-established device/buffer context straight into an NVN call
+// (measured in HSS v15: the UnityGfxDeviceWorker's texture upload read [dev+0x24d0], got 0, used it as the command buffer in
+// nvnCommandBuffer*, and the old code segfaulted reading o->cur at addr=0x8). Real NVN rejects a null handle rather than
+// killing the process, so neither may we: hand back a throwaway pad, drop this record and raise a fault line.
+// 客体调用点写成「模块+偏移」：跳板是 br 转发、不动 x30，所以 h_ 函数里取的 __builtin_return_address(0) 就是客体那条
+// bl 的返回地址，能直接拿去反汇编。（v20 实测：贴图上传那 9 条 CopyBufferToTexture 拿到的是空命令缓冲，只报了接口名，
+// 报不出是谁把空句柄送进来的。）
+// Write the guest call site as "module+offset": the thunk forwards with br and never touches x30, so inside an h_ function
+// __builtin_return_address(0) is the return address of the guest's bl, which can be taken straight into a disassembler.
+// (Measured in v20: the 9 CopyBufferToTexture calls of the texture upload were handed a null command buffer; the log named the API
+// but not who passed the null handle in.)
+static const char *guest_pc(uint64_t pc) {
+    static _Thread_local char buf[48];
+    module_t *m = pc ? module_of((void *)pc) : NULL;
+    if (m) snprintf(buf, sizeof buf, "%s+%#llx", m->name, (unsigned long long)(pc - (uint64_t)m->base));
+    else snprintf(buf, sizeof buf, "%#llx", (unsigned long long)pc);
+    return buf;
+}
+static uint8_t *cmd_pad_alloc(uint32_t size, const char *nm, uint64_t from)
+{
+    static _Thread_local uint8_t *pad; static _Thread_local size_t pad_sz; static _Thread_local unsigned pad_off;
+    static _Atomic unsigned n;
+    size_t sz = (size + 24u + 15u) & ~(size_t)15u;   // 头 + 载荷 + 余量，调用方还会自己 memset 到 sz-8 | header + payload + slack, the caller memsets to sz-8
+    if (sz > pad_sz) { free(pad); pad_sz = sz < 65536 ? 65536 : (sz + 65536); pad = calloc(1, pad_sz); pad_off = 0; }
+    if ((size_t)pad_off + sz > pad_sz) pad_off = 0;
+    uint8_t *p = pad + pad_off; pad_off += (unsigned)sz;
+    unsigned k = atomic_fetch_add(&n, 1);
+    // 报的是接口名（调用点用 __func__，NVN 宏里的函数名就是客体调的那个 nvn*）：这才指出「哪一条 NVN 调用拿到了空句柄」。
+    // The log carries the API name (call sites pass __func__, and inside the NVN macro that name is exactly the nvn* the guest called):
+    // it says which NVN call was handed the null handle.
+    if (k < 24) LOG("【红】NVN 空命令缓冲：%s 需 %#x 字节（累计 %u 次，线程 %p，客体调用点 %s，这条记录丢弃）", nm ? nm : "?", size, k + 1, (void *)pthread_self(), guest_pc(from));
+    else if (k == 24) LOG("【红】空命令缓冲 已累计 %u 次，后续不再逐条打印", k + 1);
+    return p;
+}
+static uint8_t *cmd_null_alloc(uint32_t size, const char *nm, uint64_t from);   // 定义在下方 | defined below
+static uint8_t *cmd_alloc(cmd_t *o, uint32_t size, const char *nm, uint64_t from) {
+    if (!o) return cmd_null_alloc(size, nm, from);
     size = (size + 7) & ~7u;
+    if (o == &g_icb) {
+        if (!o->cur || o->cur + size + OP_RESERVE > o->end) icb_drain();   // 段满了先收口执行，再从头录（调用方已持锁）| device-owned buffer: drain, then record from the segment start again (caller holds g_icb_mu)
+        // 收口让路（游戏那条提交还占着命令池）时段是真的没空：这条只能丢，不能 die——die 会把整轮带上屏幕一起没了。
+        // If the drain had to yield, the segment really is full: drop this record rather than die, or the whole run goes with it.
+        if (!o->cur || o->cur + size + OP_RESERVE > o->end) return cmd_pad_alloc(size, nm, from);
+    }
     for (int tries = 0; !o->cur || o->cur + size + OP_RESERVE > o->end; tries++) {
         if (!o->cb || tries == 2) die("NVN 命令内存耗尽且无法补充（cb=%p）", (void *)o->cb);
         if (cs_on()) { pthread_mutex_lock(&g_cs_mu); g_cs.cbs++; pthread_mutex_unlock(&g_cs_mu); }
@@ -786,62 +1077,85 @@ static uint8_t *cmd_alloc(cmd_t *o, uint32_t size) {
     if (cs_on()) { pthread_mutex_lock(&g_cs_mu); g_cs.bytes += size; g_cs.recs++; pthread_mutex_unlock(&g_cs_mu); }
     uint8_t *p = o->cur; o->cur += size; put_hdr(p, 0, size); return p;
 }
+// 空句柄落进自带缓冲：追加这一条的空间；载荷由调用方在返回后填好，填完由各条记录末尾的 REC_DRAIN 就地收口执行
+// A null handle lands in the internal buffer: this reserves the record; the caller fills the payload after the return, and
+// REC_DRAIN at the end of each such API drains it there (v23 的「先收口上一条」会把一批里的最后一条一直压到下一次提交，实测定了这一点).
+static uint8_t *cmd_null_alloc(uint32_t size, const char *nm, uint64_t from) {
+    cmd_t *o = icb_get();
+    if (!o) return cmd_pad_alloc(size, nm, from);
+    static _Atomic unsigned n;
+    unsigned k = atomic_fetch_add(&n, 1);
+    if (k < 24) LOG("【红】NVN 空命令缓冲：%s 需 %#x 字节（累计 %u 次，线程 %p，客体调用点 %s）→ 记进设备自带命令缓冲", nm ? nm : "?", size, k + 1, (void *)pthread_self(), guest_pc(from));
+    else if (k == 24) LOG("【红】空命令缓冲 已累计 %u 次，后续不再逐条打印", k + 1);
+    pthread_mutex_lock(&g_icb_mu);
+    uint8_t *p = cmd_alloc(o, size, nm, from);
+    pthread_mutex_unlock(&g_icb_mu);
+    return p;
+}
+// 空句柄那条记录：载荷已填完，就地收口执行。不等下一次提交——实测上传那 9 条走的是 Unity 工作线程，
+// 提交点在下一次 nvnQueueSubmitCommands，靠它收口就永远差一条。
+// The record that came from a null handle now has its payload: drain in place. Waiting for the next submission lost the last
+// record of every burst - the uploads run on Unity's worker thread and the submit comes later, measured in v23.
+#define REC_DRAIN(c) do { if (!(c)) cmd_icb_flush(); } while (0)
 NVN(nvnCommandBufferBeginRecording, void, NVNcommandBuffer *c) {
     cmd_t *o = CB(c);
     if (o->recording) LOG("【红】BeginRecording 重入");
     o->recording = 1;
-    uint8_t *p = cmd_alloc(o, 8); put_hdr(p, OP_BEGIN, 8); o->begin = p;
+    uint8_t *p = cmd_alloc(o, 8, __func__, (uint64_t)__builtin_return_address(0)); put_hdr(p, OP_BEGIN, 8); o->begin = p;
 }
 NVN(nvnCommandBufferEndRecording, NVNcommandHandle, NVNcommandBuffer *c) {
     cmd_t *o = CB(c);
-    uint8_t *p = cmd_alloc(o, 8); put_hdr(p, OP_END, 8);
+    uint8_t *p = cmd_alloc(o, 8, __func__, (uint64_t)__builtin_return_address(0)); put_hdr(p, OP_END, 8);
     o->recording = 0;
     return (NVNcommandHandle)o->begin;
 }
 NVN(nvnCommandBufferIsRecording, NVNboolean, const NVNcommandBuffer *c) { return ((const cmd_t *)c)->recording != 0; }
 NVN(nvnCommandBufferCopyCommands, void, NVNcommandBuffer *c, int n, const NVNcommandHandle *h) {
-    for (int i = 0; i < n; i++) { uint8_t *p = cmd_alloc(CB(c), 16); put_hdr(p, OP_CALL, 16); memcpy(p + 8, &h[i], 8); }
+    for (int i = 0; i < n; i++) { uint8_t *p = cmd_alloc(CB(c), 16, __func__, (uint64_t)__builtin_return_address(0)); put_hdr(p, OP_CALL, 16); memcpy(p + 8, &h[i], 8); }
 }
 NVN(nvnCommandBufferSignalEvent, void, NVNcommandBuffer *c, const NVNevent *e, NVNeventSignalMode m, NVNeventSignalLocation loc, int flags, uint32_t v) {
     (void)loc; (void)flags;
-    uint8_t *p = cmd_alloc(CB(c), 24); put_hdr(p, OP_SIGNAL_EVENT, 24);
+    uint8_t *p = cmd_alloc(CB(c), 24, __func__, (uint64_t)__builtin_return_address(0)); put_hdr(p, OP_SIGNAL_EVENT, 24);
     const ev_t *ev = (const ev_t *)e; volatile uint32_t *val = ev->val; uint32_t mm = m;
     memcpy(p + 8, &val, 8); memcpy(p + 16, &mm, 4); memcpy(p + 20, &v, 4);
 }
 NVN(nvnCommandBufferResetCounter, void, NVNcommandBuffer *c, NVNcounterType t) {
-    uint8_t *p = cmd_alloc(CB(c), 16); put_hdr(p, OP_RESET_COUNTER, 16); uint64_t tt = t; memcpy(p + 8, &tt, 8);
+    uint8_t *p = cmd_alloc(CB(c), 16, __func__, (uint64_t)__builtin_return_address(0)); put_hdr(p, OP_RESET_COUNTER, 16); uint64_t tt = t; memcpy(p + 8, &tt, 8);
 }
 NVN(nvnCommandBufferReportCounter, void, NVNcommandBuffer *c, NVNcounterType t, NVNbufferAddress a) {
-    uint8_t *p = cmd_alloc(CB(c), 24); put_hdr(p, OP_REPORT_COUNTER, 24); uint64_t tt = t; memcpy(p + 8, &tt, 8); memcpy(p + 16, &a, 8);
+    uint8_t *p = cmd_alloc(CB(c), 24, __func__, (uint64_t)__builtin_return_address(0)); put_hdr(p, OP_REPORT_COUNTER, 24); uint64_t tt = t; memcpy(p + 8, &tt, 8); memcpy(p + 16, &a, 8);
 }
 NVN(nvnCommandBufferCopyBufferToBuffer, void, NVNcommandBuffer *c, NVNbufferAddress src, NVNbufferAddress dst, size_t n, int flags) {
     (void)flags;
-    uint8_t *p = cmd_alloc(CB(c), 32); put_hdr(p, OP_COPY_B2B, 32); uint64_t nn = n;
+    uint8_t *p = cmd_alloc(CB(c), 32, __func__, (uint64_t)__builtin_return_address(0)); put_hdr(p, OP_COPY_B2B, 32); uint64_t nn = n;
     memcpy(p + 8, &src, 8); memcpy(p + 16, &dst, 8); memcpy(p + 24, &nn, 8);
+    REC_DRAIN(c);
 }
 // uniform 更新：数据在录制时拷进命令内存（NVN 语义：录制后调用方可改原数据），提交时写进缓冲
 // uniform update: the data is copied into command memory at record time (NVN semantics: the caller may modify the original data after recording) and written into the buffer at submit
 NVN(nvnCommandBufferUpdateUniformBuffer, void, NVNcommandBuffer *c, NVNbufferAddress buf, size_t bufsz, ptrdiff_t off, size_t n, const void *data) {
     (void)bufsz;
     uint32_t sz = (uint32_t)(24 + n);
-    uint8_t *p = cmd_alloc(CB(c), sz); put_hdr(p, OP_UPDATE_UB, (sz + 7) & ~7u);
+    uint8_t *p = cmd_alloc(CB(c), sz, __func__, (uint64_t)__builtin_return_address(0)); put_hdr(p, OP_UPDATE_UB, (sz + 7) & ~7u);
     uint64_t dst = buf + off, nn = n; memcpy(p + 8, &dst, 8); memcpy(p + 16, &nn, 8); memcpy(p + 24, data, n);
 }
 
 // ---------- 渲染命令：参数按 nvn_obj.h 的载荷格式录进命令内存，回放见 nvn_mtl.m ----------
 // ---------- Render commands: parameters are recorded into command memory in the payload format of nvn_obj.h; for replay see nvn_mtl.m ----------
-static void *rec(NVNcommandBuffer *c, uint32_t op, size_t payload) {
+static void *rec(NVNcommandBuffer *c, uint32_t op, size_t payload, const char *nm, uint64_t from) {
     uint32_t sz = (uint32_t)((8 + payload + 7) & ~(size_t)7);
-    uint8_t *p = cmd_alloc(CB(c), sz); put_hdr(p, op, sz);
+    cmd_t *o = CB(c);
+    uint8_t *p = o ? cmd_alloc(o, sz, nm, from) : cmd_null_alloc(sz, nm, from);   // 空句柄：记进设备自带命令缓冲，见 cmd_null_alloc 上方注释 | null handle: record into the device's own buffer, see the comment above cmd_null_alloc
+    put_hdr(p, op, sz);
     memset(p + 8, 0, sz - 8);
     return p + 8;
 }
-#define REC(c, OP, T) ((T *)rec((c), (OP), sizeof(T)))
+#define REC(c, OP, T) ((T *)rec((c), (OP), sizeof(T), __func__, (uint64_t)__builtin_return_address(0)))
 // 带数组的绑定记录按实际个数分配：前缀字段 + n 个元素（回放端只读前 n 个）。原先按最大个数定长记（绑顶点缓冲 272 字节、绑贴图 / 采样器 280 字节，
 // 实际常只有 1–2 个），空尾占每帧命令字节的四到五成；88 级法师的高级属性页每帧录 12.5 MB，把游戏自己的命令内存池（约每帧 105 段 × 128 KB）用空
 // Binding records with arrays are allocated by the actual count: prefix fields + n elements (the replay side reads only the first n). Previously they were recorded at fixed length for the maximum count (bind vertex buffers 272 bytes, bind textures / samplers 280 bytes,
 // while there are usually only 1–2 in practice), and the empty tail took 40–50% of the command bytes per frame; the advanced stats page of the level 88 sorceress recorded 12.5 MB per frame, using up the game's own command memory pool (about 105 segments x 128 KB per frame)
-#define RECN(c, OP, T, ARR, N) ((T *)rec((c), (OP), offsetof(T, ARR) + sizeof(((T *)0)->ARR[0]) * (size_t)(N)))
+#define RECN(c, OP, T, ARR, N) ((T *)rec((c), (OP), offsetof(T, ARR) + sizeof(((T *)0)->ARR[0]) * (size_t)(N), __func__, (uint64_t)__builtin_return_address(0)))
 static void copy_view(view_t *dst, uint8_t *has, const NVNtextureView *v) { *has = v != NULL; if (v) *dst = *(const view_t *)v; }
 NVN(nvnCommandBufferSetRenderTargets, void, NVNcommandBuffer *c, int n, const NVNtexture *const *ct, const NVNtextureView *const *cv,
     const NVNtexture *dt, const NVNtextureView *dv) {
@@ -856,6 +1170,13 @@ NVN(nvnCommandBufferClearColor, void, NVNcommandBuffer *c, int index, const floa
 NVN(nvnCommandBufferClearDepthStencil, void, NVNcommandBuffer *c, float depth, uint32_t dmask, int stencil, int smask) {
     p_clear_ds *r = REC(c, OP_CLEAR_DS, p_clear_ds); *r = (p_clear_ds){depth, (int)B(dmask), stencil, smask};
 }
+// 点大小：只有画点（gl POINTS 那类）才有用，我们的绘制重放没有需要它的通路；空操作并留话，
+// 免得每帧一条「未实现」。ZCull 的存取同上一条注释里的 ZCull 家族：Tegra 独有，这里没有对应物。
+// Point size only matters for point draws, which the replay path has no use for; a no-op, so it stops reporting as
+// unimplemented every frame. Save/RestoreZCullData belong to the Tegra-only ZCull family above.
+NVN(nvnCommandBufferSetPointSize, void, NVNcommandBuffer *c, float s) { (void)c; (void)s; }
+NVN(nvnCommandBufferSaveZCullData, void, NVNcommandBuffer *c, NVNbufferAddress a, size_t n) { (void)c; (void)a; (void)n; }
+NVN(nvnCommandBufferRestoreZCullData, void, NVNcommandBuffer *c, NVNbufferAddress a, size_t n) { (void)c; (void)a; (void)n; }
 NVN(nvnCommandBufferSetViewports, void, NVNcommandBuffer *c, int first, int n, const float *v) {
     if (n < 0 || first + n > 16) { LOG("【红】SetViewports first=%d n=%d", first, n); return; }
     p_viewports *r = REC(c, OP_VIEWPORTS, p_viewports); r->first = first; r->n = n;
@@ -960,32 +1281,37 @@ NVN(nvnCommandBufferDispatchCompute, void, NVNcommandBuffer *c, int x, int y, in
     // The thunk is a tail jump (br), so the return address here is the call site in the game
     *REC(c, OP_DISPATCH, p_dispatch) = (p_dispatch){x, y, z, (uint64_t)__builtin_return_address(0)};
 }
-NVN(nvnCommandBufferBarrier, void, NVNcommandBuffer *c, int bits) { *(int32_t *)rec(c, OP_BARRIER, 8) = bits; }
-NVN(nvnCommandBufferSetTexturePool, void, NVNcommandBuffer *c, const NVNtexturePool *p) { REC(c, OP_SET_TEX_POOL, p_set_pool)->pool = (const dpool_t *)p; }
-NVN(nvnCommandBufferSetSamplerPool, void, NVNcommandBuffer *c, const NVNsamplerPool *p) { REC(c, OP_SET_SAMP_POOL, p_set_pool)->pool = (const dpool_t *)p; }
+NVN(nvnCommandBufferBarrier, void, NVNcommandBuffer *c, int bits) { *(int32_t *)rec(c, OP_BARRIER, 8, __func__, (uint64_t)__builtin_return_address(0)) = bits; }
+NVN(nvnCommandBufferSetTexturePool, void, NVNcommandBuffer *c, const NVNtexturePool *p) { REC(c, OP_SET_TEX_POOL, p_set_pool)->pool = (const dpool_t *)p; REC_DRAIN(c); }
+NVN(nvnCommandBufferSetSamplerPool, void, NVNcommandBuffer *c, const NVNsamplerPool *p) { REC(c, OP_SET_SAMP_POOL, p_set_pool)->pool = (const dpool_t *)p; REC_DRAIN(c); }
 
 NVN(nvnCommandBufferCopyBufferToTexture, void, NVNcommandBuffer *c, NVNbufferAddress src, const NVNtexture *t, const NVNtextureView *v,
     const NVNcopyRegion *r, int flags) {
     p_copy_b2t *o = REC(c, OP_COPY_B2T, p_copy_b2t); o->src = src; o->tex = (const tex_t *)t; copy_view(&o->view, &o->has_view, v); o->r = *r; o->flags = flags;
+    REC_DRAIN(c);
 }
 NVN(nvnCommandBufferCopyTextureToBuffer, void, NVNcommandBuffer *c, const NVNtexture *t, const NVNtextureView *v, const NVNcopyRegion *r,
     NVNbufferAddress dst, int flags) {
     p_copy_b2t *o = REC(c, OP_COPY_T2B, p_copy_b2t); o->src = dst; o->tex = (const tex_t *)t; copy_view(&o->view, &o->has_view, v); o->r = *r; o->flags = flags;
+    REC_DRAIN(c);
 }
 // 用给定值清贴图区域（浮点 / 无符号整数两版；mask = 通道写掩码）
 // Clear a texture region with the given value (float / unsigned integer versions; mask = channel write mask)
 NVN(nvnCommandBufferClearTexture, void, NVNcommandBuffer *c, const NVNtexture *t, const NVNtextureView *v, const NVNcopyRegion *r, const float *rgba, int mask) {
     p_clear_tex *o = REC(c, OP_CLEAR_TEX, p_clear_tex); o->tex = (const tex_t *)t; copy_view(&o->view, &o->has_view, v); o->r = *r; o->mask = mask; o->is_uint = 0; memcpy(o->c.f, rgba, 16);
+    REC_DRAIN(c);
 }
 NVN(nvnCommandBufferClearTextureui, void, NVNcommandBuffer *c, const NVNtexture *t, const NVNtextureView *v, const NVNcopyRegion *r, const uint32_t *rgba, int mask) {
     p_clear_tex *o = REC(c, OP_CLEAR_TEX, p_clear_tex); o->tex = (const tex_t *)t; copy_view(&o->view, &o->has_view, v); o->r = *r; o->mask = mask; o->is_uint = 1; memcpy(o->c.u, rgba, 16);
+    REC_DRAIN(c);
 }
 NVN(nvnCommandBufferCopyTextureToTexture, void, NVNcommandBuffer *c, const NVNtexture *s, const NVNtextureView *sv, const NVNcopyRegion *sr,
     const NVNtexture *d, const NVNtextureView *dv, const NVNcopyRegion *dr, int flags) {
     p_copy_t2t *o = REC(c, OP_COPY_T2T, p_copy_t2t); o->src = (const tex_t *)s; o->dst = (const tex_t *)d;
     copy_view(&o->sv, &o->has_sv, sv); copy_view(&o->dv, &o->has_dv, dv); o->sr = *sr; o->dr = *dr; o->flags = flags;
+    REC_DRAIN(c);
 }
-NVN(nvnCommandBufferSetCopyRowStride, void, NVNcommandBuffer *c, ptrdiff_t st) { REC(c, OP_COPY_STRIDE, p_copy_stride)->stride = st; }
+NVN(nvnCommandBufferSetCopyRowStride, void, NVNcommandBuffer *c, ptrdiff_t st) { REC(c, OP_COPY_STRIDE, p_copy_stride)->stride = st; REC_DRAIN(c); }
 NVN(nvnCommandBufferSetBlendColor, void, NVNcommandBuffer *c, const float *v) { memcpy(REC(c, OP_BLEND_COLOR, p_blend_color)->rgba, v, 16); }
 
 // ---------- 状态对象：就地打包（nvn_obj.h） ----------
@@ -998,6 +1324,15 @@ NVN(nvnBlendStateSetBlendFunc, void, NVNblendState *s, NVNblendFunc sr, NVNblend
 }
 NVN(nvnBlendStateSetBlendEquation, void, NVNblendState *s, NVNblendEquation er, NVNblendEquation ea) { ST(blend_st, s)->eq_rgb = er; ST(blend_st, s)->eq_a = ea; }
 NVN(nvnColorStateSetDefaults, void, NVNcolorState *s) { *ST(color_st, s) = (color_st){0, NVN_LOGIC_OP_COPY, NVN_ALPHA_FUNC_ALWAYS}; }
+// 逻辑运算（GL 那套 AND/XOR/…）：只记录、回读，管线不启用它。Maleoon 这类瓦片 GPU 的逻辑运算通路不在我们用的
+// 混合状态里，而且 NVN 的枚举顺序与 Vulkan 的 VkLogicOp 并不一致（COPY 都是 3，后面就分叉），照抄会算错。
+// 默认值是 COPY，游戏真改动过它的绘制在鸿蒙上还没出现过；改动了会在建管线处显形，那时再做映射。
+// Logic operations (the GL set): recorded and readable, but the pipeline never enables them. The tiled GPU's path for
+// logic ops is not part of the blend state we use, and NVN's enum order diverges from VkLogicOp after COPY=3, so copying
+// the number would compute the wrong op. The default is COPY and no draw that changes it has shown up yet; when one does,
+// it will surface at pipeline creation and the mapping can be built then.
+NVN(nvnColorStateSetLogicOp, void, NVNcolorState *s, NVNlogicOp op) { ST(color_st, s)->logic_op = (uint32_t)op; }
+NVN(nvnColorStateGetLogicOp, NVNlogicOp, const NVNcolorState *s) { return (NVNlogicOp)((const color_st *)s)->logic_op; }
 NVN(nvnColorStateSetBlendEnable, void, NVNcolorState *s, int i, uint32_t en) {
     color_st *o = ST(color_st, s); if (i < 0 || i > 7) return;
     o->blend_en = B(en) ? (o->blend_en | 1u << i) : (o->blend_en & ~(1u << i));
@@ -1082,6 +1417,7 @@ void dm_gfx_suspend(int on) {
 }
 NVN(nvnQueueSubmitCommands, void, NVNqueue *q, int n, const NVNcommandHandle *h) {
     gfx_enter();
+    cmd_icb_flush();   // 先收口设备自带那条（上传要在本帧绘制前生效）| drain the device-owned buffer first, so uploads land before this frame's draws
     uint64_t t0 = now_ns(), c0 = clock_gettime_nsec_np(CLOCK_THREAD_CPUTIME_ID), i0, y0, s0 = thr_sys_ns(); thr_counts(&i0, &y0);
     ((queue_t *)q)->submits++;
     mtl_sub_begin();
@@ -1129,13 +1465,33 @@ __attribute__((constructor)) static void nvn_nops_register(void) {
         nvn_slot[i].fn = (void *)nvn_nop;
     }
     unsigned nnop = sizeof g_nops / sizeof *g_nops;
-    // DM_NVN_PROF=1：已实现的函数（未实现桩与出图除外：出图含节拍等待，单独计）套计时包装，用于拆「翻译层录制期」耗时
-    // DM_NVN_PROF=1: implemented functions (except unimplemented stubs and present: present includes the display-link wait and is counted separately) get a timing wrapper, used to break down the time spent in the "translation layer recording phase"
-    if (getenv("DM_NVN_PROF"))
-        for (unsigned i = 0; i < NVN_NFUNC; i++)
-            if (nvn_slot[i].fn != (void *)nvn_unimpl_entry && strcmp(nvn_names[i], "nvnQueuePresentTexture")) { nvn_real[i] = nvn_slot[i].fn; nvn_slot[i].fn = (void *)nvn_prof_entry; }
     LOG("[nvn] 空设备：名字 %u，已实现 %u（语义 %u + 空实现 %u），其余 %u 个接报红桩",
         NVN_NFUNC, g_nsem + nnop, g_nsem, nnop, NVN_NFUNC - g_nsem - nnop);
+}
+
+// 包装层在 .so 构造函数里装不了：鸿蒙的 want 参数是 dlopen 之后才 setenv 的（见 app_ohos.c 的 [env] 那段），
+// 构造函数期 getenv 一律为空——v31 那一轮调用环全空就是这么来的。改由 app_ohos.c 在开关落定后调用一次。
+// The wrapper layer cannot be installed from the .so constructor: HarmonyOS want-parameters are setenv'd only after
+// dlopen (see the [env] block in app_ohos.c), so getenv is always empty at constructor time — that is why the v31
+// call ring came out empty. app_ohos.c calls this once after the external switches have landed.
+void nvn_wrap_arm(void) {
+    g_arm.env_prof = getenv("DM_NVN_PROF") != NULL;
+    g_arm.env_trace = getenv("DM_NVN_TRACE") != NULL;
+    g_arm.armed = 1;
+    if (g_arm.env_prof)
+        // 已实现函数套计时包装（出图含节拍等待，单独计）| implemented functions get the timing wrapper (present includes the display-link wait and is counted separately)
+        for (unsigned i = 0; i < NVN_NFUNC; i++)
+            if (nvn_slot[i].fn && nvn_slot[i].fn != (void *)nvn_unimpl_entry && strcmp(nvn_names[i], "nvnQueuePresentTexture")) { nvn_real[i] = nvn_slot[i].fn; nvn_slot[i].fn = (void *)nvn_prof_entry; g_arm.wrapped++; }
+    else if (g_arm.env_trace)
+        // 含未实现桩：nvn_trace_entry 保留 x16 = 槽地址，桩照常报红。两个开关同时开时以计时为准。
+        // Includes the unimplemented stubs: nvn_trace_entry keeps x16 = slot address, so the stubs still report. Profiling wins if both switches are set.
+        for (unsigned i = 0; i < NVN_NFUNC; i++)
+            if (nvn_slot[i].fn) { nvn_real[i] = nvn_slot[i].fn; nvn_slot[i].fn = (void *)nvn_trace_entry; g_arm.wrapped++; }
+    for (unsigned i = 0; i < NVN_NFUNC; i++) {           // 装完之后槽表各类占比，崩现场再核一次是否还在 | slot-table composition after arming; the crash dump re-checks it
+        if (!nvn_slot[i].fn) g_arm.nullfn++;
+        else if (nvn_slot[i].fn == (void *)nvn_unimpl_entry) g_arm.unimpl++;
+    }
+    LOG("[nvn] 包装层：%s", g_arm.env_prof ? "计时" : g_arm.env_trace ? "调用环" : "无");
 }
 
 // ---------- 窗口 / 出图 ----------
@@ -1428,6 +1784,7 @@ NVN(nvnQueuePresentTexture, void, NVNqueue *q, NVNwindow *w, int idx) {
       if (!gate && g_nvn_loadscreen_up && g_nvn_loadscreen_up()) { gate = 1; int ms = mtl_warm_wait(15000); if (ms) LOG("[nvn] 进局读取画面等管线预热 %d ms", ms); } }
     present_cfg(o);
     gfx_enter();
+    cmd_icb_flush();
     uint64_t t0 = now_ns();
     if (idx >= 0 && idx < o->ntex && idx < 4) o->ticket[idx] = mtl_present(CTX(o->tex[idx]), present_period(o) / 1e9, o->crop);   // 只入队，立即返回 | enqueue only, return immediately
     gfx_leave();
