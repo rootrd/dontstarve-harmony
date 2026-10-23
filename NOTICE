@@ -35,6 +35,7 @@ The upstream MIT licence text and copyright notice are retained verbatim in
 | bcdec | MIT | `dm/third_party/bcdec/` |
 | flip, stb_image, tinyexr | MIT / public domain (per file) | `dm/third_party/flip/` |
 | Ryujinx shader decoder (subset) | MIT | `dm/third_party/ryujinx/` |
+| ARM astcenc 5.7.0 (public header only; the static libraries are built by the user) | Apache-2.0 | `third_party/astcenc/` |
 
 Each retains its own licence file in place. If you redistribute this tree, keep them.
 

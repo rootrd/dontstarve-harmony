@@ -24,9 +24,10 @@ These are records of **facts about** a console API or about our own code — not
 | `dm/gfx/nvn/nvn_protos.h`, `nvn_obj.h`, `nvn_count.h`, `nvn_thunks.S`, `dm/ohos/nvn_thunks_ohos.S` | ~250 KB | Generated entry points and object tables for that API | Written by us from the public declaration set |
 | `dm/gfx/nvn/nvn_shbin.h`, `nvn_sh_tri.h` | 6 KB | SPIR-V for **our own** full-screen present triangle | Generated with `glslang` from our own GLSL; nothing to do with the game |
 | `dm/third_party/**` | 4.8 MB | `libdeflate`, `bcdec`, `flip`, `stb`, and a subset of Ryujinx's shader decoder | Third-party open source, each with its own licence file in place |
+| `third_party/astcenc/{include/astcenc.h,LICENSE.txt,README.md}` | ~50 KB | the public header of ARM's astcenc 5.7.0 (Apache-2.0) and its licence text | the only part of astcenc published here. The cross-compiled `.a` files are build products, gitignored; [README](../third_party/astcenc/README.md) documents the toolchain so anyone can produce them |
 | `dm/host/*.c`, `dm/gfx/**/*.c`, `dm/ohos/*` | ~5 MB | our code | the port |
 | `scripts/**`, `dm/gfx/nvn/tests/pkg_faults.c` | ~110 KB | build/pack helpers plus the host-side fault-injection test for the upload path | `scripts/pkg_faults.sh` extracts the production bodies and asserts them on a plain Linux host — it is how the "verified offline" numbers in [STATUS.md](STATUS.md) can be re-produced without a phone |
-| `docs/screens/*.jpg` | ~300 KB | two screenshots of this port running | they are the status. Everything else about the state is text |
+| `docs/screens/*.jpg` | ~1 MB | four screenshots of this port running: the main menu, a live world, and the same title screen before/after the vertex-and-dynamic-state round | they are the status. Everything else about the state is text |
 
 ### About the inherited documentation and tools
 

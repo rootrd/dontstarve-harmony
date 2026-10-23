@@ -4,9 +4,61 @@ Written so that whoever picks this up does not re-walk the paths that are alread
 
 ---
 
-## 1. The flat green ground (the only functional blocker)
+## 0. Multi-part geometry still tears (the current functional blocker)
 
-**Symptom.** In world, everything renders except the terrain: grass tufts, the character, lighting, the day dial, the inventory bar, interaction labels ("常青树" = evergreen) are all correct; the ground is one flat green field.
+**Symptom.** Anything built from several vertex buffers draws *something*, but sheds stray
+triangles and mis-strided stripes: the title-art figure, the roster portrait panel, the
+in-world structures. One modal renders its title while its whole button bar stays blank.
+Before/after of the same screen, same device, same packaging chain:
+`docs/screens/title_before_an.jpg` → `docs/screens/title_after_an.jpg`. The figure is now
+coherent; the shards on the right edge are this entry.
+
+**What landed this week (AM/AN), and what the counters say.** Three deviations from the
+reference replay layer were closed, each with its own counter so the picture can be attributed
+rather than hoped for:
+
+| Change | Counter on the AN title screen | What it proves |
+|---|---|---|
+| A vertex rebind that *shrinks* the attribute count now takes effect (`n > 0 && n <= 16`, `memcmp` over the first n), and `S.nattr` gates the pipeline key | `缩绑:属77035 流0` | 77,035 shrink-rebinds were being ignored before this round — a hot path, not a cold branch |
+| Dynamic state re-emitted from a dirty flag (set by viewport/scissor/depth-bias/blend-colour ops and by a pipeline swap), plus the three stencil states declared dynamic | `动发228180` | the re-emit runs; the offline case is the AC tsv: 455k viewport + 488k scissor changes against far fewer pass begins, i.e. mid-pass changes existed and were dropped |
+| A depth-stencil clear honours `depth_mask` / `stencil` / `stencil_mask`, and clears the stencil aspect only when the bound format really has one (`fmt_has_stencil`) | `清屏:模板13700 无面0 全跳0` | 13,700 stencil clears that never happened before, none of them illegal; passes open depth/stencil `DONT_CARE`, so an uncleared stencil plane is undefined for every draw that tests it |
+| Colour-write masks instrumented, behaviour unchanged | `色掩或15与15` | OR == AND == 15: every clear this title issues writes all four channels, so the mask is boolean in practice and needs no emulation here |
+
+**Ruled out (do not re-test these).** Arena staleness (`陈旧0`), stale constants
+(`常量:陈旧0`), dummy textures as the cause (`哑3` in a clean round), present-source mismatch,
+quads dropped for want of a pipeline (`无管线0`), back-face culling by winding (`s=924` is a
+false handle), and "the text is missing because the font asset is missing" — the font vertex
+stage was missing from `shaders.bin` and adding it (entry 114) made menu and world text render.
+
+**Next step.** Two named, cheap probes rather than another aggregate counter:
+(a) the per-object readouts (`真值 属…` / `常值 槽…`) on one *specific* multi-part entity, drawn
+with `DM_SPKEY` naming its program, so "which attribute of which part is wrong" is answered by
+the game rather than inferred; (b) the half of `do_set_rt` that still ignores the attachment
+`cview/has_cview/dview/has_dview` the guest names — it always binds level 0 / layer 0, which
+needs a per-subresource `VkImageView` cache.
+
+**Known source↔binary divergence, disclosed:** the installed AN block gates the
+"never test stencil" A/B switch on `DM_VK_SKIP` bit 64, which the legend already assigns to
+呈现不用信号量; the source in this repository uses the free bit 2097152. Harmless while
+`DM_VK_SKIP=0` (it is), and the next rebuild of the block resolves it.
+
+---
+
+## 1. The flat green ground — CLOSED
+
+**Closed by:** the Maleoon 920 accepts essentially no BC format, so the host stopped asking it
+to. BC1/BC3/BC4/BC5 are now re-encoded to ASTC 4×4 — on the device at upload time through a
+cross-built astcenc 5.7.0 with an on-disk cache (`ASTC缓存 命中/新写/盘错/额尽`), or pre-baked
+offline by the same converter (`dm/tools/bc2astc.c`, `scripts/astc_bake_all.sh`), with a guard
+that refuses blocks whose region origin is not 4×4 aligned instead of writing a shifted
+texture. The ground, grass tufts and terrain lighting are correct in world
+(`docs/screens/in_world.jpg`). The instrument history below is what made that call possible —
+**keep reading it before re-opening this entry**, because most of it is "how not to be fooled
+by your own counters".
+
+**Historical record (the symptom as of 2026-10-18).** In world, everything rendered except the
+terrain: grass tufts, the character, lighting, the day dial, the inventory bar, interaction
+labels ("常青树" = evergreen) were all correct; the ground was one flat green field.
 
 **Historical measurements (not a confirmed root cause).**
 
@@ -25,7 +77,8 @@ Static review found that these are different observations and must not be confla
   in the process. Missing lines, especially after menu/world generation, prove nothing.
 
 The historical missing-asset audit and mip-zero experiment remain useful prior evidence;
-this patch does not repeat or change either experiment. The ground's root cause is still open.
+this patch does not repeat or change either experiment. (This line was written while the ground
+was still open — the closing header above records what it turned out to be.)
 
 **Ruled out (do not re-test these).**
 
@@ -33,7 +86,10 @@ this patch does not repeat or change either experiment. The ground's root cause 
 |---|---|
 | Missing asset files | A full offline audit of all 21,310 files, then on-device: the unresolved-path list file is **never created**. Zero unresolved references. |
 | Mips clamped so the atlas is sampled at an empty level | Ran a round forcing every sample to mip level 0 (`DM_VK_SKIP 16777216`): no change. |
-| "No shader library" for these draws | The HUD and characters use the same library; the missing-library share is 10%, and it does not correlate with the terrain draws. |
+| ~~"No shader library" for these draws~~ **re-opened, and it is a live blocker in-world** | This row was measured on **menu screens**, where `无库` really is ~0 and the share stays under 10%. Round M walked into the world and read `无库` climbing **+80 draws/second** (≈5.3 per frame) against four program keys that first appear at the moment of world entry: `5461f70680ae7d03`+`96225b5d4c6aa151` and `f386d71fb78474b8`+`6d1ecc55404624fa`. `nvn_draw_indexed` returns **without issuing the draw** when a stage is unresolved, so those entities are not drawn wrong — they are not drawn at all, which is exactly the "ground is there, everything standing on it is missing" symptom. **Lesson: a percentage is only worth the screen it was sampled on.** |
+| **Round O closed the loop on the above** | Two of those four keys came out of the romfs `.ksh` files offline; the other two (`96225b5d4c6aa151`, `6d1ecc55404624fa`) are the live pair, and `6d1ecc55404624fa` is in **none** of the 60+ keydumps taken before world entry — it is only ever bound in-world, so it cannot be recovered offline. Round O captured it 3 minutes inside the world. `ctl_Z2.bin` → **99-entry `shaders.bin`** (32 vertex / 67 fragment, 886 KB, all 198 SPIR-V blobs parse under `spirv-cross`), which contains all five keys named above. **Also corrected: the world is not "black because nothing renders"** — the spawn plaza (Florid Postern / 绚丽之门) is legitimately dark at that hour; walking the character two steps brings up ground, entities, the light ring and the subtitles. Sample a screenshot's world region before concluding a layer is dead. In-world measurement while walking: **≈11 FPS**, `无库` +27 draws/s, `打包:上1225 成MB807 败0`, `哑139` = the 1280×720/640×360/320×180 glow chain hitting the per-submit eager-upload budget (`当场顶139` is the same 139) — render targets, not lost art. |
+
+| **Round Z: the shader-library blocker is CLOSED in-world — and the symptom changed shape** | Installed the 99-entry library with `bm install -r -p` (data kept: the 354 MB / 2427-file ASTC self-transcode cache and all five save clusters survived). Boot logged `着色器库就位：99 条 … /data/storage/el1/bundle/entry/resources/resfile/shaders.bin`, i.e. the new in-package fallback path is what loaded it. Deep in-world, walking: **`无库 0`, `跳过 0`, `无管线 0`, and no `缺键` line at all** (round O: +27 draws/s). `哑` fell 139 → 17. So every draw is now *issued*. **What is left is not pipeline availability, it is the colour of the result**: the world layer renders with its **red channel at zero** — a vertical profile through the player's light disc reads `R0 G160 B95` where the art is warm orange, so brown/dark entities collapse to black silhouettes and the grass goes flat green, while the HUD (same back buffer, same frame: red heart, orange dials) is unaffected. The light disc additionally carries **evenly spaced horizontal dark stripes (~12 px at panel scale)** = a row-pitch error on the 640×360 / 320×180 glow chain, not a lost texture. Frame cost has also moved off the GPU: `[长帧] 整帧 146.6 ms，提交+出图 134.6 ms，GPU 0.0 ms`. Sustained walk rate: **14.0 FPS** (O: 10.9), ≈23 render passes and 11 clears per frame. |
 | The pool memory is not mapped | `m1 p1` in the bind dump: memory and pool both present, `L16384` range registered. |
 | The installed `shaders.bin` is too small and needs a full re-pack | Offline key-coverage check against the device-reported keys: the installed 40-entry library covers **all 27** of them, and the older 222/233-entry libraries share **zero** keys with the current chain (`e6ff54a2620e`) — they are a different key scheme, not a bigger version of this one. `SHB_MAXE` is 512, so headroom is not the constraint either. |
 
@@ -130,10 +186,11 @@ Buttons reached the guest a long time ago (the world-creation screen in this pro
 
 ---
 
-## 7. Remaining picture defects (to be settled together with #1)
+## 7. Remaining picture defects (same family as #0)
 
-- Vertical stripe ("barcode") artefacts on the EULA page and some panels.
-- Some button labels missing.
+- **Multi-part entities tear** — promoted to its own entry: see [#0](#0-multi-part-geometry-still-tears-the-current-functional-blocker).
+- Some button labels missing on one modal (title renders, the button bar under it is empty) — the stencil-clear work in #0 is the current lead, because that modal's own test showed the same font program drawing fine elsewhere in the same frame.
+- Vertical stripe ("barcode") artefacts on the EULA page and some panels; the roster portrait panel is the same shape at larger scale.
 - The whole frame reads slightly dark.
 - **Text blur is not a bug**: the game renders 1280×720 and the swap chain is 2848×1276, so the present blit upscales 2.22× with a LINEAR magnification filter. The discriminator: in the same screenshot, our own native-resolution debug overlay text is crisp while the game's text is soft. Switching the present to NEAREST gives hard edges and shimmer — a taste call, not a fix.
 
