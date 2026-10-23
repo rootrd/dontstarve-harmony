@@ -56,6 +56,7 @@ static int g_geom_fail_lvl = -1, g_geom_fail_layer = -1;
 static int g_dz_fail_lvl = -1, g_dz_fail_layer = -1, g_dec_fail = 0;
 static uint64_t g_base_step = 1024 * 8;   // 本级本层在池里的起点：造越界用
 static int g_tracked = 1;
+static _Atomic uint64_t g_eup_try, g_eup_ok, g_eup_cap, g_eup_fail;
 static int n_protect, n_layout, n_readarm, n_enter, n_drop, n_result, n_queued;
 static uint8_t g_poolbytes[16 << 20];
 
@@ -91,6 +92,11 @@ static int nvn_deswizzle_geom(const nvn_texdesc *d, unsigned lvl, unsigned la, u
     *base = (uint64_t)lvl * g_base_step + (uint64_t)la * (1u << 20);
     *th = *td = 0; *bpb = 4; return 0;
 }
+static uint64_t g_source_padding;
+// This harness uses a linear fake storage layout; pixel tiling is tested by vk_compat.c.
+static uint64_t nvn_bl_offset(uint32_t x, uint32_t y, uint32_t z, uint32_t rb, uint32_t rows, unsigned th, unsigned td) {
+    (void)th; (void)td; return ((uint64_t)z * rows + y) * rb + x + g_source_padding;
+}
 static int nvn_deswizzle(const nvn_texdesc *d, unsigned lvl, unsigned la, const void *src, void *dst, size_t pitch) {
     (void)d; (void)src;
     if ((int)lvl == g_dz_fail_lvl || (int)la == g_dz_fail_layer) return -1;
@@ -101,6 +107,12 @@ static int nvn_bc_decode(uint32_t f, const uint8_t *src, size_t pitch, uint32_t 
     if (g_dec_fail) return -1;
     if (dst) dst[0] = 0x5A;                  // 解码写出一个字节就够：这里判的是结局不是像素
     (void)w; (void)h; return 0;
+}
+static int rt_bc3_to_astc(const uint8_t *src, size_t pitch, uint32_t w, uint32_t h, uint8_t *dst, size_t cap) {
+    (void)src; (void)pitch; (void)w; (void)h;
+    if (g_dec_fail || !cap) return -1;
+    dst[0] = 0x5a;
+    return 0;
 }
 // 取证三探针（A/B 落盘、整张落盘、读回挂账）：桩把「版本代号 / 层」记下来，C6 就判这两个身份
 // 在两条探针里是不是同一个（P3 的「同一版本、同一层」全靠这两个字段，名字错了整轮证据就作废）。
@@ -222,7 +234,7 @@ static void clearday(void) {
     g_bcok = 1; g_tracked = 1; g_skip = 0;
     g_rowb = 1024; g_rows = 8; g_sl = 1; g_base_step = 1024 * 8; g_bpb = 4; g_bw = g_bh = 1;
     g_rows_late = 0; g_late_after = -1; n_geom = 0;
-    g_ring_fail = 0;
+    g_ring_fail = 0; g_source_padding = 0;
     // 环本身在源码里是「建一次就长住」的：用例之间得把这三个句柄擦回去，否则 g_ring_fail 那一档永远走不到
     g_bigs = (VkBuffer)0; g_bigs_mem = (VkDeviceMemory)0; g_bigs_map = NULL;
     mtl_sub_reset_bigstage();          // 相当于换了一条提交：环游标清零（「余量不足等清零就有救」的那个清零）
@@ -242,6 +254,8 @@ static const struct { const char *lab; _Atomic uint64_t *c; int shift; } g_exp[]
     { "超表", &g_pkg_sub_over, 0 }, { "溢出", &g_pkg_ovfl, 0 }, { "余不", &g_pkg_head, 0 },
     { "超容", &g_pkg_over, 0 }, { "无环", &g_pkg_nobuf, 0 }, { "退避", &g_pkg_bkoff, 0 },
     { "队龄", &g_pkg_age, 0 }, { "重开", &g_sub_reenter, 0 }, { "串线", &g_sub_race, 0 },
+    { "当场试", &g_eup_try, 0 }, { "当场成", &g_eup_ok, 0 },
+    { "当场顶", &g_eup_cap, 0 }, { "当场败", &g_eup_fail, 0 },
 };
 #define EXP_N ((int)(sizeof g_exp / sizeof g_exp[0]))
 
@@ -270,6 +284,13 @@ int main(void) {
            "工作区新版"
 #endif
     );
+
+    casebeg("Tegra padding exceeds pool even when linear bytes fit");
+    clearday(); mk(&g_v, 10, 0x100, 64, 64, 1, 1, 0);
+    g_pool.size = (uint64_t)g_rowb * g_rows; g_source_padding = 512;
+    pkg_queue(&g_v); pkg_flush();
+    ck("padded source rejected", g_v.pkg_bad, 1);
+    ck("no out-of-range copy", ncopy, 0);
 
     // ① 陈旧标志：进队要成、传成才清（C3）
     casebeg("C3-1 stale=1/dirty=0/uploaded=1 必须进得了队，成功才清");

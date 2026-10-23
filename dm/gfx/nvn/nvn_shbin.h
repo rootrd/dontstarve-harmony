@@ -14,8 +14,8 @@ typedef struct {
     uint32_t c1_total, spv_total, reserved0;
 } shb_hdr;                                   /* 32 */
 
-// 一个着色器段（键 = 控制段 0x880 字节的 sha256 前 8 字节）
-// One shader stage blob; key = the first 8 bytes of sha256 of its 0x880-byte control segment
+// Stage key = sha256(control[:0x838] + code[:min(total, 0x838)])[:8].
+// DST builder: scripts/build_dst_shaders.py; keep in sync with nvn_vulkan.c.
 typedef struct {
     uint8_t key[8];
     uint8_t stage;                   // 0 顶点 1 像素 2 计算 | 0 vertex, 1 fragment, 2 compute

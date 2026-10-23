@@ -1,5 +1,7 @@
 # Building and installing on HarmonyOS
 
+For the current DST 1.30.0 asset layout (`main,sdk`), generated guest manifest, 105-stage shader library and stable two-module staging, follow **[the current repair/build report](OHOS-RENDERING-2026-10.md#本地重建)**. The commands below also document older packaging rounds.
+
 Three stages: cross-compile the host into `libdmhost.so`, assemble a signed HAP that carries it plus the game data, install. A round takes about five minutes end to end; treat that as the unit of work and **batch your changes into it** — one-variable-at-a-time device rounds are the slowest possible way to find out anything.
 
 ## 0. What you need

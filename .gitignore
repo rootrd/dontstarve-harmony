@@ -41,6 +41,7 @@ third_party/astcenc/ohos/
 *.orig
 
 # Editor / OS
+.idea/
 .DS_Store
 __pycache__/
 *.pyc

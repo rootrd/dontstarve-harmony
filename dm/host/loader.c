@@ -208,8 +208,12 @@ void *guest_sym(const char *name) {
     return NULL;
 }
 module_t *module_of(const void *p) {
-    for (int i = 0; i < g_nmod; i++)
-        if ((const uint8_t *)p >= g_mod[i].base && (const uint8_t *)p < g_mod[i].base + g_mod[i].size) return &g_mod[i];
+    for (int i = 0; i < g_nmod; i++) {
+        const module_t *m = &g_mod[i];
+        uintptr_t a = (uintptr_t)p, base = (uintptr_t)m->base, tail = (uintptr_t)m->tail_va;
+        if ((a >= base && a - base < m->size) ||
+            (m->patch_below && tail && a >= tail && a - tail < m->tail_len)) return &g_mod[i];
+    }
     return NULL;
 }
 
@@ -288,7 +292,8 @@ static void read_layout(module_t *m, const char *dir) {
 static void install_key_page(module_t *m) {
     uint8_t *kp;
     if (m->patch_below) {   // 键页在基址之下的尾部里 | the key page lives in the tail below the base
-        if (m->key_page_off < m->tail_off || m->key_page_off + m->key_page_size > m->tail_off + m->tail_len) die("%s: 键页越界（尾部）", m->name);
+        if (m->key_page_off < m->tail_off || m->key_page_off - m->tail_off > m->tail_len ||
+            m->key_page_size > m->tail_len - (m->key_page_off - m->tail_off)) die("%s: 键页越界（尾部）", m->name);
         kp = m->tail_va + (m->key_page_off - m->tail_off);
     } else {
         if (m->key_page_off + m->key_page_size > m->size) die("%s: 键页越界", m->name);

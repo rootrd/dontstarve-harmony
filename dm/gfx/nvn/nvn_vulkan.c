@@ -14,6 +14,7 @@
 #include "../../host/dm.h"   // dm_guest_write_prepare：流内写入落在写保护的客体池页上时得先解保护 | unprotect guest pool pages before the host writes into them
 #include "nvn_obj.h"
 #include "nvn_tex.h"
+#include "nvn_vk_compat.h"
 #include "dmsh_chain.h"
 #include "nvn_sh_tri.h"
 #include "nvn_shbin.h"      // 构建机折出的着色器二进制库（shaders.bin）的布局 | layout of the binary shader library packed by the build box
@@ -138,6 +139,8 @@ static VkInstance g_inst;
 static VkSurfaceKHR g_surf;
 static VkPhysicalDevice g_pd;
 static VkDevice g_dev;
+static VkPhysicalDeviceFeatures g_features; // Features actually enabled on g_dev.
+static uint8_t g_compressed[VK_FORMAT_ASTC_12x12_SRGB_BLOCK + 1];
 static VkQueue g_q;
 static uint32_t g_qf;
 static VkCommandPool g_cp;
@@ -188,6 +191,8 @@ typedef struct {
     tex_t d;
     VkImage img;
     VkImageView view;
+    VkImageView attachment; // Identity swizzle, one mip/layer; never a sampled view.
+    VkImageUsageFlags usage;
     VkDeviceMemory mem;
     VkFormat fmt;
     VkImageLayout layout;
@@ -338,13 +343,14 @@ static int tex_same_store(const vktex *v, const tex_t *t)
 // 就等于引用它的命令全跑完了——晚一代再毁，不引入 DXVK 那套引用计数。
 // Retire one submission generation behind: mtl_sub_commit waits every fence, so a smaller generation means the
 // submission that recorded the reference has already completed.
-typedef struct { VkImage img; VkImageView view; VkDeviceMemory mem; uint64_t gen; } grave_t;
+typedef struct { VkImage img; VkImageView view; VkDeviceMemory mem; uint64_t gen; VkImageView attachment; } grave_t;
 #define GRAVE_N 512
 static grave_t g_grave[GRAVE_N];
 static int g_grave_n;
 
 static void grave_kill(const grave_t *g)
 {
+    if (g->attachment) vkDestroyImageView(g_dev, g->attachment, NULL);
     if (g->view) vkDestroyImageView(g_dev, g->view, NULL);
     if (g->img) vkDestroyImage(g_dev, g->img, NULL);
     if (g->mem) vkFreeMemory(g_dev, g->mem, NULL);
@@ -361,8 +367,8 @@ static void tex_retire(vktex *v)
         memmove(g_grave, g_grave + 1, (size_t)(GRAVE_N - 1) * sizeof g_grave[0]);
         g_grave_n--;
     }
-    g_grave[g_grave_n++] = (grave_t){ v->img, v->view, v->mem, g_fence_val };
-    v->img = (VkImage)0; v->view = (VkImageView)0; v->mem = (VkDeviceMemory)0;
+    g_grave[g_grave_n++] = (grave_t){ v->img, v->view, v->mem, g_fence_val, v->attachment };
+    v->img = (VkImage)0; v->view = (VkImageView)0; v->mem = (VkDeviceMemory)0; v->attachment = (VkImageView)0;
 }
 
 static void grave_reap(void)
@@ -527,30 +533,15 @@ static int g_tex_astc;    // DM_TEX_ASTC=1 且设备认 ASTC 4x4、又不认 BC3
 static float g_rt_astc;   // B 路：DM_RT_ASTC=<档位> 时由设备在上传那一刻把 BC3 现编成 ASTC 4x4。它不读素材清单，
                           // 所以"离线烘漏了某个容器"这类事故在结构上不会发生；代价是编码耗时，全部记在 rt_astc_stat。
 
-// NVN 格式里有几个颜色分量（0 = 不知道：压缩、深度、以及 _UI2F 那一族的别名，这些一律留给恒等映射）。
-// 只算未压缩族，免得把软解码 BC 的错误也一起遮掉。
-// Component count of an uncompressed NVN format; 0 = unknown (compressed, depth, the _UI2F aliases) and left to identity.
-// Deliberately excludes the compressed families so a soft-decode bug cannot hide behind a forced alpha.
-static int nvc_ch(int f)
-{
-    if (f >= NVN_FORMAT_R8 && f <= NVN_FORMAT_RGBA32I) return 1 + (f - NVN_FORMAT_R8) / 12;
-    switch (f) {
-    case NVN_FORMAT_RGBX8_SRGB: case NVN_FORMAT_RGB5: case NVN_FORMAT_RGB565:
-    case NVN_FORMAT_R11G11B10F: case NVN_FORMAT_RGB9E5F:
-    case NVN_FORMAT_RGBX8: case NVN_FORMAT_RGBX8SN: case NVN_FORMAT_RGBX8UI:
-    case NVN_FORMAT_BGR565: case NVN_FORMAT_BGR5: case NVN_FORMAT_BGRX8: case NVN_FORMAT_BGRX8_SRGB:
-        return 3;
-    case NVN_FORMAT_RGBA8_SRGB: case NVN_FORMAT_RGBA4: case NVN_FORMAT_RGB5A1:
-    case NVN_FORMAT_RGB10A2: case NVN_FORMAT_RGB10A2UI:
-    case NVN_FORMAT_BGRA8: case NVN_FORMAT_BGRA8_SRGB:
-        return 4;
-    default: return 0;
-    }
-}
-
 static VkFormat fmt_of(int f, int *depth)
 {
     if (depth) *depth = 0;
+    VkFormat compressed = nvn_vk_compressed_format(f);
+    if (compressed) {
+        if (f == 0x44 && g_tex_astc) return g_compressed[VK_FORMAT_ASTC_4x4_UNORM_BLOCK]
+            ? VK_FORMAT_ASTC_4x4_UNORM_BLOCK : VK_FORMAT_UNDEFINED;
+        return g_compressed[compressed] ? compressed : nvn_vk_bc_fallback(f);
+    }
     switch (f) {
     // R / RG 族（第 37 轮实测游戏在用 0x5 0x6 0xB 0xD 0x3F，先补齐）
     // R / RG families (round 37 measured the game using 0x5 0x6 0xB 0xD 0x3F, so they go in now)
@@ -598,60 +589,6 @@ static VkFormat fmt_of(int f, int *depth)
     case 0x9A: return VK_FORMAT_B8G8R8A8_UNORM;         // BGRA8
     case 0x9B: return VK_FORMAT_B8G8R8A8_SRGB;
     case 0x9C: return VK_FORMAT_B8G8R8A8_SRGB;
-    // 压缩格式：DXT / RGTC / BPTC（4×4 块）与 ASTC。马良收不收要问设备（g_bcap 由 vk_boot 探出来）。
-    // 实测第 81 轮：Maleoon 920 只报 ASTC 4x4 可采样，BC1–BC7 全不认。而 D2R 的美术资源就是 BC1/BC3，
-    // 所以认不下的 BC 块改建成未压缩（BC1–BC5/BC7 → RGBA8 或 R8/RG8，BC6H → RGBA16F），
-    // 像素在 do_copy_b2t 里用 nvn_bcdec 的 CPU 解码搬进去（第 82 轮实测：上传 94 → 12244，「贴图没有图」12189 → 54）。
-    // Measured on round 81: Maleoon 920 samples only ASTC 4x4 and rejects every BC format, while D2R's art is BC1/BC3 -
-    // so the unsupported blocks are rebuilt uncompressed (BC1-BC5/BC7 -> RGBA8 or R8/RG8, BC6H -> RGBA16F) and the texels
-    // are decoded on the CPU by nvn_bcdec inside do_copy_b2t (round 82: uploads 94 -> 12244, "no image" 12189 -> 54).
-    // BC4 SNORM / BC5 SNORM 也按无符号解：符号错了只会让法线贴图偏色，不致命，等真要用了再补。
-    case 0x41: return g_bcap & 1   ? VK_FORMAT_BC1_RGB_UNORM_BLOCK  : VK_FORMAT_R8G8B8A8_UNORM;
-    case 0x45: return g_bcap & 1   ? VK_FORMAT_BC1_RGB_SRGB_BLOCK   : VK_FORMAT_R8G8B8A8_SRGB;
-    case 0x42: return g_bcap & 2   ? VK_FORMAT_BC1_RGBA_UNORM_BLOCK : VK_FORMAT_R8G8B8A8_UNORM;
-    case 0x46: return g_bcap & 2   ? VK_FORMAT_BC1_RGBA_SRGB_BLOCK  : VK_FORMAT_R8G8B8A8_SRGB;
-    case 0x43: return g_bcap & 4   ? VK_FORMAT_BC2_UNORM_BLOCK      : VK_FORMAT_R8G8B8A8_UNORM;
-    case 0x47: return g_bcap & 4   ? VK_FORMAT_BC2_SRGB_BLOCK       : VK_FORMAT_R8G8B8A8_SRGB;
-    case 0x44: return g_bcap & 8 ? VK_FORMAT_BC3_UNORM_BLOCK
-                       : g_tex_astc ? VK_FORMAT_ASTC_4x4_UNORM_BLOCK   // 离线转过素材的这一档：块尺寸与 BC3 一样（4×4 / 16 字节），搬块那一路不用改
-                       : VK_FORMAT_R8G8B8A8_UNORM;
-    case 0x48: return g_bcap & 8   ? VK_FORMAT_BC3_SRGB_BLOCK       : VK_FORMAT_R8G8B8A8_SRGB;
-    case 0x49: return g_bcap & 16  ? VK_FORMAT_BC4_UNORM_BLOCK      : VK_FORMAT_R8_UNORM;      // 单通道：解出来就是 R8（nvn_bcdec 的 1 bpp 目标）
-    case 0x4A: return g_bcap & 16  ? VK_FORMAT_BC4_SNORM_BLOCK      : VK_FORMAT_R8_SNORM;
-    case 0x4B: return g_bcap & 32  ? VK_FORMAT_BC5_UNORM_BLOCK      : VK_FORMAT_R8G8_UNORM;    // 双通道：法线贴图的 R / G
-    case 0x4C: return g_bcap & 32  ? VK_FORMAT_BC5_SNORM_BLOCK      : VK_FORMAT_R8G8_SNORM;
-    case 0x4F: return g_bcap & 64  ? VK_FORMAT_BC6H_SFLOAT_BLOCK    : VK_FORMAT_R16G16B16A16_SFLOAT;   // 浮点亮度：RGBA16F，alpha 由解码器补 1.0
-    case 0x50: return g_bcap & 64  ? VK_FORMAT_BC6H_UFLOAT_BLOCK    : VK_FORMAT_R16G16B16A16_SFLOAT;
-    case 0x4D: return g_bcap & 128 ? VK_FORMAT_BC7_UNORM_BLOCK      : VK_FORMAT_R8G8B8A8_UNORM;
-    case 0x4E: return g_bcap & 128 ? VK_FORMAT_BC7_SRGB_BLOCK       : VK_FORMAT_R8G8B8A8_SRGB;
-    case 0x79: return g_bcap & 256 ? VK_FORMAT_ASTC_4x4_UNORM_BLOCK  : 0;
-    case 0x7A: return g_bcap & 256 ? VK_FORMAT_ASTC_5x4_UNORM_BLOCK  : 0;
-    case 0x7B: return g_bcap & 256 ? VK_FORMAT_ASTC_5x5_UNORM_BLOCK  : 0;
-    case 0x7C: return g_bcap & 256 ? VK_FORMAT_ASTC_6x5_UNORM_BLOCK  : 0;
-    case 0x7D: return g_bcap & 256 ? VK_FORMAT_ASTC_6x6_UNORM_BLOCK  : 0;
-    case 0x7E: return g_bcap & 256 ? VK_FORMAT_ASTC_8x5_UNORM_BLOCK  : 0;
-    case 0x7F: return g_bcap & 256 ? VK_FORMAT_ASTC_8x6_UNORM_BLOCK  : 0;
-    case 0x80: return g_bcap & 256 ? VK_FORMAT_ASTC_8x8_UNORM_BLOCK  : 0;
-    case 0x81: return g_bcap & 256 ? VK_FORMAT_ASTC_10x5_UNORM_BLOCK : 0;
-    case 0x82: return g_bcap & 256 ? VK_FORMAT_ASTC_10x6_UNORM_BLOCK : 0;
-    case 0x83: return g_bcap & 256 ? VK_FORMAT_ASTC_10x8_UNORM_BLOCK : 0;
-    case 0x84: return g_bcap & 256 ? VK_FORMAT_ASTC_10x10_UNORM_BLOCK : 0;
-    case 0x85: return g_bcap & 256 ? VK_FORMAT_ASTC_12x10_UNORM_BLOCK : 0;
-    case 0x86: return g_bcap & 256 ? VK_FORMAT_ASTC_12x12_UNORM_BLOCK : 0;
-    case 0x87: return g_bcap & 256 ? VK_FORMAT_ASTC_4x4_SRGB_BLOCK  : 0;
-    case 0x88: return g_bcap & 256 ? VK_FORMAT_ASTC_5x4_SRGB_BLOCK  : 0;
-    case 0x89: return g_bcap & 256 ? VK_FORMAT_ASTC_5x5_SRGB_BLOCK  : 0;
-    case 0x8A: return g_bcap & 256 ? VK_FORMAT_ASTC_6x5_SRGB_BLOCK  : 0;
-    case 0x8B: return g_bcap & 256 ? VK_FORMAT_ASTC_6x6_SRGB_BLOCK  : 0;
-    case 0x8C: return g_bcap & 256 ? VK_FORMAT_ASTC_8x5_SRGB_BLOCK  : 0;
-    case 0x8D: return g_bcap & 256 ? VK_FORMAT_ASTC_8x6_SRGB_BLOCK  : 0;
-    case 0x8E: return g_bcap & 256 ? VK_FORMAT_ASTC_8x8_SRGB_BLOCK  : 0;
-    case 0x8F: return g_bcap & 256 ? VK_FORMAT_ASTC_10x5_SRGB_BLOCK : 0;
-    case 0x90: return g_bcap & 256 ? VK_FORMAT_ASTC_10x6_SRGB_BLOCK : 0;
-    case 0x91: return g_bcap & 256 ? VK_FORMAT_ASTC_10x8_SRGB_BLOCK : 0;
-    case 0x92: return g_bcap & 256 ? VK_FORMAT_ASTC_10x10_SRGB_BLOCK : 0;
-    case 0x93: return g_bcap & 256 ? VK_FORMAT_ASTC_12x10_SRGB_BLOCK : 0;
-    case 0x94: return g_bcap & 256 ? VK_FORMAT_ASTC_12x12_SRGB_BLOCK : 0;
     case 0x31: if (depth) *depth = 1; return VK_FORMAT_D24_UNORM_S8_UINT;    // STENCIL8：与深度共用一块，按 D24S8 挂 | shares storage with depth: attached as D24S8
     case 0x32: if (depth) *depth = 1; return VK_FORMAT_D16_UNORM;
     case 0x33: if (depth) *depth = 1; return VK_FORMAT_X8_D24_UNORM_PACK32;
@@ -744,16 +681,20 @@ static int vk_boot(void)
     VkDeviceCreateInfo dci = { VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO };
     dci.queueCreateInfoCount = 1;
     dci.pQueueCreateInfos = &qci;
-    // 各向异性：游戏采样器普遍声明 maxAnisotropy>1，特性没开就建采样器会直接失败（第 88 轮真实采样器那一刀要用）。
-    // 只在实测支持时开这一条，其余特性维持原来的「全 0」。
-    // Anisotropy: the game's samplers declare maxAnisotropy > 1 and vkCreateSampler faults when the feature is off (needed by the
-    // round-88 real-sampler cut). Enabled only when the device actually reports it; every other feature stays off as before.
     VkPhysicalDeviceFeatures sup;
     vkGetPhysicalDeviceFeatures(g_pd, &sup);
-    static VkPhysicalDeviceFeatures use;
-    use = (VkPhysicalDeviceFeatures){ 0 };
-    use.samplerAnisotropy = sup.samplerAnisotropy;
-    dci.pEnabledFeatures = &use;
+    g_features = (VkPhysicalDeviceFeatures){0};
+    g_features.samplerAnisotropy = sup.samplerAnisotropy;
+    g_features.textureCompressionBC = sup.textureCompressionBC;
+    g_features.textureCompressionASTC_LDR = sup.textureCompressionASTC_LDR;
+    g_features.independentBlend = sup.independentBlend;
+    g_features.imageCubeArray = sup.imageCubeArray;
+    g_features.fillModeNonSolid = sup.fillModeNonSolid;
+    g_features.depthBiasClamp = sup.depthBiasClamp;
+    dci.pEnabledFeatures = &g_features;
+    GVL("[vk] enabled features BC=%{public}u ASTC=%{public}u independentBlend=%{public}u cubeArray=%{public}u",
+        g_features.textureCompressionBC, g_features.textureCompressionASTC_LDR,
+        g_features.independentBlend, g_features.imageCubeArray);
     // 一条条加：M2-0 只开 swapchain 建得起来，5 条一起开 vkCreateDevice 直接失败（第 35 轮），而驱动不点名是哪条。
     // 每加一条试建一次设备，加不上就踢掉并报名——建设备只在开机做，几次试错不要紧。
     // Add them one at a time: M2-0 built a device with swapchain alone, while asking for all five failed vkCreateDevice (round 35) without naming the culprit.
@@ -765,7 +706,10 @@ static int vk_boot(void)
         dci.enabledExtensionCount = nok + 1;
         dci.ppEnabledExtensionNames = on;
         VkDevice d = NULL;
-        if (vkCreateDevice(g_pd, &dci, NULL, &d) == VK_SUCCESS) { g_dev = d; nok++; continue; }
+        if (vkCreateDevice(g_pd, &dci, NULL, &d) == VK_SUCCESS) {
+            if (g_dev) vkDestroyDevice(g_dev, NULL);
+            g_dev = d; nok++; continue;
+        }
         GVL("[vk] 设备扩展踢掉 %{public}s（加上就建不起来）", cand[k]);
     }
     if (!g_dev) { GRED("vkCreateDevice 失败（第一条 %{public}s 都建不起来）", nc ? cand[0] : "无"); return 0; }
@@ -813,7 +757,7 @@ static int swapchain_build(void *win, uint64_t ww, uint64_t hh)
     VkSurfaceCapabilitiesKHR cap;
     if (vkGetPhysicalDeviceSurfaceCapabilitiesKHR(g_pd, g_surf, &cap) != VK_SUCCESS) { GRED("拿不到表面能力"); return 0; }
     uint32_t nf = 0;
-    vkGetPhysicalDeviceSurfaceFormatsKHR(g_pd, g_surf, &nf, NULL);
+    if (vkGetPhysicalDeviceSurfaceFormatsKHR(g_pd, g_surf, &nf, NULL) != VK_SUCCESS || !nf) return 0;
     VkSurfaceFormatKHR fm[16];
     if (nf > 16) nf = 16;
     vkGetPhysicalDeviceSurfaceFormatsKHR(g_pd, g_surf, &nf, fm);
@@ -1013,6 +957,8 @@ static int tri_boot(void)
     if (!g_tri_pl) {
         VkPipelineLayoutCreateInfo li = { VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO };
         li.setLayoutCount = 1; li.pSetLayouts = &g_tri_dsl;
+        VkPushConstantRange pc = { VK_SHADER_STAGE_FRAGMENT_BIT, 0, sizeof(int32_t) };
+        li.pushConstantRangeCount = 1; li.pPushConstantRanges = &pc;
         if (vkCreatePipelineLayout(g_dev, &li, NULL, &g_tri_pl) != VK_SUCCESS) { GRED("建管线布局失败"); g_tri_fail = 1; return 0; }
     }
     if (!g_tri_vs && !tri_module(sh_tri_vert, sh_tri_vert_len, &g_tri_vs, "顶点")) { g_tri_fail = 1; return 0; }
@@ -1105,7 +1051,7 @@ static VkDescriptorSet tri_prep(VkCommandBuffer cb, vktex *v)
 
 // 通道**内**：绑管线 + 画一个满屏三角形，把源图贴满整张
 // Inside the pass: bind and draw the one full-screen triangle that covers the whole image.
-static void tri_emit(VkCommandBuffer cb, VkDescriptorSet set)
+static void tri_emit(VkCommandBuffer cb, VkDescriptorSet set, VkFormat source_format)
 {
     VkViewport vp = { 0, 0, (float)g_sc_ext.width, (float)g_sc_ext.height, 0.0f, 1.0f };
     VkRect2D sc = { { 0, 0 }, g_sc_ext };
@@ -1113,6 +1059,10 @@ static void tri_emit(VkCommandBuffer cb, VkDescriptorSet set)
     vkCmdSetViewport(cb, 0, 1, &vp);
     vkCmdSetScissor(cb, 0, 1, &sc);
     vkCmdBindDescriptorSets(cb, VK_PIPELINE_BIND_POINT_GRAPHICS, g_tri_pl, 0, 1, &set, 0, NULL);
+    int src_srgb = source_format == VK_FORMAT_R8G8B8A8_SRGB || source_format == VK_FORMAT_B8G8R8A8_SRGB;
+    int dst_srgb = g_sc_fmt == VK_FORMAT_R8G8B8A8_SRGB || g_sc_fmt == VK_FORMAT_B8G8R8A8_SRGB;
+    int32_t conversion = src_srgb == dst_srgb ? 0 : src_srgb ? 1 : 2;
+    vkCmdPushConstants(cb, g_tri_pl, VK_SHADER_STAGE_FRAGMENT_BIT, 0, sizeof conversion, &conversion);
     vkCmdDraw(cb, 3, 1, 0, 0);
     g_tri_drawn++;
 }
@@ -1216,7 +1166,7 @@ static vktex *tex_get(const tex_t *t)
     // Round B: build NVN 0x44 as ASTC 4x4 and transcode the blocks at upload. Same 4x4/16-byte geometry as BC3, so
     // addressing, pitch and mips are untouched - only the interpretation of the bytes changes.
     int rt_astc = 0;
-    if (g_rt_astc > 0.0f && !depth && t->d.format == 0x44 && (g_bcap & 256) && !(g_bcap & 8)) {
+    if (g_rt_astc > 0.0f && !g_tex_astc && !depth && t->d.format == 0x44 && g_compressed[VK_FORMAT_ASTC_4x4_UNORM_BLOCK] && !g_compressed[VK_FORMAT_BC3_UNORM_BLOCK]) {
         f = VK_FORMAT_ASTC_4x4_UNORM_BLOCK;
         rt_astc = 1;
     }
@@ -1251,92 +1201,67 @@ static vktex *tex_get(const tex_t *t)
                       k, v->w, v->h, t->d.format, (int)f, v->levels, v->layers, depth, (int)v->soft_bc); }
 
     VkImageCreateInfo ii = { VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO };
-    ii.imageType = VK_IMAGE_TYPE_2D;
+    VkImageViewType view_type;
+    if (!nvn_vk_image_shape(t->d.target, v->w, v->h, t->d.depth, &ii, &view_type) ||
+        (view_type == VK_IMAGE_VIEW_TYPE_CUBE_ARRAY && !g_features.imageCubeArray)) {
+        GRED("unsupported texture target %{public}d", t->d.target); goto tex_fail;
+    }
+    v->w = ii.extent.width; v->h = ii.extent.height; v->layers = ii.arrayLayers;
     ii.format = f;
-    ii.extent = (VkExtent3D){ v->w, v->h, t->d.depth > 1 ? t->d.depth : 1 };
-    if (t->d.depth > 1) v->layers = t->d.depth;
     ii.mipLevels = v->levels;
-    ii.arrayLayers = v->layers;
     ii.samples = VK_SAMPLE_COUNT_1_BIT;
     ii.tiling = VK_IMAGE_TILING_OPTIMAL;
-    // 深度图也要可采样：游戏的阴影图就是一趟深度通道写完、下一趟用比较采样器读回来。少了 SAMPLED 位，
-    // 那次读只能落回 1x1 哑图（第 88 轮画面全白的一条来源）。多了这位的代价是马良可能给深度图换一种内存布局，
-    // 实测过才算数。
-    // Depth images must be sampleable too: the game's shadow map is written by one depth pass and read back by the next through a
-    // comparison sampler. Without SAMPLED that read can only fall back to the 1x1 dummy (one source of round 88's all-white frame).
-    ii.usage = depth ? (VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT | VK_IMAGE_USAGE_SAMPLED_BIT)
-                     : (VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_SAMPLED_BIT);
-    // 自转成 ASTC 的这张不能再要 COLOR_ATTACHMENT：压缩格式做不了渲染目标（客体本来也不可能往 BC3 里画），
-    // 要了只会在 vkCreateImage 那步被驱动拒掉，整张图建不出来。
-    // A transcoded ASTC image must not ask for COLOR_ATTACHMENT: compressed formats cannot be render targets (the guest
-    // cannot draw into BC3 either), and asking for it only makes vkCreateImage fail and lose the texture.
-    if (v->rt_astc) ii.usage = VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_SAMPLED_BIT;
+    VkFormatProperties fp;
+    vkGetPhysicalDeviceFormatProperties(g_pd, f, &fp);
+    ii.usage = v->usage = nvn_vk_image_usage(fp.optimalTilingFeatures, depth);
     ii.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
-    if (v->layers > 1) ii.flags |= VK_IMAGE_CREATE_2D_ARRAY_COMPATIBLE_BIT_KHR;
-    if (vkCreateImage(g_dev, &ii, NULL, &v->img) != VK_SUCCESS) { GRED("vkCreateImage 失败 %{public}u x %{public}u 格式 %{public}d", v->w, v->h, (int)f); v->img = NULL; return NULL; }
+    if (!ii.usage) { GRED("unsupported image usage for Vk format %{public}d", (int)f); goto tex_fail; }
+    VkResult image_result = vkCreateImage(g_dev, &ii, NULL, &v->img);
+    if (image_result != VK_SUCCESS) {
+        GRED("vkCreateImage failed fmt=%{public}d usage=0x%{public}x target=%{public}d result=%{public}d",
+            (int)f, ii.usage, t->d.target, (int)image_result);
+        goto tex_fail;
+    }
     VkMemoryRequirements rq;
     vkGetImageMemoryRequirements(g_dev, v->img, &rq);
     int ti = find_type(rq, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
-    if (ti < 0) { GRED("没有可绑的内存类型"); vkDestroyImage(g_dev, v->img, NULL); v->img = NULL; return NULL; }
+    if (ti < 0) { GRED("没有可绑的内存类型"); goto tex_fail; }
     VkMemoryAllocateInfo ai = { VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO };
     ai.allocationSize = rq.size;
     ai.memoryTypeIndex = (uint32_t)ti;
-    if (vkAllocateMemory(g_dev, &ai, NULL, &v->mem) != VK_SUCCESS) { GRED("vkAllocateMemory 失败 %{public}llu", (unsigned long long)rq.size); vkDestroyImage(g_dev, v->img, NULL); v->img = NULL; return NULL; }
-    vkBindImageMemory(g_dev, v->img, v->mem, 0);
+    if (vkAllocateMemory(g_dev, &ai, NULL, &v->mem) != VK_SUCCESS) { GRED("vkAllocateMemory 失败 %{public}llu", (unsigned long long)rq.size); goto tex_fail; }
+    if (vkBindImageMemory(g_dev, v->img, v->mem, 0) != VK_SUCCESS) goto tex_fail;
     v->vk_bytes = rq.size;             // 回收站按这个数算预算 | the recycle budget counts these bytes
     VkImageViewCreateInfo iv = { VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO };
     iv.image = v->img;
-    // NVN 的 target 编号（nvn.h:778）：1=2D 2=3D 3=1D阵列 4=2D阵列 8=CUBE 9=CUBE阵列
-    // NVN target numbering (nvn.h:778): 1=2D 2=3D 3=1D array 4=2D array 8=cube 9=cube array
-    int tg = v->d.d.target;
-    iv.viewType = (tg == 4 || tg == 9 || tg == 3) ? VK_IMAGE_VIEW_TYPE_2D_ARRAY
-                : tg == 8 ? VK_IMAGE_VIEW_TYPE_CUBE
-                : tg == 2 ? VK_IMAGE_VIEW_TYPE_3D
-                : VK_IMAGE_VIEW_TYPE_2D;
+    iv.viewType = view_type;
     iv.format = f;
-    // 少于四分量时把 A 显式改写成 ONE：NVN（GL 规矩）让着色器采到 A=1.0，而 Vulkan 的恒等映射只在格式含
-    // 归一化分量时才补 1.0——R11G11B10F、RGB9E5F、R32F 这类半浮/整型格式给出的是 A=0，UI 层用的正是这些；
-    // 另外 RGBX/BGRX 在 Vulkan 里只能建成四通道格式，第四字节是客体没写的垃圾，必须让 A 走 ONE 而不是读它。
-    // A missing alpha must be spelled out: NVN (GL rules) samples such texels as A=1.0, while Vulkan's identity swizzle
-    // substitutes 1.0 only for formats with a scaled component - half-float/int packeds give 0.0 - and RGBX/BGRX can only
-    // be rebuilt as 4-channel views whose fourth byte is unwritten garbage.
-    {
-        int ch = nvc_ch((int)t->d.format);
-        if (ch == 1 || ch == 2 || ch == 3) {
-            iv.components.r = VK_COMPONENT_SWIZZLE_R;
-            iv.components.g = ch >= 2 ? VK_COMPONENT_SWIZZLE_G : VK_COMPONENT_SWIZZLE_ZERO;
-            iv.components.b = ch >= 3 ? VK_COMPONENT_SWIZZLE_B : VK_COMPONENT_SWIZZLE_ZERO;
-            iv.components.a = VK_COMPONENT_SWIZZLE_ONE;
-            if (g_tex_new < 8) GVL("[vk] 视图补 A=1：NVN 格式 %{public}d 分量 %{public}d → Vk %{public}d", (int)t->d.format, ch, (int)f);
-        }
-    }
-    // 客体显式改写过通道（nvnTextureBuilderSetSwizzle）时按它建视图。NVN 的枚举是 ZERO=0 ONE=1 R=2 G=3 B=4 A=5，
-    // Vulkan 的是 IDENTITY=0 ZERO=1 ONE=2 R=3 G=4 B=5 A=6 —— 非恒等时正好差 1。
-    // 没设过或设成恒等都不动，好让上面那条「不足四分量把 A 补成 1.0」继续生效（恒等映射在 Vulkan 里是 IDENTITY，
-    // 但 NVN 的恒等写作 R,G,B,A，两者对不足四分量格式的补值规矩不同）。
-    // When the guest explicitly reorders channels, build the view that way. The NVN enum is ZERO=0 ONE=1 R=2 G=3 B=4 A=5 and
-    // Vulkan's is IDENTITY=0 ZERO=1 ONE=2 R=3 G=4 B=5 A=6, so a non-identity swizzle is exactly +1. Unset or identity leaves the
-    // A=1.0 fix above in force: NVN spells identity as R,G,B,A, which substitutes differently than Vulkan's IDENTITY.
-    if (t->swz_set) {
-        int bad = 0;
-        for (int c = 0; c < 4; c++) if (t->swz[c] > NVN_TEXTURE_SWIZZLE_A) bad = 1;
-        if (bad) GRED("视图通道改写了非法值 %{public}u %{public}u %{public}u %{public}u（按恒等处理）", t->swz[0], t->swz[1], t->swz[2], t->swz[3]);
-        else if (t->swz[0] != NVN_TEXTURE_SWIZZLE_R || t->swz[1] != NVN_TEXTURE_SWIZZLE_G
-                 || t->swz[2] != NVN_TEXTURE_SWIZZLE_B || t->swz[3] != NVN_TEXTURE_SWIZZLE_A) {
-            iv.components.r = (VkComponentSwizzle)(t->swz[0] + 1);
-            iv.components.g = (VkComponentSwizzle)(t->swz[1] + 1);
-            iv.components.b = (VkComponentSwizzle)(t->swz[2] + 1);
-            iv.components.a = (VkComponentSwizzle)(t->swz[3] + 1);
-            if (g_tex_new < 8) GVL("[vk] 视图按客体改写 R%{public}u G%{public}u B%{public}u A%{public}u（NVN 编号）", t->swz[0], t->swz[1], t->swz[2], t->swz[3]);
-        }
-    }
+    iv.components = nvn_vk_components((int)t->d.format, t->swz, t->swz_set);
     iv.subresourceRange = (VkImageSubresourceRange){ depth ? VK_IMAGE_ASPECT_DEPTH_BIT : VK_IMAGE_ASPECT_COLOR_BIT, 0, v->levels, 0, v->layers };
-    GK("vkCreateImageView", vkCreateImageView(g_dev, &iv, NULL, &v->view));
+    if (vkCreateImageView(g_dev, &iv, NULL, &v->view) != VK_SUCCESS) goto tex_fail;
+    if (v->usage & (VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT)) {
+        // Framebuffer attachments require identity swizzles and a single mip.
+        // 3D attachment slicing needs extra views; only sampling is supported here.
+        if (ii.imageType != VK_IMAGE_TYPE_3D) {
+            iv.components = (VkComponentMapping){0};
+            iv.subresourceRange = (VkImageSubresourceRange){ nvn_vk_aspect(f), 0, 1, 0, 1 };
+            iv.viewType = ii.imageType == VK_IMAGE_TYPE_1D ? VK_IMAGE_VIEW_TYPE_1D : VK_IMAGE_VIEW_TYPE_2D;
+            if (vkCreateImageView(g_dev, &iv, NULL, &v->attachment) != VK_SUCCESS) goto tex_fail;
+        }
+    }
     v->layout = VK_IMAGE_LAYOUT_UNDEFINED;
     g_tex_new++;
     if (g_tex_new <= 8) GVL("[vk] 建贴图 serial=%{public}llu %{public}u x %{public}u x%{public}u 格式 NVN %{public}d → Vk %{public}d（第 %{public}llu 张）",
                             (unsigned long long)t->serial, v->w, v->h, v->layers, t->d.format, (int)f, (unsigned long long)g_tex_new);
     return v;
+tex_fail:
+    if (v->attachment) vkDestroyImageView(g_dev, v->attachment, NULL);
+    if (v->view) vkDestroyImageView(g_dev, v->view, NULL);
+    if (v->img) vkDestroyImage(g_dev, v->img, NULL);
+    if (v->mem) vkFreeMemory(g_dev, v->mem, NULL);
+    memset(v, 0, sizeof *v);
+    g_tex_n--; g_tex_gen++;
+    return NULL; // Transient failure must not leave a permanent empty cache hit.
 }
 
 // 只按 serial 查（不建）：探针与描述符填写用 | lookup by serial only, for probes and descriptor fills
@@ -1596,7 +1521,7 @@ static void to_layout(VkCommandBuffer cb, vktex *v, VkImageLayout want)
     case VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL:
                                            src_stage = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT;
                                            src_acc   = VK_ACCESS_COLOR_ATTACHMENT_READ_BIT | VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT; break;
-    case VK_IMAGE_LAYOUT_DEPTH_ATTACHMENT_OPTIMAL:
+    case VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL:
                                            src_stage = VK_PIPELINE_STAGE_EARLY_FRAGMENT_TESTS_BIT | VK_PIPELINE_STAGE_LATE_FRAGMENT_TESTS_BIT;
                                            src_acc   = VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_READ_BIT | VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT; break;
     case VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL:
@@ -1604,9 +1529,9 @@ static void to_layout(VkCommandBuffer cb, vktex *v, VkImageLayout want)
     case VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL:
                                            src_stage = VK_PIPELINE_STAGE_TRANSFER_BIT; src_acc = VK_ACCESS_TRANSFER_WRITE_BIT; break;
     case VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL:
-                                           src_stage = VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT; src_acc = VK_ACCESS_SHADER_READ_BIT; break;
-    case VK_IMAGE_LAYOUT_DEPTH_READ_ONLY_OPTIMAL:
-                                           src_stage = VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT |
+                                           src_stage = (VK_PIPELINE_STAGE_VERTEX_SHADER_BIT | VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT); src_acc = VK_ACCESS_SHADER_READ_BIT; break;
+    case VK_IMAGE_LAYOUT_DEPTH_STENCIL_READ_ONLY_OPTIMAL:
+                                           src_stage = (VK_PIPELINE_STAGE_VERTEX_SHADER_BIT | VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT) |
                                                        VK_PIPELINE_STAGE_EARLY_FRAGMENT_TESTS_BIT;
                                            src_acc   = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_READ_BIT; break;
     default:                              src_stage = VK_PIPELINE_STAGE_ALL_COMMANDS_BIT; src_acc = VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT; break;
@@ -1619,12 +1544,12 @@ static void to_layout(VkCommandBuffer cb, vktex *v, VkImageLayout want)
     case VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL:
                                            dst_stage = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT;
                                            dst_acc   = VK_ACCESS_COLOR_ATTACHMENT_READ_BIT | VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT; break;
-    case VK_IMAGE_LAYOUT_DEPTH_ATTACHMENT_OPTIMAL:
+    case VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL:
                                            dst_stage = VK_PIPELINE_STAGE_EARLY_FRAGMENT_TESTS_BIT | VK_PIPELINE_STAGE_LATE_FRAGMENT_TESTS_BIT;
                                            dst_acc   = VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_READ_BIT | VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT; break;
     case VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL:
-                                           dst_stage = VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT; dst_acc = VK_ACCESS_SHADER_READ_BIT; break;
-    case VK_IMAGE_LAYOUT_DEPTH_READ_ONLY_OPTIMAL: dst_stage = VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT |
+                                           dst_stage = (VK_PIPELINE_STAGE_VERTEX_SHADER_BIT | VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT); dst_acc = VK_ACCESS_SHADER_READ_BIT; break;
+    case VK_IMAGE_LAYOUT_DEPTH_STENCIL_READ_ONLY_OPTIMAL: dst_stage = (VK_PIPELINE_STAGE_VERTEX_SHADER_BIT | VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT) |
                                                        VK_PIPELINE_STAGE_EARLY_FRAGMENT_TESTS_BIT;
                                            dst_acc   = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_READ_BIT; break;
     default:                              dst_stage = VK_PIPELINE_STAGE_ALL_COMMANDS_BIT; dst_acc = VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT; break;
@@ -1635,7 +1560,7 @@ static void to_layout(VkCommandBuffer cb, vktex *v, VkImageLayout want)
     b.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
     b.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
     b.image = v->img;
-    b.subresourceRange = (VkImageSubresourceRange){ v->is_depth ? VK_IMAGE_ASPECT_DEPTH_BIT : VK_IMAGE_ASPECT_COLOR_BIT, 0, v->levels, 0, v->layers };
+    b.subresourceRange = (VkImageSubresourceRange){ nvn_vk_aspect(v->fmt), 0, v->levels, 0, v->layers };
     b.srcAccessMask = src_acc;
     b.dstAccessMask = dst_acc;
     vkCmdPipelineBarrier(cb, src_stage, dst_stage, 0, 0, NULL, 0, NULL, 1, &b);
@@ -1712,7 +1637,7 @@ static VkImageLayout col_rest(void)
 }
 static VkImageLayout dep_rest(void)
 {
-    return (g_skip & 8192) ? VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL : VK_IMAGE_LAYOUT_DEPTH_READ_ONLY_OPTIMAL;
+    return (g_skip & 8192) ? VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL : VK_IMAGE_LAYOUT_DEPTH_STENCIL_READ_ONLY_OPTIMAL;
 }
 
 static VkRenderPass rp_get(uint64_t key)
@@ -1755,7 +1680,7 @@ static VkRenderPass rp_get(uint64_t key)
         // the next pass' shadow read then needs no extra barrier.
         ad[n] = (VkAttachmentDescription){ 0, g_p.dv->fmt, VK_SAMPLE_COUNT_1_BIT,
             VK_ATTACHMENT_LOAD_OP_LOAD, VK_ATTACHMENT_STORE_OP_STORE,
-            VK_ATTACHMENT_LOAD_OP_DONT_CARE, VK_ATTACHMENT_STORE_OP_DONT_CARE,
+            VK_ATTACHMENT_LOAD_OP_LOAD, VK_ATTACHMENT_STORE_OP_STORE,
             dep_rest(), dep_rest() };
         n++;
     }
@@ -1771,20 +1696,12 @@ static VkRenderPass rp_get(uint64_t key)
     // 通道要读上一趟留在图里的内容，这条排序必须真生效，否则读到的就是竞态垃圾。
     // The struct's 3rd/4th slots are STAGE masks, not access masks - the old literal put access bits there, so the
     // dependency ordered nothing. With the pass now loading previous content, that ordering is load-bearing.
-    VkSubpassDependency dep = { VK_SUBPASS_EXTERNAL, 0,
-        VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT | VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT |
-        VK_PIPELINE_STAGE_TRANSFER_BIT | (g_p.has_ds ? VK_PIPELINE_STAGE_EARLY_FRAGMENT_TESTS_BIT : 0),
-        VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT | (g_p.has_ds ? VK_PIPELINE_STAGE_EARLY_FRAGMENT_TESTS_BIT : 0),
-        VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT | VK_ACCESS_COLOR_ATTACHMENT_READ_BIT | VK_ACCESS_SHADER_READ_BIT |
-        VK_ACCESS_TRANSFER_WRITE_BIT | (g_p.has_ds ? (VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_READ_BIT |
-                                                      VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT) : 0),
-        VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT | VK_ACCESS_COLOR_ATTACHMENT_READ_BIT |
-        (g_p.has_ds ? (VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_READ_BIT | VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT) : 0),
-        VK_DEPENDENCY_BY_REGION_BIT };
+    VkSubpassDependency dep[2];
+    nvn_vk_pass_dependencies(dep);
     VkRenderPassCreateInfo rpc = { VK_STRUCTURE_TYPE_RENDER_PASS_CREATE_INFO };
     rpc.attachmentCount = n; rpc.pAttachments = ad;
     rpc.subpassCount = 1; rpc.pSubpasses = &sp;
-    rpc.dependencyCount = 1; rpc.pDependencies = &dep;
+    rpc.dependencyCount = 2; rpc.pDependencies = dep;
     VkRenderPass rp = NULL;
     if (vkCreateRenderPass(g_dev, &rpc, NULL, &rp) != VK_SUCCESS) { GRED("vkCreateRenderPass(游戏) 失败"); return NULL; }
     g_rpc[g_rpc_n++] = (rpcache){ key, rp };
@@ -1798,14 +1715,14 @@ static VkFramebuffer fb_get(uint64_t key, VkRenderPass rp, VkExtent2D ext, int h
     for (int i = 0; i < g_fbc_n; i++)
         if (g_fbc[i].key == key && g_fbc[i].w == ext.width && g_fbc[i].h == ext.height && g_fbc[i].ncol == ncol && g_fbc[i].ds == has_ds) {
             int same = 1;
-            for (uint32_t c = 0; c < ncol; c++) if (g_fbc[i].v[c] != g_p.cv[c]->view) same = 0;
-            if (has_ds && g_fbc[i].v[ncol] != g_p.dv->view) same = 0;
+            for (uint32_t c = 0; c < ncol; c++) if (g_fbc[i].v[c] != g_p.cv[c]->attachment) same = 0;
+            if (has_ds && g_fbc[i].v[ncol] != g_p.dv->attachment) same = 0;
             if (same) return g_fbc[i].fb;
         }
     if (g_fbc_n >= FBC_N) { GRED("帧缓冲缓存满了（%{public}d）", FBC_N); return NULL; }
     VkImageView av[9]; uint32_t n = 0;
-    for (uint32_t i = 0; i < ncol; i++) av[n++] = g_p.cv[i]->view;
-    if (has_ds) av[n++] = g_p.dv->view;
+    for (uint32_t i = 0; i < ncol; i++) av[n++] = g_p.cv[i]->attachment;
+    if (has_ds) av[n++] = g_p.dv->attachment;
     VkFramebufferCreateInfo fbi = { VK_STRUCTURE_TYPE_FRAMEBUFFER_CREATE_INFO };
     fbi.renderPass = rp;
     fbi.attachmentCount = n; fbi.pAttachments = av;
@@ -1851,33 +1768,33 @@ static void do_set_rt(const p_set_rt *r)
     for (int i = 0; i < ncol_req; i++) {
         if (!r->color[i]) continue;
         vktex *v = tex_get(r->color[i]);
-        if (!v || !v->view) continue;
+        if (!v || !v->attachment) continue;
         int dup = 0;
-        for (int k = 0; k < nused; k++) if (used[k] == v->view) { dup = 1; break; }
+        for (int k = 0; k < nused; k++) if (used[k] == v->attachment) { dup = 1; break; }
         if (dup) continue;
-        if (nused < 9) used[nused++] = v->view;
+        if (nused < 9) used[nused++] = v->attachment;
         for (int k = 0; k < g_src_n; k++) if (g_src_v[k] == v) { atomic_fetch_add(&g_rt_src_pass, 1); atomic_fetch_add(&g_src_att[k], 1); g_att_src = 1; break; }
         g_p.cv[g_p.ncol] = v;
         v->drawn = 1;                       // 当过附件 = 这张图会有内容（按需建图那条路的判据之一）
         if (g_sp_tex[0] && v == g_sp_tex[0]) { g_in1_cur = 1; atomic_fetch_add(&g_in1_pass, 1); }
-        att(&g_p.col[g_p.ncol], v->view, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL, NULL, 0);
+        att(&g_p.col[g_p.ncol], v->attachment, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL, NULL, 0);
         g_p.ncol++;
     }
     if (r->depth) {
         vktex *v = tex_get(r->depth);
-        if (v && v->view) {
+        if (v && v->attachment) {
             int dup = 0;
-            for (int k = 0; k < nused; k++) if (used[k] == v->view) dup = 1;
+            for (int k = 0; k < nused; k++) if (used[k] == v->attachment) dup = 1;
             if (dup) { v = NULL; GRED("深度附件与颜色同图：这刀不挂深度"); }
         }
-        if (v && v->view && !(g_skip & 4)) {
+        if (v && v->attachment && !(g_skip & 4)) {
             g_p.dv = v;
             v->drawn = 1;                   // 同上：深度附件写过就有内容
             VkClearValue c = { .depthStencil = { 1.0f, 0 } };
             memset(&g_p.ds, 0, sizeof g_p.ds);
             g_p.ds.sType = VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO;
-            g_p.ds.imageView = v->view;
-            g_p.ds.imageLayout = VK_IMAGE_LAYOUT_DEPTH_ATTACHMENT_OPTIMAL;
+            g_p.ds.imageView = v->attachment;
+            g_p.ds.imageLayout = VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL;
             g_p.ds.loadOp = VK_ATTACHMENT_LOAD_OP_DONT_CARE;
             g_p.ds.storeOp = VK_ATTACHMENT_STORE_OP_DONT_CARE;
             g_p.ds.clearValue = c;
@@ -2620,7 +2537,7 @@ uint64_t mtl_present(const tex_t *t, double period_s, const int crop[4])
         rpb.clearValueCount = 1;
         rpb.pClearValues = &cv;
         vkCmdBeginRenderPass(pcb, &rpb, VK_SUBPASS_CONTENTS_INLINE);
-        if (triset) tri_emit(pcb, triset);
+        if (triset) tri_emit(pcb, triset, v->fmt);
         vkCmdEndRenderPass(pcb);
     }
     vkEndCommandBuffer(pcb);
@@ -3088,12 +3005,16 @@ static void probe_bc(void)
         { 16, VK_FORMAT_BC4_UNORM_BLOCK, "BC4" }, { 32, VK_FORMAT_BC5_UNORM_BLOCK, "BC5" },
         { 64, VK_FORMAT_BC6H_UFLOAT_BLOCK, "BC6H" }, { 128, VK_FORMAT_BC7_UNORM_BLOCK, "BC7" },
         { 256, VK_FORMAT_ASTC_4x4_UNORM_BLOCK, "ASTC4" } };
+    memset(g_compressed, 0, sizeof g_compressed);
+    for (int f = VK_FORMAT_BC1_RGB_UNORM_BLOCK; f <= VK_FORMAT_ASTC_12x12_SRGB_BLOCK; f++) {
+        VkFormatProperties fp;
+        vkGetPhysicalDeviceFormatProperties(g_pd, (VkFormat)f, &fp);
+        g_compressed[f] = nvn_vk_compressed_supported((VkFormat)f, fp.optimalTilingFeatures, &g_features);
+    }
     uint32_t got = 0;
     char line[128]; int q = snprintf(line, sizeof line, "[vk] 压缩格式：");
     for (int i = 0; i < 9; i++) {
-        VkFormatProperties fp;
-        vkGetPhysicalDeviceFormatProperties(g_pd, t[i].f, &fp);
-        int ok = (fp.optimalTilingFeatures & VK_FORMAT_FEATURE_SAMPLED_IMAGE_BIT) != 0;
+        int ok = g_compressed[t[i].f];
         if (ok) got |= t[i].bit;
         if (q < (int)sizeof line - 12) q += snprintf(line + q, sizeof line - q, " %s%d", t[i].n, ok);
     }
@@ -3120,8 +3041,8 @@ static void probe_bc(void)
                 GVL("[vk] 包内素材已烘 ASTC（%{public}s）：自动按 ASTC 4x4 建图", mk);
             }
         }
-        g_tex_astc = want && (got & 256) && !(got & 8);
-        if (want && !g_tex_astc)
+        g_tex_astc = want; // Asset encoding is independent of the GPU's BC support.
+        if (want && !(got & 256))
             GVL("[vk] DM_TEX_ASTC=1 没生效：ASTC4 收不收=%{public}d BC3 收不收=%{public}d", (got & 256) != 0, (got & 8) != 0);
         else if (g_tex_astc)
             GVL("[vk] DM_TEX_ASTC=1：NVN 0x44 按 ASTC 4x4 建图，不再 CPU 软解（素材须已在构建机转好）");
@@ -3133,8 +3054,9 @@ static void probe_bc(void)
     {
         const char *s = getenv("DM_RT_ASTC");
         float p = s ? (float)atof(s) : 0.0f;
-        if (p > 0.0f && (got & 256) && !(got & 8)) {
-            if (g_tex_astc) { g_tex_astc = 0; GVL("[vk] DM_RT_ASTC 顶掉了 DM_TEX_ASTC：设备自转要读原厂 BC3，不能再按已烘的字节建图"); }
+        if (p > 0.0f && g_tex_astc) {
+            GRED("DM_RT_ASTC ignored: baked ASTC assets cannot be decoded as BC3");
+        } else if (p > 0.0f && (got & 256) && !(got & 8)) {
             if (!rt_astc_init(p)) {
                 g_rt_astc = p;
                 // 同一轮里就把缓存装没装说清楚：装上了回目录，没装回原因（探针读空先自证装没装）
@@ -3692,20 +3614,17 @@ static uint64_t g_arena_off, g_arena_gen;
 typedef struct { uint64_t addr, len, gen, stamp; uint32_t off; } adedup;
 static adedup g_ahash[8192];         // 直映缓存：同一提交里同 (地址, 长度) 且客体没再写过，才只搬一次 | one copy per (address, length) inside a submission, and only while the guest has not written it again
 static _Atomic uint64_t g_adup_hit, g_adup_new, g_adup_bad, g_arena_full, g_adup_dirty;
-// 去重命中 ≠ 内容还是那份。AH 轮实测：只翻 DM_ARENA_NODUP（同一个二进制）菜单文字就全回来了
-// ⇒ 客体在同一提交里把同一块（同地址、同长度）改写后再绑，去重把上一次的副本当成同一份交了出去。
-// 旧判据是命中时 memcmp 前 4 KB（vtx_check），只数不修，而且改写落在 4 KB 之外就看不见——陈旧0 就是这么来的。
-// 现在用写保护脏页戳判：搬的时候取戳，命中的时候问「这几页在戳之后被动过没有」，动过就作废重搬。
-// A dedup hit does not prove the bytes are still the same. Round AH proved it: the only change was
-// DM_ARENA_NODUP on the same binary, and the menu text came back -- the guest rewrites the same
-// (address, length) block inside one submission. The old check (a 4 KB memcmp on hit) only counted,
-// and missed any rewrite past the first 4 KB, which is why 陈旧 read 0. Now the copy carries a dirty-page
-// stamp and a hit asks whether those pages moved since it.
-static int arena_rewritten(const void *p, size_t n, uint64_t stamp)
+// Guest buffers can be rewritten at the same address within one submission.
+// Dirty-page generations stop advancing once a fault makes a page writable;
+// tracking registration alone does not prove the bytes stayed unchanged.
+// Compare the entire cached range before reusing vertex, index or UBO data.
+// A prefix check misses later glyphs/vertices, and returning an older copy
+// produces stretched triangles and missing text.
+static int arena_rewritten(const void *p, size_t n, uint32_t off)
 {
-    if (!stamp || !p) return 1;                        // 没戳 ⇒ 不敢复用 | no stamp: never reuse
-    if (!nvn_dirty_tracked(p, n)) return 1;            // 这块没在写保护名单里 ⇒ 无从判断，保守重搬 | untracked: cannot tell, so re-move
-    return nvn_dirty_since(p, n, stamp);
+    if (!p || !g_arena_map || off > ARENA_SZ - ARENA_GUARD ||
+        n > ARENA_SZ - ARENA_GUARD - off) return 1;
+    return memcmp(p, g_arena_map + off, n) != 0;
 }
 // 上一次 arena_put 走的是哪条路：1 = 去重命中（这份拷贝是更早某笔绘制留下的），0 = 这次真从客体搬的。
 // 顶点流要在命中时拿客体原字节对一遍——命中意味着「同一提交里同一块又被画了一次」，而客体完全可能在两笔
@@ -3737,20 +3656,21 @@ static uint64_t arena_put(uint64_t addr, uint64_t len, uint64_t floor_sz, uint32
     g_ahit = 0;
     if (!addr) return 0;
     if (!len) len = 1;
-    uint64_t need = (len > floor_sz ? len : floor_sz) & ~(uint64_t)15;
-    need += 15;
+    uint64_t reserve = len > floor_sz ? len : floor_sz;
+    if (reserve > ARENA_SZ - ARENA_GUARD) { atomic_fetch_add(&g_arena_full, 1); return 0; }
+    uint64_t need = (reserve + 15) & ~(uint64_t)15;
     unsigned slot = (unsigned)(((addr ^ (len * 0x9E3779B1u)) * 0x9E3779B97F4A7C15ull) >> 51) & 8191u;
     adedup *h = &g_ahash[slot];
     void *base; uint64_t bo;
     if (!g_arena_nodup && h->gen == g_arena_gen && h->addr == addr && h->len == len && mtl_addr(addr, len, &base, &bo)) {
-        if (!arena_rewritten((uint8_t *)base + bo, len, h->stamp)) {
+        if (!arena_rewritten((uint8_t *)base + bo, len, h->off)) {
             arena_arm((uint8_t *)base + bo, len);   // 命中也补一次保护：上一次可能因 BUSY 断段没落地
             *off = h->off; g_ahit = 1; g_arena_stamp = h->stamp; atomic_fetch_add(&g_adup_hit, 1); return 1;
         }
         atomic_fetch_add(&g_adup_dirty, 1);   // 键对上了但内容被客体改过 ⇒ 去重作废，走下面的重搬
     }
     if (!mtl_addr(addr, len, &base, &bo)) { atomic_fetch_add(&g_adup_bad, 1); return 0; }   // 不在任何池里：宁可不画 | not inside a pool: skip rather than dereference
-    if (g_arena_off + need > ARENA_SZ - ARENA_GUARD) { atomic_fetch_add(&g_arena_full, 1); return 0; }
+    if (g_arena_off > ARENA_SZ - ARENA_GUARD || need > ARENA_SZ - ARENA_GUARD - g_arena_off) { atomic_fetch_add(&g_arena_full, 1); return 0; }
     uint64_t o = g_arena_off;
     g_arena_off = o + need;
     // 先设只读、再取戳、最后搬：这三步之后客体发生的每一次写都必然缺页 ⇒ 代号必 > 本戳 ⇒ 下一次命中判得出。
@@ -4221,7 +4141,7 @@ static VkFormat vfmt_of2(int f, uint32_t *sz)
     return 0;
 }
 
-typedef struct { VkFormat f; uint32_t off, binding; int constant; } vtx_plan;   // binding 16 = 常数零流 | binding 16 is the constant zero stream
+typedef struct { VkFormat f; uint32_t off, binding; int constant; } vtx_plan;   // binding 16 is only a fallback sentinel; the pipeline chooses a free slot in 0..15.
 #define VTX_CONST_BINDING 16
 
 static void vtx_plan_for(int loc, int cls, vtx_plan *out)
@@ -4242,6 +4162,21 @@ static void vtx_plan_for(int loc, int cls, vtx_plan *out)
     uint32_t stride = S.stream[st].stride;
     if (stride && a.offset + sz > stride) return;   // 属性越出步长：交给常数流，别读别人的数据 | attribute outside the stride: constant stream, never read a neighbour's bytes
     out->f = m; out->off = stride ? a.offset : 0; out->binding = (uint32_t)st; out->constant = 0;
+}
+
+// Vulkan guarantees 16 vertex bindings; reserve an unused one for fallback
+// attributes instead of unconditionally using binding 16 (outside that limit).
+static uint32_t vtx_const_binding(int vi)
+{
+    uint32_t used = 0;
+    const shb_entry *ve = &g_shb_e[vi];
+    for (int v = 0; v < ve->nvi; v++) {
+        int i = ve->vi_off + v;
+        vtx_plan p; vtx_plan_for(g_shb_vi[i].loc, g_shb_vi[i].cls, &p);
+        if (!p.constant) used |= 1u << p.binding;
+    }
+    for (int b = 15; b >= 0; b--) if (!(used & (1u << b))) return (uint32_t)b;
+    return VTX_CONST_BINDING;
 }
 
 // ---- 管线缓存 | the pipeline cache ----
@@ -4372,18 +4307,20 @@ static VkPipeline pipe_get(int vi, int fi, int prim, VkRenderPass rp, uint64_t p
     if (g_pipe_n >= PIPE_N) { static int said; if (!said++) GRED("管线缓存满了（%{public}d）", PIPE_N); return NULL; }
     VkPipelineLayout pl = ply_get(vi, fi);
     if (!pl) return NULL;
-    // 顶点输入：按着色器声明的属性建，绑不动的一律走 16 号常数零流
-    // Vertex input: one description per declared attribute; anything we cannot wire falls back to binding 16, a zero stream.
+    // Vertex input: fallback attributes share a free binding within 0..15.
     const shb_entry *ve = &g_shb_e[vi];
-    VkVertexInputAttributeDescription va[32]; VkVertexInputBindingDescription vb[17];
-    uint32_t nva = 0; uint32_t used = 1u << VTX_CONST_BINDING;
+    VkVertexInputAttributeDescription va[32]; VkVertexInputBindingDescription vb[16];
+    uint32_t nva = 0, used = 0, constant_binding = vtx_const_binding(vi);
+    int has_constant = 0;
     for (int v = 0; v < ve->nvi && nva < 32; v++) {
         int loc = g_shb_vi[ve->vi_off + v].loc, cls = g_shb_vi[ve->vi_off + v].cls;
         vtx_plan p; vtx_plan_for(loc, cls, &p);
         if (p.constant) {
             static int said;   // 回退也按 cls 给宽度：整数输入配整数格式，否则是非法组合 | the fallback keeps the declared class: an integer input needs an integer format
             if (!said++) GVL("[vk] 顶点属性 %{public}d 接不上（NVN 格式 %{public}#x），走常数零流", loc, S.attr[loc < 16 ? loc : 0].fmt);
-            va[nva++] = (VkVertexInputAttributeDescription){ (uint32_t)loc, VTX_CONST_BINDING,
+            if (constant_binding >= 16) { GRED("no free vertex binding for fallback attribute"); return NULL; }
+            has_constant = 1;
+            va[nva++] = (VkVertexInputAttributeDescription){ (uint32_t)loc, constant_binding,
                 cls == 1 ? VK_FORMAT_R32G32B32A32_UINT : cls == 2 ? VK_FORMAT_R32G32B32A32_SINT : VK_FORMAT_R32G32B32A32_SFLOAT, 0 };
         } else {
             va[nva++] = (VkVertexInputAttributeDescription){ (uint32_t)loc, p.binding, p.f, p.off };
@@ -4391,7 +4328,7 @@ static VkPipeline pipe_get(int vi, int fi, int prim, VkRenderPass rp, uint64_t p
         }
     }
     uint32_t nvb = 0;
-    vb[nvb++] = (VkVertexInputBindingDescription){ VTX_CONST_BINDING, 0, VK_VERTEX_INPUT_RATE_INSTANCE };
+    if (has_constant) vb[nvb++] = (VkVertexInputBindingDescription){ constant_binding, 0, VK_VERTEX_INPUT_RATE_INSTANCE };
     for (int st = 0; st < 16; st++) if (used & (1u << st))
         vb[nvb++] = (VkVertexInputBindingDescription){ (uint32_t)st, S.stream[st].stride,
             S.stream[st].stride ? (S.stream[st].divisor ? VK_VERTEX_INPUT_RATE_INSTANCE : VK_VERTEX_INPUT_RATE_VERTEX) : VK_VERTEX_INPUT_RATE_INSTANCE };
@@ -4410,6 +4347,9 @@ static VkPipeline pipe_get(int vi, int fi, int prim, VkRenderPass rp, uint64_t p
     VkPolygonMode pmode = S.poly.mode == NVN_POLYGON_MODE_POINT ? VK_POLYGON_MODE_POINT
                         : S.poly.mode == NVN_POLYGON_MODE_LINE ? VK_POLYGON_MODE_LINE : VK_POLYGON_MODE_FILL;
     VkPipelineRasterizationStateCreateInfo rs = { VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO };
+    if (pmode != VK_POLYGON_MODE_FILL && !g_features.fillModeNonSolid) {
+        GRED("non-solid fill unsupported by device"); return NULL;
+    }
     rs.polygonMode = pmode; rs.cullMode = cull;
     // 第 99 轮：「输入1」整张是黑的，两种经典全黑成因各给一个开关，一次构建做 A/B——剔背面剔光了 / 深度测试全灭。
     // Round 99: the scene input is all black. Two classic causes of exactly that, each behind its own bit so one build A/B's both:
@@ -4459,6 +4399,10 @@ static VkPipeline pipe_get(int vi, int fi, int prim, VkRenderPass rp, uint64_t p
     }
     VkPipelineColorBlendStateCreateInfo cbs = { VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO };
     cbs.attachmentCount = g_p.ncol; cbs.pAttachments = cba;
+    if (!g_features.independentBlend) for (uint32_t i = 1; i < g_p.ncol; i++)
+        if (memcmp(&cba[0], &cba[i], sizeof cba[0])) {
+            GRED("independent MRT blend unsupported by device"); return NULL;
+        }
     // 模板三样必须是动态的：emit_dyn 每次都在发 vkCmdSetStencilCompareMask/WriteMask/Reference，
     // 没声明进这张表就是未定义行为（校验层会直接判错），而管线里烘的又是写死的 0xFF/0 —— 客体给的掩码全丢。
     // The three stencil states must be dynamic: emit_dyn issues vkCmdSetStencil* every time, which is undefined unless
@@ -4750,7 +4694,7 @@ static int set_fill(VkDescriptorSet set, int ei, int stage)
             // in its own pass without a self-dependency is a race, so that case keeps the dummy.
             int in_att = v && g_p.rp && (v == g_p.dv);
             if (v && v->view && v->is_depth && sh && !in_att && !(g_skip & 8192) && tex_has_content(v)) {
-                iv = v->view; lay = VK_IMAGE_LAYOUT_DEPTH_READ_ONLY_OPTIMAL;
+                iv = v->view; lay = VK_IMAGE_LAYOUT_DEPTH_STENCIL_READ_ONLY_OPTIMAL;
                 atomic_fetch_add(&g_bind_real, 1);
                 atomic_fetch_add(&g_b_shadow, 1);
                 if (stage >= 0 && stage < 6) atomic_fetch_add(&g_bind_real_st[stage], 1);
@@ -5017,7 +4961,7 @@ static int vtx_stream(int st, uint32_t *off)
         // 同一条流在本提交里没换绑 ≠ 客体没重写它：饥荒的字形流就是同地址同长度反复改写再绑的（AH 轮判死）
         int rewritten = 1;
         void *gb = NULL; uint64_t gbo = 0;
-        if (a && l && mtl_addr(a, l, &gb, &gbo) && gb) rewritten = arena_rewritten((uint8_t *)gb + gbo, l, g_vtx[st].stamp);
+        if (a && l && mtl_addr(a, l, &gb, &gbo) && gb) rewritten = arena_rewritten((uint8_t *)gb + gbo, l, g_vtx[st].off);
         if (!rewritten) {
             *off = g_vtx[st].off;
             if (g_vtx[st].ok) vtx_check(a, l, g_vtx[st].off);
@@ -5168,7 +5112,7 @@ static void emit_dyn(VkCommandBuffer cb, VkExtent2D ext)
         sc.offset.y = sy < 0 ? 0 : sy;
     }
     vkCmdSetScissor(cb, 0, 1, &sc);
-    vkCmdSetDepthBias(cb, S.po.units, S.po.clamp, S.po.factor);
+    vkCmdSetDepthBias(cb, S.po.units, g_features.depthBiasClamp ? S.po.clamp : 0.0f, S.po.factor);
     vkCmdSetBlendConstants(cb, S.blend_color);
     vkCmdSetStencilCompareMask(cb, VK_STENCIL_FACE_FRONT_BIT, S.st_vmask[0]);
     vkCmdSetStencilCompareMask(cb, VK_STENCIL_FACE_BACK_BIT, S.st_vmask[1]);
@@ -5205,7 +5149,7 @@ static uint32_t arena_raw(uint64_t addr, uint64_t len)
     if (!addr || !len) return 0xFFFFFFFFu;
     if (!mtl_addr(addr, len, &base, &bo)) { atomic_fetch_add(&g_b2t_noaddr, 1); return 0xFFFFFFFFu; }
     uint64_t need = (len + 15) & ~(uint64_t)15;
-    uint64_t o = (g_arena_off + 15) & ~(uint64_t)15;   // 拷贝的缓冲偏移要 16 对齐：arena_put 的记账会把游标弄歪，这里自己夹回来
+    uint64_t o = (g_arena_off + 15) & ~(uint64_t)15;   // Copy buffer offsets remain 16-byte aligned.
     if (o + need > ARENA_SZ - ARENA_GUARD) { atomic_fetch_add(&g_arena_full, 1); return 0xFFFFFFFFu; }
     g_arena_off = o + need;
     memcpy(g_arena_map + o, (uint8_t *)base + bo, len);
@@ -5271,8 +5215,20 @@ static void do_copy_b2t(const p_copy_b2t *c)
     if (!bpb) { atomic_fetch_add(&g_b2t_comp, 1); return; }   // 认不出的格式：等 CPU 解码那一刀
     unsigned level = (c->has_view && c->view.set_levels) ? (unsigned)c->view.base_level : 0u;
     unsigned layer0 = (c->has_view && c->view.set_layers) ? (unsigned)c->view.min_layer : 0u;
-    if (level >= v->levels) return;
-    int nz = c->r.depth > 1 ? c->r.depth : 1;
+    if (level >= v->levels || level >= 32) return;
+    uint32_t mip_w = v->w >> level, mip_h = v->h >> level;
+    uint32_t mip_d = v->d.d.target == 2 ? v->d.d.depth >> level : v->layers;
+    if (!mip_w) mip_w = 1;
+    if (!mip_h) mip_h = 1;
+    if (!mip_d) mip_d = 1;
+    if (layer0 >= mip_d || !nvn_vk_copy_fits(mip_w, mip_h, mip_d - layer0,
+            c->r.xoffset, c->r.yoffset, c->r.zoffset, c->r.width, c->r.height, c->r.depth, bw, bh)) {
+        atomic_fetch_add(&g_b2t_comp, 1); return;
+    }
+    uint64_t source_pitch = nvn_vk_copy_pitch(S.copy_stride, (uint32_t)c->r.width,
+                                               (uint32_t)bw, (uint32_t)bpb);
+    if (!source_pitch) { atomic_fetch_add(&g_b2t_comp, 1); return; }
+    int nz = c->r.depth;
     if (v->rt_astc) {
         // B 路（显式 B2T 那一路）：与打包上传同一个转码口径。ASTC 4x4 与 BC3 块数相同，所以区域、行距照抄压缩块那条。
         if (c->r.xoffset % 4u || c->r.yoffset % 4u) {
@@ -5290,7 +5246,7 @@ static void do_copy_b2t(const p_copy_b2t *c)
         if (dw > lw) dw = lw;
         if (dh > lh) dh = lh;
         uint32_t nbx = (dw + 3u) / 4u, nby = (dh + 3u) / 4u;
-        uint64_t sp = (S.copy_stride > 0 && ((uint64_t)S.copy_stride % 16u) == 0) ? (uint64_t)S.copy_stride : (uint64_t)nbx * 16u;
+        uint64_t sp = source_pitch;
         uint64_t s_img = sp * nby;
         size_t need = (size_t)nbx * (size_t)nby * 16u;
         void *sb = NULL; uint64_t sbo = 0;
@@ -5305,21 +5261,14 @@ static void do_copy_b2t(const p_copy_b2t *c)
             }
         }
         to_layout(g_cb, v, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
-        VkBufferImageCopy reg[16]; int nreg = 0;
-        for (int z = 0; z < nz && nreg < 16; z++) {
-            uint32_t layer = layer0 + (uint32_t)(c->r.zoffset + z);
-            if (v->d.d.target == 2) layer = 0;
-            reg[nreg++] = (VkBufferImageCopy){
-                .bufferOffset = ao + (uint64_t)z * need,
+        VkBufferImageCopy reg = (VkBufferImageCopy){
+                .bufferOffset = ao,
                 .bufferRowLength = 0,
                 .bufferImageHeight = 0,
-                .imageSubresource = (VkImageSubresourceLayers){ VK_IMAGE_ASPECT_COLOR_BIT, level, layer, 1 },
+                .imageSubresource = (VkImageSubresourceLayers){ VK_IMAGE_ASPECT_COLOR_BIT, level, v->d.d.target == 2 ? 0u : layer0 + (uint32_t)c->r.zoffset, v->d.d.target == 2 ? 1u : (uint32_t)nz },
                 .imageOffset = { c->r.xoffset, c->r.yoffset, v->d.d.target == 2 ? c->r.zoffset : 0 },
-                .imageExtent = { nbx * 4u, nby * 4u, v->d.d.target == 2 ? nz : 1u } };
-            if (v->d.d.target != 2) continue;
-            break;
-        }
-        vkCmdCopyBufferToImage(g_cb, g_arena, v->img, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, (uint32_t)nreg, reg);
+                .imageExtent = { dw, dh, v->d.d.target == 2 ? nz : 1u } };
+        vkCmdCopyBufferToImage(g_cb, g_arena, v->img, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &reg);
         v->uploaded = 1;
         to_layout(g_cb, v, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
         atomic_fetch_add(&g_b2t_ok, 1); atomic_fetch_add(&g_b2t_rt, 1);
@@ -5330,8 +5279,8 @@ static void do_copy_b2t(const p_copy_b2t *c)
         // 解码器复用 dm/gfx/tex/nvn_bcdec.c（BC1–BC7 / BC6H，Metal 后端一直在用），目标格式与它给的每像素字节数一致。
         uint32_t pf; int bpp = 4;
         if (!nvn_bc_unpacked((uint32_t)v->d.d.format, &pf, &bpp)) { atomic_fetch_add(&g_b2t_comp, 1); return; }
-        uint32_t nbx = (uint32_t)((c->r.width + bw - 1) / bw), nby = (uint32_t)((c->r.height + bh - 1) / bh);
-        uint64_t sp = (S.copy_stride > 0 && ((uint64_t)S.copy_stride % (uint64_t)bpb) == 0) ? (uint64_t)S.copy_stride : (uint64_t)nbx * bpb;
+        uint32_t nby = (uint32_t)((c->r.height + bh - 1) / bh);
+        uint64_t sp = source_pitch;
         uint64_t s_img = sp * nby;
         uint32_t dw = (uint32_t)c->r.width, dh = (uint32_t)c->r.height;
         uint32_t lw = (v->w >> level) ? (v->w >> level) : 1u, lh = (v->h >> level) ? (v->h >> level) : 1u;
@@ -5353,21 +5302,14 @@ static void do_copy_b2t(const p_copy_b2t *c)
         }
         to_layout(g_cb, v, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
         up_probe("软解", g_arena_map + ao, d_img * (uint64_t)nz, dw, dh, 1);
-        VkBufferImageCopy reg[16]; int nreg = 0;
-        for (int z = 0; z < nz && nreg < 16; z++) {
-            uint32_t layer = layer0 + (uint32_t)(c->r.zoffset + z);
-            if (v->d.d.target == 2) layer = 0;
-            reg[nreg++] = (VkBufferImageCopy){
-                .bufferOffset = ao + (uint64_t)z * d_img,
+        VkBufferImageCopy reg = (VkBufferImageCopy){
+                .bufferOffset = ao,
                 .bufferRowLength = (uint32_t)(d_row / (uint64_t)bpp),
                 .bufferImageHeight = dh,
-                .imageSubresource = (VkImageSubresourceLayers){ VK_IMAGE_ASPECT_COLOR_BIT, level, layer, 1 },
+                .imageSubresource = (VkImageSubresourceLayers){ VK_IMAGE_ASPECT_COLOR_BIT, level, v->d.d.target == 2 ? 0u : layer0 + (uint32_t)c->r.zoffset, v->d.d.target == 2 ? 1u : (uint32_t)nz },
                 .imageOffset = { c->r.xoffset, c->r.yoffset, v->d.d.target == 2 ? c->r.zoffset : 0 },
                 .imageExtent = { dw, dh, v->d.d.target == 2 ? nz : 1u } };
-            if (v->d.d.target != 2) continue;
-            break;
-        }
-        vkCmdCopyBufferToImage(g_cb, g_arena, v->img, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, (uint32_t)nreg, reg);
+        vkCmdCopyBufferToImage(g_cb, g_arena, v->img, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &reg);
         v->uploaded = 1;
         // 传完就转可采样：游戏的用法是「上传完下一帧就当贴图采」，留在 TRANSFER_DST 会让绑定时布局不对
         // (第 85 轮实测：1131 次真图绑定，布局不对 1131 次，一次都没对上)。
@@ -5397,28 +5339,20 @@ static void do_copy_b2t(const p_copy_b2t *c)
     if (ebw > mbw) ebw = mbw;
     if (ebh > mbh) ebh = mbh;
     if (!ebw || !ebh) return;
-    uint64_t st = (uint64_t)S.copy_stride;
-    uint64_t row = (S.copy_stride > 0 && (st % (uint64_t)bpb) == 0) ? st : (uint64_t)ebw * (uint64_t)bpb;
+    uint64_t row = source_pitch;
     uint64_t img = row * ebh;
     uint32_t ao = arena_raw(c->src, img * (uint64_t)nz);
     if (ao == 0xFFFFFFFFu) return;
     up_probe("直传", g_arena_map + ao, img * (uint64_t)nz, ebw * (uint32_t)bw, ebh * (uint32_t)bh, 1);
     to_layout(g_cb, v, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
-    VkBufferImageCopy reg[16]; int nreg = 0;
-    for (int z = 0; z < nz && nreg < 16; z++) {
-        uint32_t layer = layer0 + (uint32_t)(c->r.zoffset + z);
-        if (v->d.d.target == 2) layer = 0;   // 3D 图：一次覆盖 nz 层，zoffset 走 imageOffset.z
-        reg[nreg++] = (VkBufferImageCopy){
-            .bufferOffset = ao + (uint64_t)z * img,
+    VkBufferImageCopy reg = (VkBufferImageCopy){
+            .bufferOffset = ao,
             .bufferRowLength = (uint32_t)(row / bpb) * (uint32_t)bw,
             .bufferImageHeight = (uint32_t)(img / row) * (uint32_t)bh,
-            .imageSubresource = (VkImageSubresourceLayers){ VK_IMAGE_ASPECT_COLOR_BIT, level, layer, 1 },
+            .imageSubresource = (VkImageSubresourceLayers){ VK_IMAGE_ASPECT_COLOR_BIT, level, v->d.d.target == 2 ? 0u : layer0 + (uint32_t)c->r.zoffset, v->d.d.target == 2 ? 1u : (uint32_t)nz },
             .imageOffset = { c->r.xoffset, c->r.yoffset, v->d.d.target == 2 ? c->r.zoffset : 0 },
-            .imageExtent = { ebw * (uint32_t)bw, ebh * (uint32_t)bh, v->d.d.target == 2 ? nz : 1u } };
-        if (v->d.d.target != 2) continue;
-        break;   // 3D：一条区域就够
-    }
-    vkCmdCopyBufferToImage(g_cb, g_arena, v->img, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, (uint32_t)nreg, reg);
+            .imageExtent = { (uint32_t)c->r.width, (uint32_t)c->r.height, v->d.d.target == 2 ? nz : 1u } };
+    vkCmdCopyBufferToImage(g_cb, g_arena, v->img, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &reg);
     v->uploaded = 1;
     to_layout(g_cb, v, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);   // 同上：传完即可采 | same as above: ready to sample once uploaded
     atomic_fetch_add(&g_b2t_ok, 1);
@@ -5918,8 +5852,8 @@ static int pkg_upload(vktex *v, VkCommandBuffer cb)
     // 可像素确实躺在池里（8 KB 采样非零 4164~7659，m1）。这条路的排布每步都按描述符现算（nvn_deswizzle_geom /
     // nvn_deswizzle），has_layout 只说明「打包贴图自带布局描述」，用它把关等于把上传整条锁在没人用的那半边。
     if (!t->mem || !t->pool) { v->pkg_bad = 1; return PKG_UP_FATAL; }
-    if (v->is_depth || t->d.target == 2) {   // 深度没有池内容；3D 在本层按深度拆成数组层，形状对不上，这一刀放过
-        atomic_fetch_add(t->d.target == 2 ? &g_pkg_3d : &g_pkg_dep, 1);
+    if (v->is_depth) {
+        atomic_fetch_add(&g_pkg_dep, 1);
         v->pkg_bad = 1; return PKG_UP_FATAL;
     }
     int bw = 1, bh = 1;
@@ -5958,7 +5892,12 @@ static int pkg_upload(vktex *v, VkCommandBuffer cb)
         // 池尾之外就是又一次 SIGSEGV：解排布按 16 字节段跳着读，越界不会连续踩，靠探针抓不到，只能在这里夹死
         // Reading past the end of the pool is another SIGSEGV, and the deswizzle walks in 16-byte jumps so a stray read is not
         // contiguous - the only safe place to clamp is here.
-        if (!pkg_add_ok(bs, need, &end1)) { atomic_fetch_add(&g_pkg_ovfl, 1); v->pkg_bad = 1; return PKG_UP_FATAL; }
+        if (!rows || !slices || th > 5 || td > 5) { v->pkg_bad = 1; return PKG_UP_FATAL; }
+        // Linear byte count excludes Tegra GOB padding. Bound the last byte actually read.
+        uint64_t source_span = nvn_bl_offset(rb - 1, rows - 1, slices - 1, rb, rows, th, td);
+        if (!pkg_add_ok(source_span, 1, &source_span) || !pkg_add_ok(bs, source_span, &end1)) {
+            atomic_fetch_add(&g_pkg_ovfl, 1); v->pkg_bad = 1; return PKG_UP_FATAL;
+        }
         if (end1 > avail) { atomic_fetch_add(&g_pkg_range, 1); v->pkg_bad = 1; return PKG_UP_FATAL; }
         if (end1 > pend) pend = end1;
         // 未压缩的按压缩块字节数入总量；软解的按解压后的行距入总量，压缩块只是逐层复用的一块暂存，别双计
@@ -6030,9 +5969,13 @@ static int pkg_upload(vktex *v, VkCommandBuffer cb)
             blen = drow * eh * slices;
             ao = stage_take(&st, blen);
             if (ao == ~(uint64_t)0) { atomic_fetch_add(&g_pkg_arena, 1); stag_exh = 1; break; }
-            if (nvn_bc_decode((uint32_t)t->d.format, st.map + asc, (size_t)rb, ew, eh, st.map + ao, (size_t)drow)) {
-                atomic_fetch_add(&g_pkg_fmt, 1); plan_fatal = 1; break;
+            for (uint32_t z = 0; z < slices; z++) {
+                if (nvn_bc_decode((uint32_t)t->d.format, st.map + asc + (uint64_t)z * rb * rows,
+                                  (size_t)rb, ew, eh, st.map + ao + (uint64_t)z * drow * eh, (size_t)drow)) {
+                    atomic_fetch_add(&g_pkg_fmt, 1); plan_fatal = 1; break;
+                }
             }
+            if (plan_fatal) break;
             brl = (uint32_t)(drow / (uint64_t)bpp); bih = eh;
         } else if (v->rt_astc) {
             // B 路：源 BC3 块先解排布进暂存，再由设备现编成 ASTC 4x4 块落进目的地。块数与 BC3 一模一样
@@ -6043,9 +5986,14 @@ static int pkg_upload(vktex *v, VkCommandBuffer cb)
             }
             ao = stage_take(&st, need);
             if (ao == ~(uint64_t)0) { atomic_fetch_add(&g_pkg_arena, 1); stag_exh = 1; break; }
-            if (rt_bc3_to_astc(st.map + asc, (size_t)rb, ew, eh, st.map + ao, (size_t)need)) {
-                atomic_fetch_add(&g_pkg_fmt, 1); plan_fatal = 1; break;
+            uint64_t slice_bytes = (uint64_t)rb * rows;
+            for (uint32_t z = 0; z < slices; z++) {
+                if (rt_bc3_to_astc(st.map + asc + z * slice_bytes, (size_t)rb, ew, eh,
+                                   st.map + ao + z * slice_bytes, (size_t)slice_bytes)) {
+                    atomic_fetch_add(&g_pkg_fmt, 1); plan_fatal = 1; break;
+                }
             }
+            if (plan_fatal) break;
             blen = need;
         } else {
             ao = stage_take(&st, need);
@@ -6492,7 +6440,7 @@ static void sp_pair_said(int vi, int fi, const p_draw *dw, const p_draw_idx *di)
         const char *e3 = getenv("DM_SPN"); if (e3 && *e3) { int k = (int)strtol(e3, NULL, 0); if (k > 0) g_spn = k > 24 ? 24 : k; }
         const char *e4 = getenv("DM_SPDEC"); g_spdec = e4 ? (int)strtol(e4, NULL, 0) : 0;
         char ib[128];
-        snprintf(ib, sizeof ib, "[vk] 点名开 起点拍%llu 每对%笔 解真值%d（%s）", (unsigned long long)g_spfrom, g_spn, g_spdec, g_spkey_want);
+        snprintf(ib, sizeof ib, "[vk] 点名开 起点拍%llu 每对%d笔 解真值%d（%s）", (unsigned long long)g_spfrom, g_spn, g_spdec, g_spkey_want);
         GVL("%{public}s", ib);
     }
     if (g_presents < g_spfrom) return;
@@ -6776,8 +6724,8 @@ static void do_draw(const p_draw *dw, const p_draw_idx *di)
     vkCmdBindDescriptorSets(g_cb, VK_PIPELINE_BIND_POINT_GRAPHICS, g_last_pl, 0, 2, g_cur_set, 0, NULL);
     // 顶点缓冲：按管线的绑定号绑，流没搬进来的绑零缓冲（读出来是 0，不打掉设备）| vertex buffers: unstreamed bindings fall back to the zero buffer
     {
-        VkBuffer bufs[17]; VkDeviceSize offs[17];
-        for (int i = 0; i < 17; i++) { bufs[i] = g_zero; offs[i] = 0; }
+        VkBuffer bufs[16]; VkDeviceSize offs[16];
+        for (int i = 0; i < 16; i++) { bufs[i] = g_zero; offs[i] = 0; }
         const shb_entry *ve = &g_shb_e[vi];
         for (int v = 0; v < ve->nvi; v++) {
             int loc = g_shb_vi[ve->vi_off + v].loc;
@@ -6786,7 +6734,7 @@ static void do_draw(const p_draw *dw, const p_draw_idx *di)
             uint32_t o = 0;
             if (vtx_stream((int)pl2.binding, &o)) { bufs[pl2.binding] = g_arena; offs[pl2.binding] = o; }
         }
-        vkCmdBindVertexBuffers(g_cb, 0, 17, bufs, offs);
+        vkCmdBindVertexBuffers(g_cb, 0, 16, bufs, offs);
     }
     if (g_att_src) { sp_draw_said(vi, fi, dw, di); sp_pair_said(vi, fi, dw, di); bsp_tally(vi, fi); pk_tally(vi, fi, (uint32_t)(dw ? dw->count : di->count));
                     if (!(g_pk_tot % 20000)) pk_said();

@@ -1,24 +1,19 @@
 import dmhost from 'libdmhost.so';
 import fs from '@ohos.file.fs';
+import { util } from '@kit.ArkTS';
 import { PadBtnCfg, loadPadLayout } from '../model/PadLayout';
 
-// 改写产物全清单（rawfile 同名拷贝进沙箱）；.patch.log 不需要
-// 饥荒 Don't Starve Together（Klei 自研引擎 + FMOD + Lua）：模块 main / sdk / subsdk0 / rtld
-// Don't Starve Together (Klei engine + FMOD + Lua): modules main / sdk / subsdk0 / rtld
-const FILES: string[] = [
-  'main.patched.bin', 'sdk.patched.bin', 'subsdk0.patched.bin', 'rtld.patched.bin',
-  'build_src.sha256',
-  'main.cuts.tsv', 'main.fixups.tsv', 'main.gates.tsv', 'main.obs.tsv', 'main.params.tsv', 'main.sites.tsv',
-  'sdk.cuts.tsv', 'sdk.fixups.tsv', 'sdk.gates.tsv', 'sdk.obs.tsv', 'sdk.params.tsv', 'sdk.sites.tsv',
-  'subsdk0.cuts.tsv', 'subsdk0.fixups.tsv', 'subsdk0.gates.tsv', 'subsdk0.obs.tsv', 'subsdk0.params.tsv', 'subsdk0.sites.tsv',
-  'rtld.cuts.tsv', 'rtld.fixups.tsv', 'rtld.gates.tsv', 'rtld.obs.tsv', 'rtld.params.tsv', 'rtld.sites.tsv',
-];
+interface GuestManifest {
+  version: string;
+  modules: string[];
+  files: string[];
+}
 
 @Entry
 @Component
 struct Index {
   private xcompController: XComponentController = new XComponentController();
-  @State statusText: string = 'D2R 初始化…';
+  @State statusText: string = '饥荒初始化…';
   // 状态字只在启动没走通时压屏（以前恒显，那行「镜像就绪 / dmhost.start=0」正好盖在游戏对话框中间）
   // The status line only goes on screen when startup did not work; it used to show always and sat right over the game's dialog
   @State showStatus: boolean = true;
@@ -66,20 +61,29 @@ struct Index {
     try {
       const ctx = getContext(this);
       const filesDir: string = ctx.filesDir;
+      const decoder = util.TextDecoder.create('utf-8');
+      const manifest: GuestManifest = JSON.parse(decoder.decodeWithStream(
+        ctx.resourceManager.getRawFileContentSync('guest-manifest.json'))) as GuestManifest;
+      const stamp: string = filesDir + '/guest-version.txt';
+      const current: boolean = fs.accessSync(stamp) && fs.readTextSync(stamp) === manifest.version;
       let copied: number = 0;
-      for (const m of FILES) {
+      for (const m of manifest.files) {
+        if (m.includes('/') || m.includes('\\') || m.includes('..')) throw new Error('Invalid guest file name');
         const dst: string = filesDir + '/' + m;
-        if (fs.accessSync(dst)) continue;
+        if (current && fs.accessSync(dst)) continue;
         const data: Uint8Array = ctx.resourceManager.getRawFileContentSync(m);
-        const f = fs.openSync(dst, fs.OpenMode.CREATE | fs.OpenMode.WRITE_ONLY);
+        const f = fs.openSync(dst, fs.OpenMode.CREATE | fs.OpenMode.WRITE_ONLY | fs.OpenMode.TRUNC);
         fs.writeSync(f.fd, data.buffer);
         fs.closeSync(f);
         copied++;
       }
-      this.statusText = '镜像就绪（新拷 ' + copied + '/' + FILES.length + '）';
+      const stampFile = fs.openSync(stamp, fs.OpenMode.CREATE | fs.OpenMode.WRITE_ONLY | fs.OpenMode.TRUNC);
+      fs.writeSync(stampFile.fd, manifest.version);
+      fs.closeSync(stampFile);
+      this.statusText = '镜像就绪（新拷 ' + copied + '/' + manifest.files.length + '）';
       console.info('D2R filesDir=' + filesDir + ' copied=' + copied);
       console.info('D2R resourceDir=[' + ctx.resourceDir + '] bundleCodeDir=[' + ctx.bundleCodeDir + ']');
-      const ret: number = dmhost.start(filesDir, AppStorage.get<string>('wantParams') ?? '', ctx.resourceDir);
+      const ret: number = dmhost.start(filesDir, AppStorage.get<string>('wantParams') ?? '', ctx.resourceDir, manifest.modules.join(','));
       this.statusText += ' / dmhost.start=' + ret;
       this.showStatus = ret !== 0;   // 起来了就撤字，画面交给游戏
       console.info('D2R ' + this.statusText);

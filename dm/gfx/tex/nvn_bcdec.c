@@ -24,7 +24,13 @@ int nvn_bc_unpacked(uint32_t f, uint32_t *pf, int *bpp) {
 
 static void block(uint32_t f, const uint8_t *b, uint8_t *o, int op) {   // 一块 → 4×4 像素（o 每行 op 字节） | one block → 4×4 pixels (o has op bytes per row)
     switch (f) {
-    case 0x41: case 0x42: case 0x45: case 0x46: bcdec_bc1(b, o, op); break;
+    case 0x41: case 0x45:
+        bcdec_bc1(b, o, op);
+        // RGB DXT1 uses opaque black for selector 3 in three-colour mode.
+        // bcdec implements RGBA DXT1, whose selector 3 is transparent black.
+        for (int y = 0; y < 4; y++) for (int x = 0; x < 4; x++) o[y * op + x * 4 + 3] = 255;
+        break;
+    case 0x42: case 0x46: bcdec_bc1(b, o, op); break;
     case 0x43: case 0x47: bcdec_bc2(b, o, op); break;
     case 0x44: case 0x48: bcdec_bc3(b, o, op); break;
     case 0x49: bcdec_bc4(b, o, op, 0); break;

@@ -182,6 +182,7 @@ static int path_component(char *parent, size_t n, const char *name, int create) 
     parent[len] = '/'; memcpy(parent + len + 1, physical, k + 1); return 1;
 }
 static int root_path(const char *root, const char *rest, char *out, size_t n) {
+    if (strlen(root) >= n) { errno = ENAMETOOLONG; return 0; }
     strlcpy(out, root, n);
     while (*rest) {
         while (*rest == '/') rest++;
@@ -191,7 +192,23 @@ static int root_path(const char *root, const char *rest, char *out, size_t n) {
         if (k >= sizeof part) { errno = ENAMETOOLONG; return 0; }
         memcpy(part, rest, k); part[k] = 0;
         if (!strcmp(part, "..")) { errno = ENOENT; return 0; }
-        if (strcmp(part, ".") && !path_component(out, n, part, 0)) return 0;
+        if (strcmp(part, ".")) {
+#ifdef __OHOS__
+            // HAP RomFS is case-sensitive and has no host-created alias xattrs.
+            // A miss in one split must not scan thousands of sibling files before
+            // trying the next split. Keep the packaged dot-file fallback.
+            size_t len = strlen(out);
+            if (len + k + 2 > n) { errno = ENAMETOOLONG; return 0; }
+            out[len] = '/'; memcpy(out + len + 1, part, k + 1);
+            if (access(out, F_OK)) {
+                if (errno != ENOENT || part[0] != '.') return 0;
+                memcpy(out + len + 1, part + 1, k);
+                if (access(out, F_OK)) return 0;
+            }
+#else
+            if (!path_component(out, n, part, 0)) return 0;
+#endif
+        }
         rest = end;
     }
     return 1;

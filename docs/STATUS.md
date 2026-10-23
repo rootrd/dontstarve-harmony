@@ -1,8 +1,10 @@
 # Status — what works, what does not, and how far each branch is
 
-Last measured on a real device: **2026-10-23** (the AN round). Every number below came off a phone, not out of a model of what the code should do. Where a claim needs proof to be useful, the proof line is quoted.
+Latest device check: **2026-10-23, final repair round**, Maleoon 910 / Vulkan 1.2. Arena alignment, full-range buffer-cache validation and vertex-binding limits are corrected; startup and Chinese world-settings screens align correctly, and the user reports normal rendering. Current shaders: **105 stages / 805,432 bytes**, rebuilt from the actual 1.30.0 assets. Host checks pass: 1,268 texture/Vulkan checks, 195 upload assertions, all 65,536 vertex-binding masks, asset/loader/cache regressions and all 105 shader lookups. See **[OHOS-RENDERING-2026-10.md](OHOS-RENDERING-2026-10.md)** for the current build and evidence.
 
-## Where it stands
+The percentages, in-world performance figures and AN-round counters below are **historical**, not new measurements of this build. The latest round has not yet covered all world scenes or completed the standalone GPU readback probe.
+
+## Historical AN baseline
 
 The game is entered and played: EULA → offline confirmation → real main menu → world list → world creation → **world generation completes** → character select (22 characters) → **in world**, day-1 HUD, inventory icons, stat orbs, a spoken Chinese subtitle. The flat-green ground is **closed** (see [BLOCKERS.md](BLOCKERS.md#1-the-flat-green-ground--closed)); what is left is **multi-part geometry that still tears** — the title-art figure, the roster portrait panel and in-world structures shed stray triangles and mis-strided stripes, and one modal draws its title with a blank button bar.
 
@@ -41,7 +43,7 @@ World generation takes **2m20s** on the phone (`00:05:34` shard start → `00:07
 | Packaging / install pipeline | **100%** | three commands, two self-checks, `bm install -p` for large HAPs; a round takes ~5 min |
 | Forensics channel (logs, pixels, crashes, threads) | **100%** | sandbox readable, whole frames to files, `crash_<pid>.txt` and `thr.txt` complete |
 | ELF load / SVC / threads / service stubs | **95%** | full chain to `nnMain` and stable; `_ZTH` now hands each guest module a real TLS block and the guest exception stack is a host buffer |
-| File system and asset resolution | **92%** | the unresolved-reference file is never created; missing only an `lstat` fast path on the hot path |
+| File system and asset resolution | **92%** | the unresolved-reference file is never created; latest repair adds exact packaged-RomFS lookup; the percentage belongs to AN |
 | **Reaching the game** (EULA → menu → create world → in world) | **95%** | screenshotted end to end, twice, on two different builds — but **no script reproduces it**: the A-mash driver presses A 34 times and never leaves the world-config modal (`@draws` toggles 142 ↔ 149), so the last hop is driven one key at a time from a screenshot |
 | Networking / the local shard | **80%** offline · **15%** online | real BSD loopback, RakNet connects; online is blocked by a missing TLS context — deliberately not pursued |
 | Shader library / pipelines | **80%** | the installed library is 115 entries / 1,212,048 B and byte-audited into the package every round; it now carries the font vertex stage (entry 114), which is why menu/world text renders at all. The 41%→10% "no library" figures belong to the older key scheme |
@@ -64,5 +66,5 @@ World generation takes **2m20s** on the phone (`00:05:34` shard start → `00:07
 - Evidence chain **solved in the tree, same caveat**: readback got the missing layout transitions/ barriers and a per-chunk TGA offset fix, the pack statistics are label-adjacent, and `DM_TEXREAD` reads an uploaded `VkImage` back off the GPU so "bytes landed wrong" and "binding/UV wrong" are separable on the phone.
 - Verified offline, not yet on the phone: the three items above were checked by a fault-injection harness (`scripts/pkg_faults.sh` + `dm/gfx/nvn/tests/pkg_faults.c`) that `awk`-extracts the production bodies verbatim and runs them against stubs on the host — **176 assertions, 0 red** under ASan+UBSan, and the same assertions against the pre-fix commit `6a4def6` give **46 red**, so they bite the defects. Details in [BLOCKERS.md](BLOCKERS.md#3-pack-staging-vs-the-vertex-stream--code-fixed-round-pending).
 - Untracked-range dirty reporting **solved in the tree, same caveat**: `pkg_tracked` records at upload whether the pool range is inside the dirty table, and the bind-time check skips untracked ranges. With `MAX_RANGE 4096` really being hit, the old behaviour meant re-uploading on every bind.
-- No `lstat` fast path in the path mapper: the first lookup walks a whole directory.
+- Closed in the latest repair for OHOS packaged RomFS: exact case-sensitive lookup avoids directory scans and xattrs on split misses. Writable save-path handling keeps its existing resolver.
 - The HarmonyOS port layer (`dm/ohos/`, `dm/gfx/nvn/nvn_vulkan.c`, `hle_ipc.c`, `hle_stdio.c`) had **never been committed** until this repository was created. If you fork from here, that is the moment the history starts. Until 2026-10-18 the published file was an older snapshot than the build that runs on the phone; the tree now matches the device build modulo comment sanitisation.

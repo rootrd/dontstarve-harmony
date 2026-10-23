@@ -4,7 +4,21 @@ Written so that whoever picks this up does not re-walk the paths that are alread
 
 ---
 
-## 0. Multi-part geometry still tears (the current functional blocker)
+## Latest repair — 2026-10-23
+
+The earlier geometry/typing defect is corrected in the currently observed startup and Chinese
+world-settings screens; the user reports normal rendering after installing the signed update.
+See **[the repair report](OHOS-RENDERING-2026-10.md)** for arena alignment, full-range buffer
+comparison, the 16-binding device limit and current validation. The sections below preserve
+historical AN-round evidence. World-scene coverage and long-run validation remain open.
+
+The earlier statement that `陈旧0` ruled out stale arena data was too strong: its comparison
+covered at most 4 KiB, and dirty tracking registration did not guarantee re-armed protection.
+Current regression tests explicitly rewrite data beyond 4 KiB with unchanged dirty stamps.
+The arena alignment and binding-limit errors are independently established contract violations;
+the final device build fixes all three together, so no single one is claimed as the sole cause.
+
+## 0. Multi-part geometry tearing (historical AN investigation)
 
 **Symptom.** Anything built from several vertex buffers draws *something*, but sheds stray
 triangles and mis-strided stripes: the title-art figure, the roster portrait panel, the
@@ -24,7 +38,7 @@ rather than hoped for:
 | A depth-stencil clear honours `depth_mask` / `stencil` / `stencil_mask`, and clears the stencil aspect only when the bound format really has one (`fmt_has_stencil`) | `清屏:模板13700 无面0 全跳0` | 13,700 stencil clears that never happened before, none of them illegal; passes open depth/stencil `DONT_CARE`, so an uncleared stencil plane is undefined for every draw that tests it |
 | Colour-write masks instrumented, behaviour unchanged | `色掩或15与15` | OR == AND == 15: every clear this title issues writes all four channels, so the mask is boolean in practice and needs no emulation here |
 
-**Ruled out (do not re-test these).** Arena staleness (`陈旧0`), stale constants
+**Historical exclusions (arena conclusion superseded above).** Arena staleness (`陈旧0`), stale constants
 (`常量:陈旧0`), dummy textures as the cause (`哑3` in a clean round), present-source mismatch,
 quads dropped for want of a pipeline (`无管线0`), back-face culling by winding (`s=924` is a
 false handle), and "the text is missing because the font asset is missing" — the font vertex

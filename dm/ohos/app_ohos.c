@@ -146,6 +146,7 @@ static void dump_file_log(const char *path, int max_lines);
 //（也是本轮产物的自检字串：装机前 grep 包内 .so 能不能 grep 到它）。
 // 第一组是饥荒（CASC 分片），第二组是 Unity（高海 Saga DX：根下直接是 Data/，没有分片档案，拿最大的 assets 顶）。
 static const char *kRomfsMarks[][3] = {
+    { "prefabs.xml", "SplashScreen.tex", "DST-native-romfs" },
     { "data/.build.config",      "data/00-00000001.data", "DST" },
     { "data/build.config",       "data/00-00000001.data", "DST" },
     { "Data/globalgamemanagers", "Data/resources.assets", "Unity-HSS-v33" },
@@ -215,7 +216,7 @@ static void romfs_overlay_from_bundle(char *out, size_t n, const char *mount)
         snprintf(cand, sizeof cand, "%s/%s/resources/resfile/romfs", root, e->d_name);
         if (!strcmp(cand, mount)) continue;
         char probe[1600];
-        snprintf(probe, sizeof probe, "%s/data", cand);
+        snprintf(probe, sizeof probe, "%s", cand);
         struct stat st;
         if (stat(probe, &st) || !S_ISDIR(st.st_mode)) continue;
         size_t used = strlen(out);
@@ -261,8 +262,8 @@ static void *host_thread(void *p)
     setenv("DM_TEMP", tp, 1);
     if (!getenv("DM_TACT_PREFETCH")) setenv("DM_TACT_PREFETCH", "0", 1);   // 首测：不预取（无 bootlist.tsv）
 
-    // 真机诊断开关默认打开（外部已设则不覆盖）：HLE 计数走 hilog、fs 打开路径日志、NVN 对象创建日志、50ms 采样客体主线程
-    // Real-device diagnostic switches on by default (not overridden if set outside): HLE counts to hilog, fs open-path log, NVN object creation log, 50ms sampling of the guest main thread
+    // 真机诊断开关默认打开（外部已设则不覆盖）：HLE 计数走 hilog、fs 打开路径日志、NVN 对象创建日志；线程采样按需开启
+    // Real-device diagnostic switches on by default (not overridden if set outside): HLE counts to hilog, fs open-path log, NVN object creation log; thread sampling is opt-in
     { char hp[1200]; snprintf(hp, sizeof hp, "%s/hlc.tsv", dir);
       if (!getenv("DM_HLECOUNT")) setenv("DM_HLECOUNT", hp, 1);
       if (!getenv("DM_HLECOUNT_LOG")) setenv("DM_HLECOUNT_LOG", "1", 1);
@@ -272,7 +273,7 @@ static void *host_thread(void *p)
       // DM_THR stays unset by default: it is an "enabled if present" flag and per-svc logging writes 100k lines in 12 s on device,
       // which evicts the hilog ring buffer and the graphics layer's lines with it. Turn it on with --ps DM_THR 1 when chasing threads.
       if (!getenv("DM_NVN_LOG")) setenv("DM_NVN_LOG", "1", 1);
-      if (!getenv("DM_SAMPLE")) setenv("DM_SAMPLE", "50:*", 1); }   // 全客体线程轮询采样 | Cycle-sample all guest threads
+      if (!getenv("DM_SAMPLE")) setenv("DM_SAMPLE", "0", 1); }   // --ps DM_SAMPLE 2000:* enables bounded sampling
 
     redirect_output();
     DLOG("宿主启动：dir=%{public}s", dir);
@@ -351,8 +352,8 @@ static void list_rec(const char *root, int depth, int *budget)
 static napi_value Start(napi_env env, napi_callback_info info)
 {
     napi_value ret = NULL;
-    size_t argc = 3;
-    napi_value argv[3] = {NULL, NULL, NULL};
+    size_t argc = 4;
+    napi_value argv[4] = {NULL, NULL, NULL, NULL};
     napi_get_cb_info(env, info, &argc, argv, NULL, NULL);
     if (argc >= 1 && argv[0]) {
         size_t len = 0;
@@ -400,6 +401,14 @@ static napi_value Start(napi_env env, napi_callback_info info)
             }
         }
     }
+    // The staged game manifest supplies the module set; explicit Want overrides win.
+    if (argc >= 4 && argv[3] && !getenv("DM_MODULES")) {
+        char modules[256]; size_t len = 0;
+        if (napi_get_value_string_utf8(env, argv[3], modules, sizeof modules, &len) == napi_ok &&
+            len > 0 && len + 1 < sizeof modules)
+            setenv("DM_MODULES", modules, 1);
+    }
+    if (!getenv("DM_TITLE_DRV")) setenv("DM_TITLE_DRV", "0", 1); // DST never uses D2R guest offsets.
     pad_ohos_env();     // 外部开关落定后才知道 DM_PAD 关不关手柄面（模块注册期还读不到 want 参数）
     // 第 3 个参数 = HAP 资源目录（ctx.resourceDir）。游戏数据打进安装包后，$: 就地挂到这里（见 pick_romfs）。
     // Third argument = the HAP resource directory (ctx.resourceDir). With the data inside the package, $: mounts there in place (see pick_romfs).

@@ -32,16 +32,26 @@ flags = struct.unpack_from('<I', d, 0xc)[0]
 segs = [struct.unpack_from('<III', d, 0x10 + i * 0x10) for i in range(3)]
 bss = struct.unpack_from('<I', d, 0x3c)[0]
 csz = struct.unpack_from('<III', d, 0x60)
-IMG = bytearray(segs[2][1] + segs[2][2] + bss)
+IMAGE_END = segs[2][1] + segs[2][2]
+# AArch64 B/BL reaches only +/-128 MiB. Huge guest BSS must stay virtual,
+# with trampolines below the image as supported by loader.c's PATCH_BELOW.
+PATCH_BELOW = IMAGE_END + bss >= 64 * 1024 * 1024
+TAIL_LEN = 8 * 1024 * 1024 if PATCH_BELOW else 0
+TAIL_OFF = -TAIL_LEN
+IMG = bytearray(IMAGE_END if PATCH_BELOW else IMAGE_END + bss)
 for i, (fo, mo, sz) in enumerate(segs):
     raw = d[fo:fo + csz[i]]
     if flags >> i & 1: raw = lz4.block.decompress(raw, uncompressed_size=sz)
     IMG[mo:mo + sz] = raw
 TEXT_END = segs[0][2]
 RO_OFF, DATA_OFF = segs[1][1], segs[2][1]
-KEY_PAGE_OFF = (len(IMG) + 0x3FFF) & ~0x3FFF
-IMG.extend(bytes(0x4000))
-PATCH_OFF = (len(IMG) + 0xFFFF) & ~0xFFFF
+if PATCH_BELOW:
+    KEY_PAGE_OFF = TAIL_OFF
+    PATCH_OFF = TAIL_OFF + 0x4000
+else:
+    KEY_PAGE_OFF = (len(IMG) + 0x3FFF) & ~0x3FFF
+    IMG.extend(bytes(KEY_PAGE_OFF + 0x4000 - len(IMG)))
+    PATCH_OFF = (len(IMG) + 0xFFFF) & ~0xFFFF
 
 # ---- 已登记剪口：{NSO 构建号: [(偏移, 原字节, 新字节, 理由)]} ----
 # 联网剪口（排除范围：战网 / 联机）：取自社区离线修复（LFS Mod Offline Fix for v2228224，与官方 94012 main 只差这 7 个字）。
@@ -859,7 +869,16 @@ if RULE_RUN:
 
 os.makedirs(outdir, exist_ok=True)
 P = lambda ext: os.path.join(outdir, f'{NAME}.{ext}')
-open(P('patched.bin'), 'wb').write(IMG + bytearray(PATCH_OFF - len(IMG)) + patch)
+with open(P('patched.bin'), 'wb') as f:
+    f.write(IMG)
+    if PATCH_BELOW:
+        assert len(patch) <= TAIL_LEN - 0x4000, 'trampoline region exceeds reserved tail'
+        f.write(bytes(0x4000))
+        f.write(patch)
+        f.write(bytes(TAIL_LEN - 0x4000 - len(patch)))
+    else:
+        f.write(bytes(PATCH_OFF - len(IMG)))
+        f.write(patch)
 import hashlib
 with open(os.path.join(outdir, 'build_src.sha256'), 'w') as f:
     f.write(hashlib.sha256(open(os.path.abspath(__file__), 'rb').read()).hexdigest() + '  patch_nso.py\n')
@@ -875,6 +894,8 @@ elif os.path.exists(P('rules.tsv')):
     os.unlink(P('rules.tsv'))  # 重出native时清本模块旧规则登记，不让旧manifest混入原资源域 | When rebuilding native, clear this module's old rule registration so the old manifest does not leak into the original-resource domain
 with open(P('fixups.tsv'), 'w') as f:
     f.write(f'# PATCH_OFF\t{PATCH_OFF:#x}\n# KEY_PAGE_OFF\t{KEY_PAGE_OFF:#x}\n# KEY_PAGE_SIZE\t0x4000\n# TEXT_END\t{TEXT_END:#x}\n# RO_OFF\t{RO_OFF:#x}\n# DATA_OFF\t{DATA_OFF:#x}\n')
+    if PATCH_BELOW:
+        f.write(f'# PATCH_BELOW\t1\n# TAIL_OFF\t{TAIL_OFF:#x}\n# TAIL_LEN\t{TAIL_LEN:#x}\n# BSS_SIZE\t{bss:#x}\n')
     for k in KEY_INDEX: f.write(f'# KEY_{k}_IDX\t{KEY_INDEX[k]}\n')
 with open(P('gates.tsv'), 'w') as f:
     for ret, k, arg, orig in gates: f.write(f'{ret:#x}\t{k}\t{arg}\t{orig:#x}\n')

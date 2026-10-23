@@ -1,4 +1,4 @@
-export const start: (dir?: string, wantParams?: string, resourceDir?: string) => number;
+export const start: (dir?: string, wantParams?: string, resourceDir?: string, modules?: string) => number;
 // 手柄 / 触屏进 libdmhost.so 的四个入口（实现见 dm/ohos/pad_ohos.c）
 // The four controller / touch entries into libdmhost.so (implementation in dm/ohos/pad_ohos.c)
 export const padKey: (code: number, type: number) => number;      // 1 = 这个键归手柄（页面据此消费）| 1 = the key belongs to the controller (the page consumes it accordingly)
@@ -9,3 +9,6 @@ export const padDiag: () => string;
 // On-screen pad: press / release one game button (gp numbering in ets/model/PadLayout.ets, same convention as the Stardew project)
 export const padBtn: (gp: number, down: number) => number;
 
+
+export const kbdPoll: () => string;
+export const kbdAnswer: (text: string, accepted: number) => void;
