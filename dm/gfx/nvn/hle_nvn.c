@@ -1475,18 +1475,24 @@ __attribute__((constructor)) static void nvn_nops_register(void) {
 // dlopen (see the [env] block in app_ohos.c), so getenv is always empty at constructor time — that is why the v31
 // call ring came out empty. app_ohos.c calls this once after the external switches have landed.
 void nvn_wrap_arm(void) {
+    // g_log 在槽表初始化（.so 构造函数期）就定死了，那时 want 参数还没落；这里补读一次
+    // g_log was frozen at slot-table init (.so constructor time), before want-params landed; re-read here
+    g_log = getenv("DM_NVN_LOG") != NULL;
     g_arm.env_prof = getenv("DM_NVN_PROF") != NULL;
     g_arm.env_trace = getenv("DM_NVN_TRACE") != NULL;
     g_arm.armed = 1;
-    if (g_arm.env_prof)
+    // 大括号必须带：不带时 else 会解析成内层 if 的 else，env_trace 单开时整段不可达（HSS 实测 wrapped=0）
+    // The braces are mandatory: without them the else parses as the inner if's else, and trace-only mode never wraps (measured wrapped=0 on HSS)
+    if (g_arm.env_prof) {
         // 已实现函数套计时包装（出图含节拍等待，单独计）| implemented functions get the timing wrapper (present includes the display-link wait and is counted separately)
         for (unsigned i = 0; i < NVN_NFUNC; i++)
             if (nvn_slot[i].fn && nvn_slot[i].fn != (void *)nvn_unimpl_entry && strcmp(nvn_names[i], "nvnQueuePresentTexture")) { nvn_real[i] = nvn_slot[i].fn; nvn_slot[i].fn = (void *)nvn_prof_entry; g_arm.wrapped++; }
-    else if (g_arm.env_trace)
+    } else if (g_arm.env_trace) {
         // 含未实现桩：nvn_trace_entry 保留 x16 = 槽地址，桩照常报红。两个开关同时开时以计时为准。
         // Includes the unimplemented stubs: nvn_trace_entry keeps x16 = slot address, so the stubs still report. Profiling wins if both switches are set.
         for (unsigned i = 0; i < NVN_NFUNC; i++)
             if (nvn_slot[i].fn) { nvn_real[i] = nvn_slot[i].fn; nvn_slot[i].fn = (void *)nvn_trace_entry; g_arm.wrapped++; }
+    }
     for (unsigned i = 0; i < NVN_NFUNC; i++) {           // 装完之后槽表各类占比，崩现场再核一次是否还在 | slot-table composition after arming; the crash dump re-checks it
         if (!nvn_slot[i].fn) g_arm.nullfn++;
         else if (nvn_slot[i].fn == (void *)nvn_unimpl_entry) g_arm.unimpl++;
