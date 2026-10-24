@@ -18,6 +18,60 @@ Current regression tests explicitly rewrite data beyond 4 KiB with unchanged dir
 The arena alignment and binding-limit errors are independently established contract violations;
 the final device build fixes all three together, so no single one is claimed as the sole cause.
 
+## Latest — 2026-10-24 (Maleoon 920): a retraction, and the two things left
+
+**Retracted: "the 105-stage library renders the world black on our device".** That verdict came from
+a single screenshot taken ~30 s after entering the world. DST's opening minute in a fresh world is
+night, so the frame really was dark — for a reason that has nothing to do with the library. Re-run
+with the rule *enter the world (`@draws` ≥ 700), wait ≥ 150 s, walk once, then compare the same
+object against the baseline*, and the world renders: ground, trees, flowers, butterflies, HUD and
+Chinese subtitles ([`screens/fairlib_world_night.jpg`](screens/fairlib_world_night.jpg)), a clean
+roster screen ([`screens/fairlib_roster.jpg`](screens/fairlib_roster.jpg)), and full-resolution
+loading art with correct reds ([`screens/fairlib_loading_art.jpg`](screens/fairlib_loading_art.jpg)).
+
+The cost of the bad sample was real: it made us fall back onto our own `Z3` library, which is the
+build that *does* have a defect — the Florid Postern is covered in green/magenta shards under `Z3`
+([`screens/z3lib_gate_speckle.jpg`](screens/z3lib_gate_speckle.jpg)) and clean under the 105-stage
+library, same `.so`, same hour, same object. **The gate speckle was never a host bug.**
+
+Also retracted: "our romfs is missing 4 `.ksh`". The packaged `shaders_nx` has all **68**; the 64-file
+count was a stale local snapshot. Rebuilt from the package, `dm/gfx/tools/dmsh_xlate` +
+`scripts/build_dst_shaders.py` produce 805,432 bytes with md5
+`4ca337f9586dc45909b071c1917f69a8` — byte-identical to the shipped library. **Do not treat the two
+libraries as different artifacts; treat `Z3` as a bad build and drop it.**
+
+Session counters for the re-run: `【红】0`, zero `缺键` lines, and
+`无库0 跳过0 无管线0 陈旧0 越池0 满0 建败0 管线败0 哑0 解排0 格式0 越界0 卡环0 环拒0`.
+
+### 54. Speckled ground at daylight — texture side, not geometry
+
+**Symptom.** Day 2, daylight: large magenta/green patches across the ground whose boundaries follow
+individual ground-tile footprints
+([`screens/fairlib_ground_speckle.jpg`](screens/fairlib_ground_speckle.jpg)). In the *same* frame the
+Florid Postern, the HUD and every text layer are clean.
+
+**Why this is not the old tearing entry.** §0 was a vertex/matrix problem and produced stray
+triangles and horizontal stripes. This produces correctly placed quads with corrupted *pixels*, and
+it appears only where a compressed atlas is sampled.
+
+**The one counter that is non-zero.** `打包:尝试图1214 上1228 重898 成MB761 BC层130 卡环0 越界0 解排0
+格式0 深度0 三维0 环拒0 环成1228` — 130 BC layers went through a path other than the ASTC re-encode,
+and every other texture-side counter is zero. That matches the long-standing coverage gap in cls-0
+(BC1/BC4, 8-byte blocks), which neither the offline bake nor `DM_RT_ASTC` claims to cover.
+
+**Next step, offline first.** `DM_TEXDUMP` the serials under a speckled patch, then on the PC decide
+between "block stream present but mis-strided" and "these bytes were never encoded". Do not touch
+`nvn_deswizzle`/`rt_bc3_to_astc` before one of those two is picked.
+
+### 55. In-world frame rate: 9.3 FPS on the 105-stage library vs 15.0 on `Z3`
+
+Same `.so`, same device, same region — only the shader library differs. A library should not be
+worth 1.6×, so this is a measurement to control before it is a bug to chase: same walking route,
+three samples each, and normalise `绘:重放`, `arena:新` and `管线` per second rather than comparing
+raw totals. Note `arena:新11119706` against `复用2470871`: the new-allocation path dominates, so the
+full-range `arena_rewritten` `memcmp` is not automatically the cost, and "their fix made it slow" is
+not yet supported by anything.
+
 ## 0. Multi-part geometry tearing (historical AN investigation)
 
 **Symptom.** Anything built from several vertex buffers draws *something*, but sheds stray

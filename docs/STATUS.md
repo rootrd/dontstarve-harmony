@@ -1,8 +1,52 @@
 # Status — what works, what does not, and how far each branch is
 
-Latest device check: **2026-10-23, final repair round**, Maleoon 910 / Vulkan 1.2. Arena alignment, full-range buffer-cache validation and vertex-binding limits are corrected; startup and Chinese world-settings screens align correctly, and the user reports normal rendering. Current shaders: **105 stages / 805,432 bytes**, rebuilt from the actual 1.30.0 assets. Host checks pass: 1,268 texture/Vulkan checks, 195 upload assertions, all 65,536 vertex-binding masks, asset/loader/cache regressions and all 105 shader lookups. See **[OHOS-RENDERING-2026-10.md](OHOS-RENDERING-2026-10.md)** for the current build and evidence.
+Latest device check: **see the 2026-10-24 section below** (Maleoon 920). The 2026-10-23 round below is the repair round itself: Arena alignment, full-range buffer-cache validation and vertex-binding limits are corrected; startup and Chinese world-settings screens align correctly, and the user reports normal rendering. Current shaders: **105 stages / 805,432 bytes**, rebuilt from the actual 1.30.0 assets. Host checks pass: 1,268 texture/Vulkan checks, 195 upload assertions, all 65,536 vertex-binding masks, asset/loader/cache regressions and all 105 shader lookups. See **[OHOS-RENDERING-2026-10.md](OHOS-RENDERING-2026-10.md)** for the current build and evidence.
 
 The percentages, in-world performance figures and AN-round counters below are **historical**, not new measurements of this build. The latest round has not yet covered all world scenes or completed the standalone GPU readback probe.
+
+## 2026-10-24 — second device, and a retraction: the 105-stage library is fine
+
+Latest device check: **2026-10-24, Pura 80 Ultra / Maleoon 920**, host `49f60f7` + the 105-stage
+library, entered through the real UI and observed **≥150 s after `@draws` crossed 700**.
+
+A claim published in the previous round here — that the 105-stage library loads but renders the
+world black on our device, and is therefore not a drop-in — **was wrong and is retracted**. It was
+based on one screenshot taken ~30 s after entering the world, and DST's first minute in a new world
+is night, so it is genuinely dark. Measured properly, the world renders: ground, trees, flowers,
+butterflies, HUD and Chinese subtitles are all present
+([`screens/fairlib_world_night.jpg`](screens/fairlib_world_night.jpg)), the roster screen is clean
+([`screens/fairlib_roster.jpg`](screens/fairlib_roster.jpg)) and the full-resolution loading art
+carries correct reds ([`screens/fairlib_loading_art.jpg`](screens/fairlib_loading_art.jpg)) — which
+also closes the old "the red channel is zero in-world" entry, since every sample behind it was taken
+after sunset.
+
+Two corrections came out of the same comparison:
+
+- **The Florid Postern speckle was ours, not the host's.** The same object at the same hour, on the
+  same `.so`, is clean under the 105-stage library and covered in green/magenta shards under our
+  own 115-stage `Z3` build ([`screens/z3lib_gate_speckle.jpg`](screens/z3lib_gate_speckle.jpg)).
+  The extra 10 stages in `Z3` were the defect, not the fix.
+- **Our own toolchain reproduces the 105-stage library byte for byte.** `dm/gfx/tools/dmsh_xlate` +
+  `scripts/build_dst_shaders.py` over the packaged `shaders_nx` (**68** `.ksh`, not the 64 in a
+  stale local snapshot) yields 805,432 bytes, md5 `4ca337f9586dc45909b071c1917f69a8` — identical to
+  the file that shipped with the fix. So the library is reproducible from this repository alone.
+
+Round counters, whole session: `【红】0`, no `缺键` line at all, and
+`无库0 跳过0 无管线0 陈旧0 越池0 满0 建败0 管线败0 哑0 解排0 格式0 越界0 卡环0 环拒0`. The only
+non-zero texture-side anomaly is `打包:… BC层130`.
+
+What is actually left, after this round:
+
+1. **Speckled ground at daylight** ([`screens/fairlib_ground_speckle.jpg`](screens/fairlib_ground_speckle.jpg)):
+   magenta/green patches whose boundaries follow individual ground-tile footprints, in a frame where
+   the portal and the HUD are clean. That shape plus `BC层130` points at the still-uncovered cls-0
+   (BC1/BC4, 8-byte block) family rather than at geometry. Next move is `DM_TEXDUMP` on those serials
+   and an offline verdict — wrong block order, or never encoded at all.
+2. **In-world frame rate**: 9.3 FPS on the tsv frame counter with the 105-stage library against
+   15.0 FPS with `Z3`, same `.so`, same region. A shader library should not be worth that much, so
+   this gets a controlled A/B (same route, three samples each, counters normalised per second)
+   before any code is touched. Note `arena:新11119706` vs `复用2470871` — the new-allocation path
+   dominates, so the full-range `memcmp` is not automatically the cost.
 
 ## Historical AN baseline
 

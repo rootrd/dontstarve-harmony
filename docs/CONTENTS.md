@@ -27,9 +27,9 @@ These are records of **facts about** a console API or about our own code — not
 | `third_party/astcenc/{include/astcenc.h,LICENSE.txt,README.md}` | ~50 KB | the public header of ARM's astcenc 5.7.0 (Apache-2.0) and its licence text | the only part of astcenc published here. The cross-compiled `.a` files are build products, gitignored; [README](../third_party/astcenc/README.md) documents the toolchain so anyone can produce them |
 | `dm/host/*.c`, `dm/gfx/**/*.c`, `dm/ohos/*` | ~5 MB | our code | the port |
 | `scripts/**`, `dm/gfx/nvn/tests/*.c` | source only | build/pack helpers plus the host-side fault-injection test for the upload path | `scripts/pkg_faults.sh` extracts the production bodies and asserts them on a plain Linux host — it is how the "verified offline" numbers in [STATUS.md](STATUS.md) can be re-produced without a phone |
-| `docs/screens/*.jpg` | ~1 MB | four screenshots of this port running: the main menu, a live world, and the same title screen before/after the vertex-and-dynamic-state round | they are the status. Everything else about the state is text |
+| `docs/screens/*.jpg` | ~2.5 MB | nine screenshots of this port running: the main menu, a live world, the same title screen before/after the vertex-and-dynamic-state round, and the 2026-10-24 Maleoon 920 re-test (world at night, roster, loading art, speckled ground) plus the one frame that shows our own `Z3` library — not the host — producing the Florid Postern shards | they are the status. Everything else about the state is text |
 
-The generated game shader library remains under ignored `build/`; `nvn_sh_tri.h` contains only our own present shaders. Current repair details and local verification commands are in [OHOS-RENDERING-2026-10.md](OHOS-RENDERING-2026-10.md). No new device screenshots or logs were added in this repair.
+The generated game shader library remains under ignored `build/`; `nvn_sh_tri.h` contains only our own present shaders. Current repair details and local verification commands are in [OHOS-RENDERING-2026-10.md](OHOS-RENDERING-2026-10.md); the 2026-10-24 second-device re-test, including the retracted "105-stage library renders the world black" verdict, is in [STATUS.md](STATUS.md).
 
 ### About the inherited documentation and tools
 
@@ -41,6 +41,6 @@ Like every HLE project, our code refers to locations inside the guest binary: `s
 
 They are **not usable without the game**, and they are **not a copy of anything**: an offset is a fact about where something is, the same class of statement as "this import is named X". They are also version-specific — valid for build 1.30 only, and wrong for any other. Where an offset encodes *what the game does*, we describe the behaviour in prose instead of shipping the game's own bytes.
 
-### About the two screenshots
+### About the screenshots
 
-They show a game running. They are here for the same reason a reviewer includes a figure: they are the evidence that the claim in the headline is true, and one of them is the evidence of the open bug. They are the only game-derived visual material in the repository, and they were chosen so that nothing else (notifications, launcher, home screen, chat) appears in frame.
+They show a game running. They are here for the same reason a reviewer includes a figure: they are the evidence that the claim in the headline is true, and some of them are the evidence of an open bug — including the one that indicts our own build rather than the host. They are the only game-derived visual material in the repository, and they were chosen so that nothing else (notifications, launcher, home screen, chat) appears in frame.
