@@ -6,16 +6,16 @@
 #
 #   MARK=...      a string literal that only this round's source contains (required)
 #   HDC=...       path to hdc
-#   PKG=...       bundle name
+#   HDC_TARGET=... explicit device target (required)
 #   PREBUILT=1    skip the hvigor step (reuse whatever is already built)
 #
 # Usage: MARK="排队上传 s=" scripts/pack_install.sh
 set -eu
 HERE=$(cd "$(dirname "$0")" && pwd)
 ROOT=$(cd "$HERE/.." && pwd)
-HAP=${HAP:-$ROOT/hap}
+HAP=${HAP:-$ROOT/build/hap}
 HDC=${HDC:-hdc}
-PKG=${PKG:-com.example.dontstarve}
+HDC_TARGET=${HDC_TARGET:?set HDC_TARGET from hdc list targets}
 MARK=${MARK:?set MARK to a runtime string literal from this round's source - not a comment, comments are stripped}
 SO="$HAP/entry/libs/arm64-v8a/libdmhost.so"
 EO="$HAP/entry/build/default/outputs/default"
@@ -50,23 +50,6 @@ unzip -p "$HAPF" libs/arm64-v8a/libdmhost.so > /tmp/inhap.so || { echo "red: no 
 grep -a -q "$MARK" /tmp/inhap.so || { echo "red: the packaged .so lacks \"$MARK\" - it is a stale object"; exit 1; }
 echo "green: packaged .so carries this round's marker ($(wc -c < /tmp/inhap.so) B after stripping)"
 
-# Large packages: `hdc install -r` TRUNCATES them and then reports a bogus
-# "verify signature failed". Push the files and let the package manager install in place.
-DS=$(wc -c < "$DO/ds2-default-signed.hap")
-"$HDC" shell "mkdir -p $DEVDIR" >/dev/null
-if [ "$("$HDC" shell "wc -c < $DEVDIR/ds2.hap" 2>/dev/null | tr -d '\r ')" = "$DS" ]; then
-  echo "ds2 already on device at $DS B, skipping transfer"
-else
-  ( cd "$DO" && "$HDC" file send ds2-default-signed.hap "$DEVDIR/ds2.hap" ) >/dev/null
-fi
-( cd "$EO" && "$HDC" file send entry-default-signed.hap "$DEVDIR/entry.hap" ) >/dev/null
-
-E=$("$HDC" shell "wc -c < $DEVDIR/entry.hap" | tr -d '\r ')
-[ "$E" = "$S" ] || { echo "red: transfer incomplete ($E of $S)"; exit 1; }
-echo "green: transfer sizes match ($E B)"
-
-# Changing the install requires uninstalling first; an update-over keeps the old sandbox
-# and the old data layout, which is how a good build gets blamed for a stale save.
-"$HDC" shell "bm uninstall -n $PKG" >/dev/null 2>&1 || true
-"$HDC" shell "bm install -p $DEVDIR/entry.hap $DEVDIR/ds2.hap" | tail -2
-echo "installed"
+# Verify both module identities and SHA-256 hashes, then replace them together.
+# Updating keeps the existing saves. Never uninstall as part of a build/deploy.
+python3 "$HERE/install_dst_hap.py" --project "$HAP" --hdc "$HDC" --target "$HDC_TARGET"

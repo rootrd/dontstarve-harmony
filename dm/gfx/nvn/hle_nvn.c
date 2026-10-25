@@ -1419,6 +1419,10 @@ NVN(nvnQueueSubmitCommands, void, NVNqueue *q, int n, const NVNcommandHandle *h)
     cmd_icb_flush();   // 先收口设备自带那条（上传要在本帧绘制前生效）| drain the device-owned buffer first, so uploads land before this frame's draws
     uint64_t t0 = now_ns(), c0 = clock_gettime_nsec_np(CLOCK_THREAD_CPUTIME_ID), i0, y0, s0 = thr_sys_ns(); thr_counts(&i0, &y0);
     ((queue_t *)q)->submits++;
+#if defined(__OHOS__)
+    const dev_t_ *device = (const dev_t_ *)((queue_t *)q)->dev;
+    mtl_vk_window_origin(device ? device->origin : 0);
+#endif
     mtl_sub_begin();
     mtl_sub_index((const uint64_t *)h, n);
     for (int i = 0; i < n; i++) { mtl_exec_rest((const uint64_t *)h + i + 1, n - i - 1); mtl_exec((const uint8_t *)h[i]); }
@@ -1791,6 +1795,10 @@ NVN(nvnQueuePresentTexture, void, NVNqueue *q, NVNwindow *w, int idx) {
     gfx_enter();
     cmd_icb_flush();
     uint64_t t0 = now_ns();
+#if defined(__OHOS__)
+    const dev_t_ *device = (const dev_t_ *)((queue_t *)q)->dev;
+    mtl_vk_window_origin(device ? device->origin : 0);
+#endif
     if (idx >= 0 && idx < o->ntex && idx < 4) o->ticket[idx] = mtl_present(CTX(o->tex[idx]), present_period(o) / 1e9, o->crop);   // 只入队，立即返回 | enqueue only, return immediately
     gfx_leave();
     atomic_fetch_add(&g_nvn_ns, now_ns() - t0);

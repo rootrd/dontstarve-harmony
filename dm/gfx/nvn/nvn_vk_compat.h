@@ -167,3 +167,19 @@ static inline uint64_t nvn_vk_copy_pitch(int64_t stride, uint32_t width, uint32_
     if (row < minimum || row % bpb || row / bpb > UINT32_MAX / bw) return 0;
     return row;
 }
+
+// Keep offscreen rows in the guest texture coordinate system. Converting every
+// lower-left pass to display orientation reverses render-to-texture LUTs and
+// changes the meaning of later texture lookups. Flip only at presentation.
+static inline VkViewport nvn_vk_guest_viewport(VkViewport v, int upper_left)
+{
+    if (upper_left) { v.y += v.height; v.height = -v.height; }
+    return v;
+}
+
+static inline VkViewport nvn_vk_present_viewport(uint32_t w, uint32_t h, int upper_left)
+{
+    VkViewport v = {0, 0, (float)w, (float)h, 0, 1};
+    if (!upper_left) { v.y = (float)h; v.height = -(float)h; }
+    return v;
+}

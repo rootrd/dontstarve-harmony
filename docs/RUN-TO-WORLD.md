@@ -1,7 +1,9 @@
 # 跑到地图:装机后能真正进世界的那条路(2026-10-24 验证版)
 
 写给要用自己方法打包的协作者。**能装上 ≠ 能进世界**——本文记的是 10-24 当天反复验证过、
-能一路开到世界里的完整流程,以及三处"少一步就进不去"的硬门槛。
+能一路开到世界里的完整流程。启动参数一节已按 10-25 的源码与 GPU 读回证据更新。
+
+> 2026-10-25 补充：本文保留 10-24 在 Maleoon 920 上的历史操作记录。当前 `app_ohos.c` 已默认设置 `DM_TITLE_DRV=0` 和 manifest 里的模块列表，不能再概括为“桌面启动全部开关关闭”。Maleoon 910 的 CPU BC→RGBA 路径已进入世界；GPU 读回定位到独立的离屏 Y 轴错误（调色表被翻转），因此“必须启用 ASTC 才能显示世界”不是通用结论。最新证据与修复见 [渲染报告](OHOS-RENDERING-2026-10.md)。首次安装需 `entry` + `ds2`，推荐 [双包安装器](../scripts/install_dst_hap.py)，覆盖安装保留存档。
 
 ## 0. 两条打包路线的关系
 
@@ -10,29 +12,27 @@
 | 路线 A(本文):换 .so 重打 entry | HAP 壳工程(`hap/` 模板对应的本地工程)里已装好 5.18 GB 游戏资源(entry + ds2 双模块),每轮只换 `libdmhost.so` 重打 entry 模块 | **日常迭代**。5 分钟一轮,`ds2` 不动 |
 | 路线 B:[stage_dst_hap.py](../scripts/stage_dst_hap.py) 从解包产物拼全新 HAP | 首次装配/换资源 | 首次装机 |
 
-两条路线的**启动参数是同一套**(§3)。参数不对,哪条路线都进不了世界——这正是"装上了却在
-世界门口卡死"的头号原因。
+两条路线使用同一套原生启动参数（§1）；先核对模块、构建版本和日志，再定位启动或渲染问题。
 
-## 1. 硬门槛一:启动参数不是可选项
+## 1. 启动默认值与诊断参数
 
-游戏必须用 `aa start --ps` 带参启动。**桌面图标点进去 = 所有开关全关**,后果实测:
+当前 `app_ohos.c` 已默认关闭不适用于 DST 的 D2R 固定偏移驱动（`DM_TITLE_DRV=0`），并从生成的 manifest 取得 `main,sdk`。桌面启动会使用这些默认值；它不会保留上一次 `aa start --ps` 临时传入的诊断选项。
 
-- **没有 `DM_TITLE_DRV 0`**:宿主带着 D2R(暗黑 2)的固定偏移驱动默认值跑饥荒,行为未定义。
-- **没有 `DM_RT_ASTC`(+ 目录)**:BC3 贴图只剩 CPU 软解一条路,实测**世界整层全黑**
-  (交接记录 §5:软解只能当诊断旁路)。马良 920 一个 BC 块格式都不认,世界地表全靠
-  设备端 BC3→ASTC 现编,**这是能看见地图的充要条件**。
-- 没有日志开关:崩了无从取证。
+Maleoon 不支持原生 BC 时，CPU 解码为对应的未压缩 Vulkan 格式是合法回退。10-24 在 Maleoon 920 上启用过 `DM_RT_ASTC=60`，但当时没有完成白天同场景对照，不能据此断言 ASTC 是显示世界的必要条件。10-25 在 Maleoon 910 上使用 CPU BC→RGBA，已进入世界并读回证明调色表上传正确；世界颜色异常的一个确定原因是离屏渲染 Y 轴翻转，见最新渲染报告。
 
-能进世界的最小参数集(当天验证过的那份,直接抄):
+诊断基线（明确选择设备，不开高频线程采样；日志仅保存在应用沙箱）：
 
 ```bash
-aa start -a EntryAbility -b com.rootrd.dontstarve \
+hdc -t <序列号> shell aa start -a EntryAbility -b com.rootrd.dontstarve \
   --ps DM_TITLE_DRV 0 \
-  --ps DM_RT_ASTC 60 \
-  --ps DM_RT_ASTC_DIR /data/storage/el2/base/haps/entry/files/astc \
-  --ps DM_LOGFILE /data/storage/el2/base/haps/entry/files/hlog.txt \
-  --ps DM_SAMPLE 1000:*
+  --ps DM_MODULES main,sdk \
+  --ps DM_TEX_ASTC 0 \
+  --ps DM_SPUR 500 \
+  --ps DM_SAMPLE 0 \
+  --ps DM_LOGFILE /data/storage/el2/base/haps/entry/files/hlog.txt
 ```
+
+`DM_RT_ASTC`（转码质量）及 `DM_RT_ASTC_DIR`（缓存目录）仍可用于独立的 BC3→ASTC 对照，不是默认必需参数，也不能与 `DM_TEX_ASTC` 的格式重解释混为一谈。比较两条路径时要固定存档、昼夜和场景。
 
 加料轮(取证)的完整模板见仓库外 `params_<TAG>` 文件的用法:把整串 `--ps ...` 放进一个文件,
 `PARAMS="$(cat params_X)"` 后拼进 `aa start`。常用可选开关:`DM_NVN_TSV`(逐帧调用计数)、

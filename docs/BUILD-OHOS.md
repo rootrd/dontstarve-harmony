@@ -4,6 +4,18 @@ For the current DST 1.30.0 asset layout (`main,sdk`), generated guest manifest, 
 
 Three stages: cross-compile the host into `libdmhost.so`, assemble a signed HAP that carries it plus the game data, install. A round takes about five minutes end to end; treat that as the unit of work and **batch your changes into it** — one-variable-at-a-time device rounds are the slowest possible way to find out anything.
 
+## Installing both resource modules while retaining saves
+
+DST 1.30.0 splits its RomFS between `entry` and `ds2`; install both signed HAPs from the same build/version. `ds2` is a resource feature module, not a separately launched game. Use the explicit USB/network target from `hdc list targets`:
+
+```powershell
+python scripts/install_dst_hap.py --project build/hap --target DEVICE_ID
+```
+
+The installer checks module identities and versions, verifies each transferred HAP with SHA-256, runs one `bm install -r -p entry.hap ds2.hap` transaction, and confirms both installed modules. It retains saves. Do not uninstall for a routine update. `--check-only` checks the local packages without touching a device.
+
+A slow first world generation does not by itself prove a missing resource module. Check both the installed module list and runtime file paths before attributing it to `ds2`.
+
 ## 0. What you need
 
 | Item | Why |
@@ -59,8 +71,8 @@ Sign with your own certificate and profile. Two hard-won rules:
 ```bash
 hdc file send entry-default-signed.hap /data/local/tmp/dstapp/entry.hap
 hdc file send ds2-default-signed.hap   /data/local/tmp/dstapp/ds2.hap
-hdc shell bm uninstall -n <bundleName>
-hdc shell bm install -p /data/local/tmp/dstapp/entry.hap /data/local/tmp/dstapp/ds2.hap
+# Keep the existing installation and saves.
+hdc shell bm install -r -p /data/local/tmp/dstapp/entry.hap /data/local/tmp/dstapp/ds2.hap
 ```
 
 **Verify the transfer by byte count on both sides.** A short file produces exactly the signature error described above, and it will look like your signing is broken.

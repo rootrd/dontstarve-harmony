@@ -432,6 +432,10 @@ static void tex_idx_build(void)
 static void to_layout(VkCommandBuffer cb, vktex *v, VkImageLayout want);   // 定义在下面：出图管线要先用它把源图转成可采样布局 | used by the present pipeline, defined below
 static VkImageLayout col_rest(void);   // 定义在 rp_get 之前：通道外颜色附件停的那一态（位 4096 可退回旧写法）
 static VkImageLayout dep_rest(void);   // 同上，深度侧（位 8192）
+static uint32_t g_window_origin; // NVN lower-left (0) or upper-left (1)
+static int g_legacy_yflip;       // diagnostic A/B: reproduce the former per-pass flip
+void mtl_vk_window_origin(uint32_t upper_left) { g_window_origin = upper_left != 0; }
+
 static int g_sets_valid;      // 定义在下面：贴图释放时要作废缓存的描述符集 | defined below; releasing a texture invalidates the cached sets
 
 // 「游戏有没有往出图源那张画」这一问的记账 | bookkeeping for "does the game ever draw into the present source?"
@@ -1053,7 +1057,8 @@ static VkDescriptorSet tri_prep(VkCommandBuffer cb, vktex *v)
 // Inside the pass: bind and draw the one full-screen triangle that covers the whole image.
 static void tri_emit(VkCommandBuffer cb, VkDescriptorSet set, VkFormat source_format)
 {
-    VkViewport vp = { 0, 0, (float)g_sc_ext.width, (float)g_sc_ext.height, 0.0f, 1.0f };
+    VkViewport vp = nvn_vk_present_viewport(g_sc_ext.width, g_sc_ext.height,
+                                           g_legacy_yflip || g_window_origin);
     VkRect2D sc = { { 0, 0 }, g_sc_ext };
     vkCmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_GRAPHICS, g_tri_pipe);
     vkCmdSetViewport(cb, 0, 1, &vp);
@@ -1991,7 +1996,7 @@ uint64_t mtl_sub_commit(void)
                 const char *p = e;
                 while (p && *p && rr_n < 4) { rr_s[rr_n++] = strtoull(p, NULL, 0); p = strchr(p, ','); if (p) p++; }
                 const char *v2 = getenv("DM_RTREAD_EVERY");
-                if (v2 && *v2) rr_every = strtoull(v2, NULL, 0);
+                if (v2 && *v2) { uint64_t n = strtoull(v2, NULL, 0); if (n) rr_every = n; }
             }
         }
         if (rr_on && g_cb && (++rr_k % rr_every) == 0)
@@ -4212,7 +4217,7 @@ static uint32_t vtx_const_binding(int vi)
 // ---- 管线缓存 | the pipeline cache ----
 typedef struct {
     uint32_t vi, fi; uint64_t pk;
-    uint32_t ncol, has_ds, topo, poly, ds, color, chmask, a2c, blend_en;
+    uint32_t ncol, has_ds, topo, poly, ds, color, chmask, a2c, blend_en, window_origin;
     uint64_t blend[8];
     va_st attr[16]; vs_st stream[16];
 } pipe_key;
@@ -4244,7 +4249,7 @@ static void pipe_key_fill(pipe_key *k, int vi, int fi, int prim, VkRenderPass rp
 {
     memset(k, 0, sizeof *k);   // 补齐字节必须为 0，否则 memcmp 认不出同一条 | padding must be zero or the memcmp never matches
     k->vi = (uint32_t)vi; k->fi = (uint32_t)fi; k->pk = passk ^ (uint64_t)(uintptr_t)rp;
-    k->ncol = g_p.ncol; k->has_ds = g_p.has_ds;
+    k->ncol = g_p.ncol; k->has_ds = g_p.has_ds; k->window_origin = g_window_origin;
     k->topo = (uint32_t)prim;
     k->poly = *(const uint32_t *)&S.poly;
     k->ds = (uint32_t)((*(const uint64_t *)&S.ds) ^ ((*(const uint64_t *)&S.ds) >> 32));   // ds_st 就是一个 uint64 | ds_st is a single uint64
@@ -4392,6 +4397,8 @@ static VkPipeline pipe_get(int vi, int fi, int prim, VkRenderPass rp, uint64_t p
     // killer. The enums are shared with the Metal build and the expression is semantically identical, so what differs is framebuffer
     // handedness (Metal y-up bottom-left vs Vulkan y-down top-left): the same SPIR-V winds the opposite way. Hence the inversion.
     rs.frontFace = S.poly.front == NVN_FRONT_FACE_CW ? VK_FRONT_FACE_COUNTER_CLOCKWISE : VK_FRONT_FACE_CLOCKWISE;
+    if (g_window_origin && !g_legacy_yflip)
+        rs.frontFace = S.poly.front == NVN_FRONT_FACE_CW ? VK_FRONT_FACE_CLOCKWISE : VK_FRONT_FACE_COUNTER_CLOCKWISE;
     if (g_skip & 1048576) rs.frontFace = S.poly.front == NVN_FRONT_FACE_CW ? VK_FRONT_FACE_CLOCKWISE : VK_FRONT_FACE_COUNTER_CLOCKWISE;
     rs.depthBiasEnable = S.poly.offset_en ? VK_TRUE : VK_FALSE;
     rs.lineWidth = 1.0f;
@@ -5112,23 +5119,12 @@ static void emit_dyn(VkCommandBuffer cb, VkExtent2D ext)
 {
     VkViewport v = { 0, 0, (float)ext.width, (float)ext.height, S.dr[0], S.dr[1] };
     if (S.has_vp) { v.x = S.vp[0][0]; v.y = S.vp[0][1]; v.width = S.vp[0][2]; v.height = S.vp[0][3]; }
-    // Vulkan 1.0 规定视口偏移非负（VUID-VkViewport-x/y-01231/2），GL 习惯的负 y 界面矩形在这里会出现；先原样传、只计数，
-    // 画面真反了再一次性按 NVN→Vk 的惯例改 y 翻转。
-    // Vulkan 1.0 wants non-negative viewport offsets; GL-style negative y does show up here. Passed through as-is with a counter for now -
-    // if the picture comes out flipped this becomes one deliberate y-flip change.
     if (v.x < 0 || v.y < 0) g_vp_neg++;
-    // 视口 Y 翻：默认开。第 112 轮 B36 用运行时位 2097152 单独验过——饥荒画的是 NVN 的左下原点，
-    // 我们原样喂给 Vulkan（左上原点）就等于整幅上下翻一遍；开了之后截图里「开始游戏！」是正的，
-    // 而同版二进制不开就是镜像（B35）。出图那颗满屏三角形（tri.vert 的 uv=q*0.5+0.5）本身也翻一次，
-    // 两次翻合起来才是正的，所以**别**再去改出图那侧。负高度视口靠 VK_KHR_maintenance1（本机在场）。
-    // 位 8388608 = 关掉这一翻，留着做反向 A/B。
-    // Viewport Y flip, on by default. Round 112 (B36) proved it with the runtime bit: Don't Starve writes NVN's
-    //   lower-left-origin viewports, Vulkan's origin is upper-left, so passing it through flips the whole picture.
-    //   With the flip the screenshot reads upright; without it (B35, same binary) it is a vertical mirror.
-    //   The present triangle flips once more on its own (uv = q*0.5+0.5), which is why the blit side must NOT change.
-    //   Bit 8388608 turns this off for the reverse A/B. Negative viewport height needs VK_KHR_maintenance1 (present here).
-    int yflip = !(g_skip & 8388608);
-    if (yflip) { v.y += v.height; v.height = -v.height; }
+    // Guest framebuffer row zero must remain texture row zero through every
+    // offscreen pass. The old unconditional Y flip inverted colour LUTs, light
+    // buffers and postprocess inputs; an upright menu alone did not validate it.
+    int legacy_flip = g_legacy_yflip && !(g_skip & 8388608);
+    v = nvn_vk_guest_viewport(v, g_legacy_yflip ? legacy_flip : g_window_origin);
     vkCmdSetViewport(cb, 0, 1, &v);
     VkRect2D sc = { { 0, 0 }, ext };
     if (S.has_sc) {
@@ -5138,7 +5134,7 @@ static void emit_dyn(VkCommandBuffer cb, VkExtent2D ext)
         // 裁剪盒跟着视口翻：不然几何翻正了、可见矩形还留在镜像的那一排（下沿越界就夹成 0，整块 UI 会凭空消失）
         // The scissor rides along with the viewport, otherwise the geometry is upright but the visible rect stays
         // on the mirrored row (and an out-of-range origin clips a whole panel away).
-        int sy = yflip ? (int)ext.height - (int)S.sc.y - (int)sc.extent.height : (int)S.sc.y;
+        int sy = legacy_flip ? (int)ext.height - (int)S.sc.y - (int)sc.extent.height : (int)S.sc.y;
         sc.offset.y = sy < 0 ? 0 : sy;
     }
     vkCmdSetScissor(cb, 0, 1, &sc);
@@ -7114,6 +7110,8 @@ static int vk_ensure(void)
     void *win; uint64_t w = 0, h = 0;
     if (!dm_ohos_window(&win, &w, &h)) return 0;
     g_tried = 1;
+    { const char *s = getenv("DM_VK_LEGACY_YFLIP"); g_legacy_yflip = s && atoi(s) != 0;
+      GVL("[vk] guest texture rows preserved; legacy per-pass Y flip=%{public}d", g_legacy_yflip); }
     { const char *s = getenv("DM_VK_SKIP"); g_skip = s ? (int)strtol(s, NULL, 0) : 0;
       GVL("[vk] DM_VK_SKIP = %{public}d（1 无通道 2 无清除 4 无深度 8 不出图 16 不搬像素 32 不呈现 64 呈现不用信号量 128 出图前排空队列 256 游戏提交不上 GPU 512 出图写离屏 1024 不画三角形 2048 不重放游戏绘制 4096 颜色回附件态 8192 深度回附件态且不绑真深度 16384 颜色一律用哑图 32768 关掉按需建图 65536 关掉「按池偏移认图+释放进回收站」 131072 按需建图上限抬到 12000 262144 不剔背面 524288 不测深度 1048576 绕序回退成 Metal 那份 8388608 不翻视口 4194304 不搬打包贴图 16777216 采样一律 0 级（禁 mip） 33554432 哑图退回彩色渐变（不设=纯黑） 67108864 打包贴图只传一次 134217728 顶点 RGBA8 的 A 顶成 0xFF 268435456 混合源因子一律顶成 ONE 536870912 关掉「新生命补一次打包重传」1073741824 出图钉死采第一张源图 2097152 不测模板）", g_skip); }   // 逐类关掉的定位开关 | per-class isolation knob
     { const char *s = getenv("DM_FLK"); g_flk_left = s ? (int)strtol(s, NULL, 0) : 0;   // 闪屏探针：逐拍出图整帧读回，打 16x9 亮度网格与周期 | per-present full-frame readback

@@ -101,6 +101,28 @@ int main(void)
     CHECK(dep[1].dstSubpass == VK_SUBPASS_EXTERNAL && dep[1].dstAccessMask & VK_ACCESS_MEMORY_READ_BIT);
     CHECK(dep[1].srcStageMask & VK_PIPELINE_STAGE_LATE_FRAGMENT_TESTS_BIT);
     CHECK(dep[0].dependencyFlags == 0 && dep[1].dependencyFlags == 0);
+    // Rasterize a full-screen LUT quad with position.y = 2*uv.y-1.
+    // Every sample must land back in the same row, including repeated RT passes.
+    VkViewport lut = nvn_vk_guest_viewport((VkViewport){0, 0, 1024, 32, 0, 1}, 0);
+    for (int y = 0; y < 32; y++) {
+        float uv = ((float)y + 0.5f) / 32.0f;
+        for (int pass = 0; pass < 4; pass++) {
+            float ndc = 2.0f * uv - 1.0f;
+            int row = (int)(lut.y + (ndc + 1.0f) * lut.height * 0.5f);
+            CHECK(row == y);
+            uv = ((float)row + 0.5f) / 32.0f;
+        }
+    }
+    VkViewport display = nvn_vk_present_viewport(1280, 720, 0);
+    CHECK(display.y + display.height == 0 && display.y == 720);
+    // Nonzero viewport origin: leave guest rows intact; upper-left uses -height.
+    VkViewport sub = {12, 37, 80, 60, 0.2f, 0.9f};
+    VkViewport lower = nvn_vk_guest_viewport(sub, 0), upper = nvn_vk_guest_viewport(sub, 1);
+    CHECK(lower.y == 37 && lower.height == 60);
+    CHECK(upper.y == 97 && upper.height == -60 && upper.x == 12);
+    CHECK(upper.minDepth == sub.minDepth && upper.maxDepth == sub.maxDepth);
+    display = nvn_vk_present_viewport(1280, 720, 1);
+    CHECK(display.y == 0 && display.height == 720);
     bc_pixels();
 
     // Hand-placed Tegra markers: 4x4 RGBA8, two z slices, one GOB per slice.
