@@ -1299,7 +1299,7 @@ static int zskip_has(uint64_t ser, int lv, int sl) { for (int i = 0; i < g_zskip
 static void zskip_add(uint64_t ser, int lv, int sl) { if (!ser || zskip_has(ser, lv, sl) || g_zskip_n >= 4096) return; g_zskip_zero[g_zskip_n++] = (zskip_zero){ser, (uint16_t)lv, (uint16_t)sl}; }
 static int zskip_zero_clear(int i) { return R.clear_c[i] && R.cc[i].red == 0 && R.cc[i].green == 0 && R.cc[i].blue == 0 && R.cc[i].alpha == 0; }
 static void zskip_commit_clears(void) { for (int i = 0; i < 8; i++) if (g_zskip_cand_ok[i]) zskip_add(g_zskip_cand[i].ser, g_zskip_cand[i].level, g_zskip_cand[i].slice); }
-static int zskip_target_zero(const tex_t *t, const view_t *v, int hv) { int lv = hv && v->set_levels ? v->base_level : 0, sl = hv && v->set_layers ? v->min_layer : 0; return t && zskip_has(t->serial, lv, sl); }
+static int zskip_target_zero(const tex_t *t, const view_t *v, int hv) { int lv = hv && v->nlevels ? v->base_level : 0, sl = hv && v->nlayers ? v->min_layer : 0; return t && zskip_has(t->serial, lv, sl); }
 #ifdef NVN_RT_RANGE_TEST
 static int g_rr_checking;
 static void rr_begin(void), rr_finish(int ranged);
@@ -1671,8 +1671,8 @@ void pg_sub_begin_ext(uint64_t fence) { pg_sub_begin(fence); }
 void pg_commit_ext(id<MTLCommandBuffer> cb) { pg_commit(cb); }
 static void attach(MTLRenderPassAttachmentDescriptor *a, const tex_t *t, const view_t *v, int has_v) {
     a.texture = tex_mtl(t);
-    if (has_v && v->set_levels) a.level = v->base_level;
-    if (has_v && v->set_layers) { if (t->d.target == 2) a.depthPlane = v->min_layer; else a.slice = v->min_layer; }
+    if (has_v && v->nlevels) a.level = v->base_level;
+    if (has_v && v->nlayers) { if (t->d.target == 2) a.depthPlane = v->min_layer; else a.slice = v->min_layer; }
 }
 // mode 1（clear_only）：只为落地挂起的清除而开的通道，只挂有清除的附件；mode 2：前瞻证明本通道不用深度模板，不挂深度。
 // clear_only：只为落地挂起的清除而开的通道，只挂有清除的附件——其余附件本通道不碰，挂上去在 TBDR 上平白一读一写
@@ -1745,7 +1745,7 @@ static id<MTL4RenderCommandEncoder> rp_begin_ex(int clear_only) {
     }
     if (!any) { RED_ONCE(4, "渲染目标都建不出 MTLTexture"); return nil; }
     for (int i = 0; i < R.rt.n && i < 8; i++) if (R.rt.color[i] && zskip_zero_clear(i)) {
-        g_zskip_cand_ok[i] = 1; g_zskip_cand[i] = (zskip_zero){R.rt.color[i]->serial, (uint16_t)(R.rt.has_cview[i] && R.rt.cview[i].set_levels ? R.rt.cview[i].base_level : 0), (uint16_t)(R.rt.has_cview[i] && R.rt.cview[i].set_layers ? R.rt.cview[i].min_layer : 0)};
+        g_zskip_cand_ok[i] = 1; g_zskip_cand[i] = (zskip_zero){R.rt.color[i]->serial, (uint16_t)(R.rt.has_cview[i] && R.rt.cview[i].nlevels ? R.rt.cview[i].base_level : 0), (uint16_t)(R.rt.has_cview[i] && R.rt.cview[i].nlayers ? R.rt.cview[i].min_layer : 0)};
     }
     // 带宽账：Load 的附件计读入，全部附件计写出（当前一律 Store）
     // Bandwidth ledger: attachments with Load count as load, all attachments count as store (currently always Store)
@@ -1819,9 +1819,9 @@ static id<MTL4RenderCommandEncoder> rp_begin_ex(int clear_only) {
 static void rt_dims(NSUInteger *tw, NSUInteger *th) {
     id<MTLTexture> t0 = nil; NSUInteger level = 0;
     for (int i = 0; i < R.rt.n && i < 8 && !t0; i++) if (R.rt.color[i]) {
-        t0 = tex_mtl(R.rt.color[i]); level = R.rt.has_cview[i] && R.rt.cview[i].set_levels ? R.rt.cview[i].base_level : 0;
+        t0 = tex_mtl(R.rt.color[i]); level = R.rt.has_cview[i] && R.rt.cview[i].nlevels ? R.rt.cview[i].base_level : 0;
     }
-    if (!t0 && R.rt.depth) { t0 = tex_mtl(R.rt.depth); level = R.rt.has_dview && R.rt.dview.set_levels ? R.rt.dview.base_level : 0; }
+    if (!t0 && R.rt.depth) { t0 = tex_mtl(R.rt.depth); level = R.rt.has_dview && R.rt.dview.nlevels ? R.rt.dview.base_level : 0; }
     *tw = t0 ? mip_extent(t0.width, level) : 1; *th = t0 ? mip_extent(t0.height, level) : 1;
 }
 // 有挂起的清除但通道里没有绘制：开一次通道把清除落地
@@ -1833,7 +1833,7 @@ static void rp_flush(void) {
     rp_end();
 }
 static int scissor_full(const tex_t *t, const view_t *v, int has_v) {
-    NSUInteger level = has_v && v->set_levels ? v->base_level : 0;
+    NSUInteger level = has_v && v->nlevels ? v->base_level : 0;
     NSUInteger w = mip_extent(t->d.width, level), h = mip_extent(t->d.target == 0 || t->d.target == 3 ? 1 : t->d.height, level);
     return !R.has_sc || (R.sc.x <= 0 && R.sc.y <= 0 && (int64_t)R.sc.x + R.sc.w >= (int64_t)w && (int64_t)R.sc.y + R.sc.h >= (int64_t)h);
 }
@@ -2191,7 +2191,7 @@ static id<MTLTexture> tex_by_id(int tid) {   // 调用方持 g_rmu | Caller hold
     id<MTLTexture> base = tex_mtl(&rp->t);
     if (!base) return nil;
     v = base;
-    if (r.has_v && (r.v.set_format || r.v.set_levels || r.v.set_layers || r.v.set_target)) {
+    if (r.has_v && (r.v.set_format || r.v.nlevels || r.v.nlayers || r.v.set_target)) {
         uint32_t pf = (uint32_t)base.pixelFormat; uint8_t swz[4];
         if (r.v.set_format && !(nvn_fmt_to_mtl(r.v.format, &pf, swz) && pf)) pf = (uint32_t)base.pixelFormat;
         { uint32_t upf; int ubpp; if (r.v.set_format && bc_unpack(r.v.format, &upf, &ubpp)) pf = upf; }   // 无 BC：BC 视图跟底图一样换成解压后的格式 | No BC: a BC view is switched to the decompressed format just like the base texture
@@ -2199,9 +2199,9 @@ static id<MTLTexture> tex_by_id(int tid) {   // 调用方持 g_rmu | Caller hold
             base = tex_upgrade_pfv(&rp->t, base, (MTLPixelFormat)pf);
             sg = g_ser_gen;
         }
-        NSUInteger l0 = r.v.set_levels ? r.v.base_level : 0, nl = r.v.set_levels && r.v.nlevels ? r.v.nlevels : base.mipmapLevelCount - l0;
-        NSUInteger s0 = r.v.set_layers ? r.v.min_layer : 0;
-        NSUInteger ns = base.textureType == MTLTextureType3D ? 1 : (r.v.set_layers && r.v.nlayers ? r.v.nlayers : base.arrayLength * (base.textureType == MTLTextureTypeCube || base.textureType == MTLTextureTypeCubeArray ? 6 : 1) - s0);
+        NSUInteger l0 = r.v.nlevels ? r.v.base_level : 0, nl = r.v.nlevels && r.v.nlevels ? r.v.nlevels : base.mipmapLevelCount - l0;
+        NSUInteger s0 = r.v.nlayers ? r.v.min_layer : 0;
+        NSUInteger ns = base.textureType == MTLTextureType3D ? 1 : (r.v.nlayers && r.v.nlayers ? r.v.nlayers : base.arrayLength * (base.textureType == MTLTextureTypeCube || base.textureType == MTLTextureTypeCubeArray ? 6 : 1) - s0);
         MTLTextureType tt = r.v.set_target ? ttype(r.v.target, base.textureType) : base.textureType;
         if (tt == MTLTextureType2D && ns > 1) ns = 1;
         v = [base newTextureViewWithPixelFormat:(MTLPixelFormat)pf textureType:tt levels:NSMakeRange(l0, nl) slices:NSMakeRange(s0, ns)];
@@ -3209,9 +3209,9 @@ static int rt_range_shape(const p_set_rt *a, const p_set_rt *b) {
         x->d.samples > 1 || y->d.samples > 1 || (x->has_layout && x->mem) || (y->has_layout && y->mem) ||
         memcmp(&x->d,&y->d,sizeof x->d) || x->mem != y->mem || x->pool != y->pool || x->off != y->off) return 0;
     const view_t *v=&a->cview[0], *w=&b->cview[0]; int levels=x->d.levels;
-    if (!v->set_levels || !w->set_levels || v->base_level < 0 || v->base_level >= levels ||
+    if (!v->nlevels || !w->nlevels || v->base_level < 0 || v->base_level >= levels ||
         v->nlevels <= 0 || v->nlevels > levels-v->base_level || w->nlevels <= 0 || w->nlevels > levels-v->base_level ||
-        (v->set_layers && (v->min_layer || v->nlayers != 1)) || (v->set_format && v->format != x->d.format) ||
+        (v->nlayers && (v->min_layer || v->nlayers != 1)) || (v->set_format && v->format != x->d.format) ||
         (v->set_target && v->target != NVN_TEXTURE_TARGET_2D)) return 0;
     view_t cv=*w; cv.nlevels=v->nlevels;
     if (memcmp(v,&cv,sizeof cv)) return 0;
@@ -3219,7 +3219,7 @@ static int rt_range_shape(const p_set_rt *a, const p_set_rt *b) {
         if (!d->serial || d->serial != e->serial || d->d.target != NVN_TEXTURE_TARGET_2D || e->d.target != NVN_TEXTURE_TARGET_2D ||
             d->d.samples > 1 || e->d.samples > 1 || (d->has_layout && d->mem) || (e->has_layout && e->mem) ||
             memcmp(&d->d,&e->d,sizeof d->d) || d->mem != e->mem || d->pool != e->pool || d->off != e->off) return 0;
-        int dl=a->has_dview && a->dview.set_levels ? a->dview.base_level : 0;
+        int dl=a->has_dview && a->dview.nlevels ? a->dview.base_level : 0;
         if (dl < 0 || dl >= d->d.levels || mip_extent(d->d.width,dl) < mip_extent(x->d.width,v->base_level) ||
             mip_extent(d->d.height,dl) < mip_extent(x->d.height,v->base_level)) return 0; }
 
@@ -3311,7 +3311,7 @@ static uint64_t g_pp_slot[6][160]; static const prog_t *g_pp_prog; static const 
 static uint32_t *g_rtx_seq, *g_drx_seq; static uint32_t g_rtx_n, g_rtx_cap, g_drx_n, g_drx_cap;   // 本次提交的 SET_RT / 绘制序号表（可读 tile 合并的预筛用） | This submit's SET_RT / draw sequence number tables (used by the pre-screen of the readable tile merge)
 static void seq_push(uint32_t **v, uint32_t *n, uint32_t *cap, uint32_t x) { if (*n == *cap) { *cap = *cap ? *cap * 2 : 1024; *v = realloc(*v, *cap * sizeof **v); } (*v)[(*n)++] = x; }
 static void sdx_ev_add(sdx_ev e) { if (sdx_bucket(e.ser, 0) < 0) return; if (g_sdx_n == g_sdx_cap) { g_sdx_cap = g_sdx_cap ? g_sdx_cap * 2 : 4096; g_sdx = realloc(g_sdx, g_sdx_cap * sizeof *g_sdx); g_sdx_tmp = realloc(g_sdx_tmp, g_sdx_cap * sizeof *g_sdx); } g_sdx[g_sdx_n++] = e; }
-static void sdx_lvsl(const view_t *v, int hv, uint16_t *lv, uint16_t *sl) { *lv = (uint16_t)(hv && v->set_levels ? v->base_level : 0); *sl = (uint16_t)(hv && v->set_layers ? v->min_layer : 0); }
+static void sdx_lvsl(const view_t *v, int hv, uint16_t *lv, uint16_t *sl) { *lv = (uint16_t)(hv && v->nlevels ? v->base_level : 0); *sl = (uint16_t)(hv && v->nlayers ? v->min_layer : 0); }
 static void sdx_walk(const uint8_t *p, int depth) {
     if (depth > 64) { g_sdx_ok = 0; return; }
     for (uint32_t guard = 0; guard < 4000000 && p && g_sdx_ok; guard++) {
@@ -3424,7 +3424,7 @@ static void xv_forward(void) {
 }
 static void rt_sub(const p_set_rt *r, int k, uint64_t *ser, int *lv, int *sl) {   // 附件 k（0–7 颜色，8 深度）的子资源 | Subresource of attachment k (0–7 color, 8 depth)
     const tex_t *t = k == 8 ? r->depth : r->color[k]; const view_t *v = k == 8 ? &r->dview : &r->cview[k]; int hv = k == 8 ? r->has_dview : r->has_cview[k];
-    *ser = t ? t->serial : 0; *lv = hv && v->set_levels ? v->base_level : 0; *sl = hv && v->set_layers ? v->min_layer : 0;
+    *ser = t ? t->serial : 0; *lv = hv && v->nlevels ? v->base_level : 0; *sl = hv && v->nlayers ? v->min_layer : 0;
 }
 static void hoist_try(void) {
     if (g_hoist_n || !g_exec_next) return;
@@ -3587,9 +3587,9 @@ static int defer_on(void) {
 static int defer_handle_sub(uint64_t h, const p_set_rt *r, int k, int cover) {
     int tid = (int)(h & 0xfffff); if (!tid || tid >= g_ntreg || !g_treg[tid].ok) return 0;
     uint64_t ser; int lv, sl; rt_sub(r, k, &ser, &lv, &sl); if (!ser || g_treg[tid].t.serial != ser) return 0;
-    if (!g_treg[tid].has_v || !g_treg[tid].v.set_levels) return cover;
+    if (!g_treg[tid].has_v || !g_treg[tid].v.nlevels) return cover;
     view_t v = g_treg[tid].v; int n = v.nlevels > 0 ? v.nlevels : 1;
-    return lv >= v.base_level && lv < v.base_level + n && (!v.set_layers || (sl >= v.min_layer && sl < v.min_layer + (v.nlayers > 0 ? v.nlayers : 1)));
+    return lv >= v.base_level && lv < v.base_level + n && (!v.nlayers || (sl >= v.min_layer && sl < v.min_layer + (v.nlayers > 0 ? v.nlayers : 1)));
 }
 static int defer_prog_hits(const prog_t *pg, uint64_t tex[6][128], uint64_t img[6][32], const p_set_rt *r, int color_only, int cover) {
     __unsafe_unretained NvProg *pr = pg ? prog_get(pg) : nil; if (!pr) return 1;
@@ -4005,10 +4005,10 @@ static int zskip_fact_for(const char *key, zskip_fact *out) {
 }
 static int zskip_view_zero(int tid) {
     if (!tid || tid >= g_ntreg || !g_treg[tid].ok) return 0;
-    treg_t *r = &g_treg[tid]; const tex_t *t = &r->t; int lv0 = r->has_v && r->v.set_levels ? r->v.base_level : 0;
-    int nl = r->has_v && r->v.set_levels && r->v.nlevels > 0 ? r->v.nlevels : 1;
-    int sl0 = r->has_v && r->v.set_layers ? r->v.min_layer : 0;
-    int ns = r->has_v && r->v.set_layers && r->v.nlayers > 0 ? r->v.nlayers : 1;
+    treg_t *r = &g_treg[tid]; const tex_t *t = &r->t; int lv0 = r->has_v && r->v.nlevels ? r->v.base_level : 0;
+    int nl = r->has_v && r->v.nlevels && r->v.nlevels > 0 ? r->v.nlevels : 1;
+    int sl0 = r->has_v && r->v.nlayers ? r->v.min_layer : 0;
+    int ns = r->has_v && r->v.nlayers && r->v.nlayers > 0 ? r->v.nlayers : 1;
     for (int l = 0; l < nl; l++) for (int s = 0; s < ns; s++) if (!zskip_has(t->serial, lv0 + l, sl0 + s)) return 0;
     return 1;
 }
@@ -4616,11 +4616,11 @@ static void dispatch(const p_dispatch *dp) {
 // GPU：贴图 → 缓冲（行距取 SetCopyRowStride，0 = 紧排）
 // GPU: texture -> buffer (row stride taken from SetCopyRowStride, 0 = tightly packed)
 static void copy_t2b(const p_copy_b2t *c) {
-    if (c->tex) xv_check(c->tex->serial, c->has_view && c->view.set_levels ? c->view.base_level : 0, c->has_view && c->view.set_layers ? c->view.min_layer : 0, "贴图读缓冲");
+    if (c->tex) xv_check(c->tex->serial, c->has_view && c->view.nlevels ? c->view.base_level : 0, c->has_view && c->view.nlayers ? c->view.min_layer : 0, "贴图读缓冲");
     id<MTLTexture> t = tex_mtl(c->tex);
     if (!t) return;
     int bw, bh, bpb = nvn_fmt_bpb(c->tex->d.format, &bw, &bh);
-    unsigned level = c->has_view && c->view.set_levels ? c->view.base_level : 0, layer0 = c->has_view && c->view.set_layers ? c->view.min_layer : 0;
+    unsigned level = c->has_view && c->view.nlevels ? c->view.base_level : 0, layer0 = c->has_view && c->view.nlayers ? c->view.min_layer : 0;
     size_t row = S.copy_stride ? (size_t)S.copy_stride : (size_t)((c->r.width + bw - 1) / bw) * bpb;
     size_t rows = (c->r.height + bh - 1) / bh, img = row * rows;
     int is3d = c->tex->d.target == 2, nz = c->r.depth ? c->r.depth : 1;
@@ -4671,7 +4671,7 @@ static void copy_b2t(const p_copy_b2t *c) {
     PD("C ser=%llu", c->tex->serial);
     if (!t) return;
     int bw, bh, bpb = nvn_fmt_bpb(c->tex->d.format, &bw, &bh);
-    unsigned level = c->has_view && c->view.set_levels ? c->view.base_level : 0, layer0 = c->has_view && c->view.set_layers ? c->view.min_layer : 0;
+    unsigned level = c->has_view && c->view.nlevels ? c->view.base_level : 0, layer0 = c->has_view && c->view.nlayers ? c->view.min_layer : 0;
     size_t row = S.copy_stride ? (size_t)S.copy_stride : (size_t)((c->r.width + bw - 1) / bw) * bpb;
     size_t rows = (c->r.height + bh - 1) / bh, img = row * rows;
     int is3d = c->tex->d.target == 2, nz = c->r.depth ? c->r.depth : 1;
@@ -4733,20 +4733,20 @@ static int copy_t2t_astc(id<MTLTexture> s, id<MTLTexture> d, unsigned sl, unsign
 // GPU：贴图 → 贴图（原先误列为空操作，选角页每帧 3 次）。等尺寸、不镜像、同格式 → 逐层 blit；其余语义（缩放带过滤、镜像、换格式）blit 表达不了，报红待实现
 // GPU: texture -> texture (previously mislisted as a no-op, 3 times per frame on the character select page). Same size, not mirrored, same format -> blit layer by layer; the other semantics (scaling with filtering, mirroring, format change) cannot be expressed by blit: report a failure, to be implemented
 static void copy_t2t(const p_copy_t2t *c) {
-    if (c->src) xv_check(c->src->serial, c->has_sv && c->sv.set_levels ? c->sv.base_level : 0, c->has_sv && c->sv.set_layers ? c->sv.min_layer : 0, "贴图拷贝源");
+    if (c->src) xv_check(c->src->serial, c->has_sv && c->sv.nlevels ? c->sv.base_level : 0, c->has_sv && c->sv.nlayers ? c->sv.min_layer : 0, "贴图拷贝源");
     rp_flush();   // 挂起的纯清除通道先落地（零源候选在通道结束时才进集合）；下面 blit() 本来也会结束通道 | Land the pending pure-clear render pass first (zero-source candidates only enter the set when the render pass ends); the blit() below would end the render pass anyway
     if (c->dst) zskip_del(c->dst->serial);
     if (c->src && c->dst && c->sr.xoffset == 0 && c->sr.yoffset == 0 && c->dr.xoffset == 0 && c->dr.yoffset == 0
         && c->sr.width == (int)c->src->d.width && c->sr.height == (int)c->src->d.height && c->dr.width == (int)c->dst->d.width && c->dr.height == (int)c->dst->d.height) {
-        int sl = c->has_sv && c->sv.set_levels ? c->sv.base_level : 0, dl = c->has_dv && c->dv.set_levels ? c->dv.base_level : 0;
-        int ss = c->has_sv && c->sv.set_layers ? c->sv.min_layer : 0, ds = c->has_dv && c->dv.set_layers ? c->dv.min_layer : 0;
+        int sl = c->has_sv && c->sv.nlevels ? c->sv.base_level : 0, dl = c->has_dv && c->dv.nlevels ? c->dv.base_level : 0;
+        int ss = c->has_sv && c->sv.nlayers ? c->sv.min_layer : 0, ds = c->has_dv && c->dv.nlayers ? c->dv.min_layer : 0;
         if (zskip_has(c->src->serial, sl, ss)) zskip_add(c->dst->serial, dl, ds);
     }
     id<MTLTexture> s = tex_mtl(c->src), d = tex_mtl(c->dst);
     PD("T src=%llu dst=%llu %dx%dx%d→%dx%dx%d flags=%#x", c->src->serial, c->dst->serial, c->sr.width, c->sr.height, c->sr.depth, c->dr.width, c->dr.height, c->dr.depth, c->flags);
     if (!s || !d) return;
-    unsigned sl = c->has_sv && c->sv.set_levels ? c->sv.base_level : 0, dl = c->has_dv && c->dv.set_levels ? c->dv.base_level : 0;
-    unsigned sz0 = c->has_sv && c->sv.set_layers ? c->sv.min_layer : 0, dz0 = c->has_dv && c->dv.set_layers ? c->dv.min_layer : 0;
+    unsigned sl = c->has_sv && c->sv.nlevels ? c->sv.base_level : 0, dl = c->has_dv && c->dv.nlevels ? c->dv.base_level : 0;
+    unsigned sz0 = c->has_sv && c->sv.nlayers ? c->sv.min_layer : 0, dz0 = c->has_dv && c->dv.nlayers ? c->dv.min_layer : 0;
     PD("t src=%llu lv%u sl%u xyz=%d,%d,%d dst=%llu lv%u sl%u xyz=%d,%d,%d size=%d,%d,%d", c->src->serial, sl, sz0, c->sr.xoffset, c->sr.yoffset, c->sr.zoffset,
        c->dst->serial, dl, dz0, c->dr.xoffset, c->dr.yoffset, c->dr.zoffset, c->sr.width, c->sr.height, c->sr.depth);
     int s3 = c->src->d.target == 2, d3 = c->dst->d.target == 2, nz = c->sr.depth ? c->sr.depth : 1;
@@ -4782,7 +4782,7 @@ static void clear_tex(const p_clear_tex *c) {
     PD("X ser=%llu 视图格式 %#x 区域 %d,%d,%d %dx%dx%d 掩码 %#x %s %g,%g,%g,%g", c->tex->serial, c->has_view && c->view.set_format ? c->view.format : -1, c->r.xoffset, c->r.yoffset, c->r.zoffset, c->r.width, c->r.height, c->r.depth, c->mask,
        c->is_uint ? "ui" : "f", c->is_uint ? (double)c->c.u[0] : c->c.f[0], c->is_uint ? (double)c->c.u[1] : c->c.f[1], c->is_uint ? (double)c->c.u[2] : c->c.f[2], c->is_uint ? (double)c->c.u[3] : c->c.f[3]);
     if (!t) return;
-    unsigned lv = c->has_view && c->view.set_levels ? c->view.base_level : 0, l0 = c->has_view && c->view.set_layers ? c->view.min_layer : 0;
+    unsigned lv = c->has_view && c->view.nlevels ? c->view.base_level : 0, l0 = c->has_view && c->view.nlayers ? c->view.min_layer : 0;
     NSUInteger w = MAX(t.width >> lv, 1u), h = MAX(t.height >> lv, 1u);
     int is3d = t.textureType == MTLTextureType3D, nz = c->r.depth ? c->r.depth : 1;
     if (c->has_view && c->view.set_format) {   // 视图换格式：清除值按视图格式解释（游戏 5 次全是 ui 版配整数视图），在同格式视图上清 | View with changed format: the clear value is interpreted in the view format (all 5 of the game's calls are the ui version with an integer view), and the clear is done on a view of the same format

@@ -13,7 +13,7 @@ static void emit(code *c,int op,const void *p,size_t n){size_t z=(8+n+7)&~7ull;o
 static void st(code *c,int k,const void *v,size_t n){p_bind_state b={.kind=k};memcpy(b.bytes,v,n);emit(c,OP_BIND_STATE,&b,sizeof b);}
 static tex_t color={.serial=52000},depth={.serial=52001};static prog_t pg[2]={{.serial=52002},{.serial=52003}};
 static p_set_rt rt(int levels){p_set_rt r={.n=1,.depth=&depth,.has_dview=1};r.color[0]=&color;r.has_cview[0]=1;
- r.cview[0]=(view_t){.set_levels=1,.set_layers=1,.set_format=1,.set_target=1,.nlevels=levels,.nlayers=1,.format=NVN_FORMAT_RGBA8,.target=NVN_TEXTURE_TARGET_2D};
+ r.cview[0]=(view_t){.set_format=1,.set_target=1,.nlevels=levels,.nlayers=1,.format=NVN_FORMAT_RGBA8,.target=NVN_TEXTURE_TARGET_2D};
  r.dview=r.cview[0];r.dview.nlevels=1;r.dview.base_level=small_depth?1:0;r.dview.format=NVN_FORMAT_DEPTH32F_STENCIL8;return r;}
 static void seed(void){MTL4RenderPassDescriptor *p=[MTL4RenderPassDescriptor new];p.colorAttachments[0].texture=tex_mtl(&color);p.colorAttachments[0].loadAction=MTLLoadActionClear;p.colorAttachments[0].storeAction=MTLStoreActionStore;p.colorAttachments[0].clearColor=MTLClearColorMake(0,0,0,1);
  p.depthAttachment.texture=p.stencilAttachment.texture=tex_mtl(&depth);p.depthAttachment.loadAction=p.stencilAttachment.loadAction=MTLLoadActionClear;p.depthAttachment.storeAction=p.stencilAttachment.storeAction=MTLStoreActionStore;p.depthAttachment.clearDepth=.75;p.stencilAttachment.clearStencil=0x2d;enc_r_end(enc_r_begin(p));
@@ -30,7 +30,7 @@ int main(int argc,char **argv){@autoreleasepool{enabled=1;for(int i=1;i<argc;i++
 #endif
  serial_put(pg[i].serial,p);}
  color.d.width=color.d.height=depth.d.width=depth.d.height=8;color.d.depth=color.d.samples=depth.d.depth=depth.d.samples=1;color.d.levels=4;depth.d.levels=small_depth?2:1;color.d.target=depth.d.target=NVN_TEXTURE_TARGET_2D;color.d.format=NVN_FORMAT_RGBA8;depth.d.format=NVN_FORMAT_DEPTH32F_STENCIL8;
- (void)tex_mtl(&color);(void)tex_mtl(&depth);if(sample_attachment){view_t v={.set_levels=1,.base_level=1,.nlevels=1};mtl_reg_tex(1000,&color,&v);}
+ (void)tex_mtl(&color);(void)tex_mtl(&depth);if(sample_attachment){view_t v={.base_level=1,.nlevels=1};mtl_reg_tex(1000,&color,&v);}
  uint16_t *ix;posix_memalign((void **)&ix,getpagesize(),getpagesize());for(int i=0;i<120;i++)ix[i]=i%3;mtl_pool_add(ix,getpagesize());
  code first={0},second={0};p_set_rt a=rt(4),b=rt(1);emit(&first,OP_SET_RT,&a,sizeof a);ds_st ds={.dt=1,.df=NVN_DEPTH_FUNC_LESS};st(&first,5,&ds,sizeof ds);
  color_st col={0,NVN_LOGIC_OP_COPY,NVN_ALPHA_FUNC_ALWAYS};st(&first,1,&col,sizeof col);p_bind_program pr={&pg[0],3};emit(&first,OP_BIND_PROGRAM,&pr,sizeof pr);uint64_t reset=NVN_COUNTER_TYPE_SAMPLES_PASSED;emit(&first,OP_RESET_COUNTER,&reset,8);p_draw dw={NVN_DRAW_PRIMITIVE_TRIANGLES,0,3};emit(&first,OP_DRAW,&dw,sizeof dw);emit(&first,OP_END,NULL,0);

@@ -237,7 +237,7 @@ int svc_thread(int num, uint64_t *regs);   // hle_thread.c：线程与同步类 
 // x29+8 is the next hop up. No guessing about frame pointers: an unreadable or out-of-module value prints as "-".
 static void svc_caller_diag(int num, const uint64_t *regs, uint64_t orig_addr) {
     static uint64_t seen_lr[24]; static unsigned seen_n[24]; static int seen_cnt;
-    static const char *nm[] = { [0x0B] = "SleepThread", [0x11] = "SignalEvent", [0x18] = "WaitSync",
+    static const char *nm[] = { [0x0B] = "SleepThread", [0x11] = "SignalEvent", [0x18] = "WaitSync", [0x32] = "SuspendThread", [0x33] = "ResumeThread",
                                 [0x1C] = "WaitPWK", [0x1D] = "SignalPWK" };
     uint64_t lr = regs[30];
     int i, slot = -1;
@@ -289,7 +289,7 @@ uint64_t svc_dispatch(int num, uint64_t *regs, uint64_t orig_addr) {
       atomic_store_explicit(&g_last_svc[sl], num, memory_order_relaxed);
       atomic_store_explicit(&g_last_svc_a0[sl], regs[0], memory_order_relaxed); }
     { void hlecount_svc(int); hlecount_svc(num); }   // DM_HLECOUNT：svc 按号计数 | DM_HLECOUNT: svc counts by number
-    if (num == 0x0B || num == 0x11 || num == 0x18 || num == 0x1C || num == 0x1D) svc_caller_diag(num, regs, orig_addr);
+    if (num == 0x0B || num == 0x11 || num == 0x18 || num == 0x1C || num == 0x1D || num == 0x32 || num == 0x33) svc_caller_diag(num, regs, orig_addr);
     mem_init();
     if (svc_thread(num, regs)) return regs[0];
     { uint64_t svc_host_call(int, uint64_t *); if (num >= 0x80 && svc_host_call(num, regs)) return regs[0]; }   // 0x80 起：剪口约定的宿主调用（hle_tact.c） | from 0x80: host calls by cut convention (hle_tact.c)

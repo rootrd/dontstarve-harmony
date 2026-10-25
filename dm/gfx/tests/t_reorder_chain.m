@@ -31,7 +31,7 @@ static tex_t texture(unsigned w, unsigned levels, int depth) {
 }
 static void rt(chain *c, const tex_t *t, unsigned lv, const tex_t *ds) {
     p_set_rt r={.n=1,.depth=ds}; r.color[0]=t;
-    r.has_cview[0]=1; r.cview[0].set_levels=1; r.cview[0].base_level=lv; r.cview[0].nlevels=1;
+    r.has_cview[0]=1;  r.cview[0].base_level=lv; r.cview[0].nlevels=1;
     emit(c,OP_SET_RT,&r,sizeof r);
     p_viewports v={.n=1}; v.v[0][2]=v.v[0][3]=MAX(t->d.width>>lv,1u); emit(c,OP_VIEWPORTS,&v,sizeof v);
     c->width=(int)v.v[0][2];
@@ -63,8 +63,8 @@ static void draw_prog(chain *c, int p, int tid) {
     p_draw d={NVN_DRAW_PRIMITIVE_TRIANGLES,0,3}; emit(c,OP_DRAW,&d,sizeof d);
 }
 static int bind_view_range(const tex_t *t, int lv, int levels, int sl, int slices) {
-    static int tid=1000; view_t v={.set_levels=1,.base_level=lv,.nlevels=levels,
-        .set_layers=slices>0,.min_layer=sl,.nlayers=slices};
+    static int tid=1000; view_t v={.base_level=lv,.nlevels=levels,
+        .min_layer=sl,.nlayers=slices};
     mtl_reg_tex(tid,t,&v); return tid++;
 }
 static int bind_view(const tex_t *t, int lv) { return bind_view_range(t,lv,1,0,0); }
@@ -147,7 +147,7 @@ static void uniform_case(int reordered,uint8_t pixels[256]) {
 // A view's accessible range cannot be judged by base alone: the shader reads relative to the second level/second layer, and G writes that subresource.
 static void slice_rt(chain *c,const tex_t *t,int lv,int sl) {
     p_set_rt r={.n=1}; r.color[0]=t; r.has_cview[0]=1;
-    r.cview[0]=(view_t){.set_levels=1,.base_level=lv,.nlevels=1,.set_layers=1,.min_layer=sl,.nlayers=1};
+    r.cview[0]=(view_t){.base_level=lv,.nlevels=1,.min_layer=sl,.nlayers=1};
     emit(c,OP_SET_RT,&r,sizeof r); p_viewports v={.n=1}; v.v[0][2]=v.v[0][3]=MAX(t->d.width>>lv,1u); emit(c,OP_VIEWPORTS,&v,sizeof v);
     c->width=(int)v.v[0][2]; p_scissor sc={0,0,(int)t->d.width,(int)t->d.height}; emit(c,OP_SCISSOR,&sc,sizeof sc);
 }

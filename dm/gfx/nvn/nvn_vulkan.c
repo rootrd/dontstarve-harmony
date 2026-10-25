@@ -1959,6 +1959,8 @@ static void vk_dead(const char *where)
     GRED("Vulkan 设备丢失（%{public}s）：重放层停机，不再录也不再提交，恢复要由外层重建设备", where);
 }
 
+static void tex_read_arm(VkCommandBuffer cb, vktex *v, unsigned lvl, unsigned la, uint64_t stamp);   // DM_RTREAD 在提交收尾用它 | DM_RTREAD arms it at submit-close
+
 uint64_t mtl_sub_commit(void)
 {
     if (!vk_ensure() || atomic_load(&g_dead)) return g_fence_val;
@@ -1974,6 +1976,34 @@ uint64_t mtl_sub_commit(void)
         if (!rsaid++) GVL("[vk] 提交线程 %{public}d 与开缓冲线程 %{public}d 不同", tid, g_cb_tid);
     }
     pass_end();
+    // DM_RTREAD=<serial[,serial…]>（配 DM_TEXREAD=<绝对目录> 才会落盘）：点名把某张渲染目标的 VkImage
+    // 读回来。「画进 RT 的东西对不对」和「采样/组合对不对」从此一枪分开——地面乘的半分辨率光照/波纹缓冲
+    // （点名绘里的 t924/t930 族）只在这条证据链上能直接看到内容。DM_RTREAD_EVERY 控制隔多少次提交读一回。
+    // DM_RTREAD=<serial[,serial…]> (needs DM_TEXREAD=<absolute dir> to land the file): read one render
+    // target's VkImage back by name. This is the one instrument that shows what actually got rendered into the
+    // half-resolution light/wave buffers the ground shader multiplies (the t924/t930 family in the named draws).
+    {
+        static int rr_on = -1; static uint64_t rr_s[4]; static int rr_n; static uint64_t rr_every = 200, rr_k;
+        if (rr_on < 0) {
+            const char *e = getenv("DM_RTREAD");
+            rr_on = e && *e && *e != '0';
+            if (rr_on) {
+                const char *p = e;
+                while (p && *p && rr_n < 4) { rr_s[rr_n++] = strtoull(p, NULL, 0); p = strchr(p, ','); if (p) p++; }
+                const char *v2 = getenv("DM_RTREAD_EVERY");
+                if (v2 && *v2) rr_every = strtoull(v2, NULL, 0);
+            }
+        }
+        if (rr_on && g_cb && (++rr_k % rr_every) == 0)
+            for (int i = 0; i < rr_n; i++)
+                for (int t = 0; t < g_tex_n; t++)
+                    if (g_tex[t].serial == rr_s[i]) {
+                        tex_read_arm(g_cb, &g_tex[t], 0, 0, g_presents);
+                        GVL("[vk] RT读回 armed s=%{public}llu 拍%{public}llu", (unsigned long long)rr_s[i],
+                            (unsigned long long)g_presents);
+                        break;
+                    }
+    }
     if (g_skip & 256) { if (!g_cb) return ++g_fence_val;   // 位 256 = 游戏这条提交整个不上 GPU：连空缓冲都不飞（出图单独背锅时用）
         vkEndCommandBuffer(g_cb); vkFreeCommandBuffers(g_dev, g_cp, 1, &g_cb); g_cb = NULL; g_cb_tid = 0; return ++g_fence_val; }
     if (!g_in_pass && g_cb) pkg_flush();   // 没有通道收尾时也要冲刷：这批图不搬就永远停在哑图 | flush even when no pass closed - otherwise these images stay dummies forever
@@ -5213,8 +5243,8 @@ static void do_copy_b2t(const p_copy_b2t *c)
     int bw = 1, bh = 1;
     int bpb = nvn_fmt_bpb(v->d.d.format, &bw, &bh);
     if (!bpb) { atomic_fetch_add(&g_b2t_comp, 1); return; }   // 认不出的格式：等 CPU 解码那一刀
-    unsigned level = (c->has_view && c->view.set_levels) ? (unsigned)c->view.base_level : 0u;
-    unsigned layer0 = (c->has_view && c->view.set_layers) ? (unsigned)c->view.min_layer : 0u;
+    unsigned level = (c->has_view && c->view.nlevels) ? (unsigned)c->view.base_level : 0u;
+    unsigned layer0 = (c->has_view && c->view.nlayers) ? (unsigned)c->view.min_layer : 0u;
     if (level >= v->levels || level >= 32) return;
     uint32_t mip_w = v->w >> level, mip_h = v->h >> level;
     uint32_t mip_d = v->d.d.target == 2 ? v->d.d.depth >> level : v->layers;

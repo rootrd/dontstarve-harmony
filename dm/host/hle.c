@@ -6,6 +6,28 @@
 #include <dlfcn.h>
 #include <time.h>
 #include <stdatomic.h>   // _ZTH 给址那块的每线程表用原子量（见 tls_wrapper_block） | the per-thread table behind the _ZTH block needs atomics
+#ifdef __linux__
+#include <sys/uio.h>
+#include <sys/syscall.h>
+#include <unistd.h>
+// 等待帧链的取帧读：process_vm_readv 读本进程 16 字节，EFAULT 返回错误而不是 SIGSEGV——
+// 帧链是客体栈上的数据，坏指针必须按「链断」处理，不能把游戏带走。
+// Frame fetch for the wait-time backtrace: process_vm_readv on our own process returns EFAULT
+// instead of raising -- a bad frame pointer means "chain broken", not a game crash.
+int dm_rd16(uint64_t addr, uint64_t out[2]) {
+    static int pid;
+    if (!pid) pid = getpid();
+    struct iovec l = { out, 16 }, r = { (void *)(uintptr_t)addr, 16 };
+    return syscall(SYS_process_vm_readv, pid, &l, 1UL, &r, 1UL, 0UL) == 16;
+}
+#else
+#include <string.h>
+int dm_rd16(uint64_t addr, uint64_t out[2]) {
+    if (addr < 0x100000000ull) return 0;
+    memcpy(out, (const void *)(uintptr_t)addr, 16);
+    return 1;
+}
+#endif
 
 typedef struct { const char *name; void *fn; } hle_ent;
 

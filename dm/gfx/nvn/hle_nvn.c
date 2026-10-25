@@ -239,18 +239,19 @@ void nvn_trace_dump(const char *tag, uint64_t crash_sp) {
             now, nullnow, (unsigned long long)n, (void *)&nvn_trace[0], (void *)&nvn_trace_n);
     if (!n) { fprintf(stderr, "[dm] NVN 调用环：空（DM_NVN_TRACE 没开？）\n"); return; }
     uint64_t from = n > 72 ? n - 72 : 0;
+    extern const char *thr_at_sp(uint64_t);   // hle_thread.c：sp 落在哪个客体线程的栈区（无主 = 该线程已退）
     fprintf(stderr, "[dm] NVN 调用环（%s）共 %llu 条，末尾 %llu 条：\n", tag,
             (unsigned long long)n, (unsigned long long)(n - from));
     for (uint64_t k = from; k < n; k++) {
         nvn_trace_t e = nvn_trace[k & 255];
         unsigned i = (unsigned)e.slot;
         if (i >= NVN_NFUNC) i = 0;
-        fprintf(stderr, "[dm]   %c#%llu %s 宿主=%s x0=%#llx x1=%#llx x2=%#llx x3=%#llx x4=%#llx x5=%#llx x8=%#llx sp=%#llx\n",
+        fprintf(stderr, "[dm]   %c#%llu %s 宿主=%s x0=%#llx x1=%#llx x2=%#llx x3=%#llx x4=%#llx x5=%#llx x8=%#llx sp=%#llx 线程=%s\n",
                 (crash_sp >> 16) == (e.sp >> 16) ? '*' : ' ', (unsigned long long)k, nvn_names[i],
                 host_sym(i < NVN_NFUNC ? nvn_real[i] : NULL),
                 (unsigned long long)e.x0, (unsigned long long)e.x1, (unsigned long long)e.x2,
                 (unsigned long long)e.x3, (unsigned long long)e.x4, (unsigned long long)e.x5,
-                (unsigned long long)e.x8, (unsigned long long)e.sp);
+                (unsigned long long)e.x8, (unsigned long long)e.sp, thr_at_sp(e.sp));
     }
 }
 
@@ -587,10 +588,6 @@ NVN(nvnTextureGetDepthStencilMode, NVNtextureDepthStencilMode, const NVNtexture 
 }
 NVN(nvnTextureGetZCullStorageSize, size_t, const NVNtexture *t) { (void)t; return 0; }   // 见上面 Builder 那条 | see the builder entry above
 // NVNtextureView：HSS 走的是「建贴图时定描述符」那条，视图对象只被当参数传来传去并回读字段；
-// 这里存下改写与读模式，让 Get 回真值（视图级的改写在 mtl_reg_tex 之后由绑定处再覆盖，等真用到再做）。
-// NVNtextureView: HSS defines the descriptor when creating the texture and only passes view objects around and reads fields
-// back. This stores the swizzle and read mode so Get answers truthfully (a per-view override would be applied at bind time,
-// which nothing reaches yet).
 #define VW(v) ((view_t *)(v))
 NVN(nvnTextureViewSetSwizzle, void, NVNtextureView *v, NVNtextureSwizzle r, NVNtextureSwizzle g,
     NVNtextureSwizzle b, NVNtextureSwizzle a) {
@@ -619,19 +616,21 @@ NVN(nvnTextureCompare, NVNboolean, const NVNtexture *a, const NVNtexture *b) {
 // No prototype in the header; call sites such as main 0x174899c compare the return value with 1 and set some status bit 0x100 if not equal. Meaning unverified; return 1 for now
 NVN_NOPROTO(nvnTextureGetRawStorageClass, int, const NVNtexture *t) { (void)t; return 1; }
 #define VW(v) ((view_t *)(v))
-NVN(nvnTextureViewSetDefaults, void, NVNtextureView *v) { memset(v, 0, sizeof(view_t)); }
-NVN(nvnTextureViewSetLevels, void, NVNtextureView *v, int base, int n) { VW(v)->set_levels = 1; VW(v)->base_level = base; VW(v)->nlevels = n; }
-NVN(nvnTextureViewSetLayers, void, NVNtextureView *v, int min, int n) { VW(v)->set_layers = 1; VW(v)->min_layer = min; VW(v)->nlayers = n; }
+// 只清真机可见前缀（16 字节）：HSS 崩帧实测 Unity 栈上视图只有 0x10 字节，写穿就是把它存的对象指针清零
+// （main+0x614398 那次 SIGSEGV 的根因）。扩展态不清——真机的 SetDefaults 同样只写前缀。
+NVN(nvnTextureViewSetDefaults, void, NVNtextureView *v) { memset(v, 0, sizeof(int32_t) * 4); }
+NVN(nvnTextureViewSetLevels, void, NVNtextureView *v, int base, int n) { VW(v)->base_level = base; VW(v)->nlevels = n; }
+NVN(nvnTextureViewSetLayers, void, NVNtextureView *v, int min, int n) { VW(v)->min_layer = min; VW(v)->nlayers = n; }
 NVN(nvnTextureViewSetFormat, void, NVNtextureView *v, NVNformat f) { VW(v)->set_format = 1; VW(v)->format = f; }
 NVN(nvnTextureViewSetTarget, void, NVNtextureView *v, NVNtextureTarget t) { VW(v)->set_target = 1; VW(v)->target = t; }
 NVN(nvnTextureViewGetLayers, NVNboolean, const NVNtextureView *v, int *min, int *n) {
-    const view_t *o = (const view_t *)v; *min = o->min_layer; *n = o->nlayers; return o->set_layers;
+    const view_t *o = (const view_t *)v; *min = o->min_layer; *n = o->nlayers; return o->nlayers != 0;
 }
 NVN(nvnTextureGetViewOffset, ptrdiff_t, const NVNtexture *t, const NVNtextureView *v) {
     const tex_t *o = CTX(t); const view_t *w = (const view_t *)v;
     if (!w) return 0;
-    uint64_t off = w->set_levels ? nvn_tex_level_offset(&o->d, (unsigned)w->base_level) : 0;
-    if (w->set_layers) off += (uint64_t)w->min_layer * o->L.layer_size;
+    uint64_t off = w->nlevels ? nvn_tex_level_offset(&o->d, (unsigned)w->base_level) : 0;
+    if (w->nlayers) off += (uint64_t)w->min_layer * o->L.layer_size;
     return (ptrdiff_t)off;
 }
 // CPU 读贴图（NVN ReadTexels）：预排布贴图以池内存为真值（解排布直读），GPU 写出的贴图从 MTLTexture 读回（nvn_mtl.m）
@@ -642,7 +641,7 @@ static void read_texels(const tex_t *o, const view_t *v, const NVNcopyRegion *r,
     uint32_t wb = (uint32_t)((r->width + bw - 1) / bw) * bpb, hb = (uint32_t)(r->height + bh - 1) / bh;
     if (!row) row = wb;
     if (!img) img = row * hb;
-    unsigned level = v && v->set_levels ? (unsigned)v->base_level : 0, layer0 = v && v->set_layers ? (unsigned)v->min_layer : 0;
+    unsigned level = v && v->nlevels ? (unsigned)v->base_level : 0, layer0 = v && v->nlayers ? (unsigned)v->min_layer : 0;
     mtl_read_texels(o, level, layer0, r, dst, (size_t)row, (size_t)img);
 }
 NVN(nvnTextureReadTexels, void, const NVNtexture *t, const NVNtextureView *v, const NVNcopyRegion *r, void *dst) {
@@ -680,8 +679,8 @@ static void write_texels(const tex_t *o, const view_t *v, const NVNcopyRegion *r
     int bw = 1, bh = 1;
     int bpb = nvn_fmt_bpb(o->d.format, &bw, &bh);
     if (!bpb) { WTRED("认不出的格式 %#x", o->d.format); return; }
-    unsigned level = v && v->set_levels ? (unsigned)v->base_level : 0;
-    unsigned layer0 = v && v->set_layers ? (unsigned)v->min_layer : 0;
+    unsigned level = v && v->nlevels ? (unsigned)v->base_level : 0;
+    unsigned layer0 = v && v->nlayers ? (unsigned)v->min_layer : 0;
     if (level >= (o->d.levels ? o->d.levels : 1u)) return;
     uint32_t xb = (uint32_t)(r->xoffset / bw), yb = (uint32_t)(r->yoffset / bh);   // 区域起点（块单位）| region origin in blocks
     uint32_t ebw = (uint32_t)((r->width + bw - 1) / bw), ebh = (uint32_t)((r->height + bh - 1) / bh);

@@ -28,6 +28,13 @@
 #include <signal.h>
 #include <sys/mman.h>
 #include <time.h>
+#include <sys/syscall.h>
+// SuspendThread 的真实停车：SG_SUSPEND 让目标线程进处理器、SG_RESUME 放行。
+// 采样器占用 SIGUSR2，这里用 SIGRTMIN（musl 下 34 起，宿主无人用）。
+// Real parking for SuspendThread: SG_SUSPEND enters the handler, SG_RESUME releases. SIGUSR2 belongs to the
+// sampler; SIGRTMIN is unclaimed on musl.
+#define SG_SUSPEND (SIGRTMIN)
+#define SG_RESUME  (SIGRTMIN + 1)
 #include <mach/mach.h>
 #include <pthread/qos.h>
 #include <dlfcn.h>
@@ -59,9 +66,21 @@ typedef struct thr {
     struct thr *next;          // 等待链 | Wait chain
     struct thr *all;           // 全部线程链（现场导出用） | All-threads chain (for the state dump)
     int last_svc; uint64_t last_lr;
+    // 等待时的客体帧链（等待类 svc 入口一次捕齐，dump 用；OHOS 没有 Mach 线程挂起，thr_bt 打不出回溯）
+    // Guest frame chain captured once at the entry of a waiting SVC (for the dump; OHOS lacks Mach thread
+    // suspension so thr_bt cannot produce backtraces there)
+    uint64_t bt[10]; int nbt;
+    uint64_t wregs[4];   // 等待类 svc 入口的 x19..x22（0x3d56b0 的 x19=作业池）| x19..x22 at the waiting SVC's entry
     int closed;                // 句柄已关：与 exited 同时成立才释放对象（Horizon：线程对象随最后一个引用消失） | Handle closed: the object is freed only when this holds together with exited (Horizon: the thread object goes away with the last reference)
     uint64_t nsvc;             // SVC 次数（现场导出用） | SVC count (for the state dump)
-    mach_port_t mport;         // 宿主线程端口（取 CPU 时间） | Host thread port (to get CPU time)
+    mach_port_t mport;         // 宿主线程端口（取 CPU 时间；OHOS shim 恒 0） | Host thread port (to get CPU time; the OHOS shim returns 0)
+    int tid;                   // Linux 线程号（gettid；读 /proc/self/task/<tid> 的 wchan/状态用——OHOS 无 Mach） | Linux thread id (for /proc wchan/state)
+    // SuspendThread/ResumeThread(0x32/0x33，Horizon 专用)的真实现：
+    // int suspend_count>0 且 suspended=1 = 被停；wake() 见 suspended 只记 wake_pending 不唤醒；
+    // 在跑客体代码的线程用 tgkill(SG_SUSPEND) 停在信号处理里，Resume 用 SG_RESUME 放行。
+    // Real implementation of SuspendThread/ResumeThread (0x32/0x33, Horizon-only). wake() defers to
+    // wake_pending while suspended; a thread running guest code is stopped inside a signal handler.
+    int suspend_count; volatile int suspended, susp_ack, wake_pending, in_svc, hook_parked; int64_t pend_res;
     uint32_t qos;
 } thr_t;
 static thr_t *g_all;
@@ -107,11 +126,26 @@ static thr_t *pick(int kind, uint64_t a) {
     thr_t *b = NULL;
     for (thr_t *t = g_wait; t; t = t->next) {
         if (t->wkind != kind || (kind == 2 ? t->wkey : t->waddr) != a) continue;
+        // 注意：不跳过 suspended 的等待者。真机内核对「被暂停的等待者」照常完成交接（握手、拿锁），
+        // 线程停在「醒来但暂停」态，Resume 后带着锁继续跑。我们的等价实现：完整唤醒 → 块返回 →
+        // svc 出口钩子停车（见 svc_thread 包装）。跳过反而把信号弄丢、清错键（v61/v62 实锤）。
+        // Do NOT skip suspended waiters: the real kernel completes the handoff for paused waiters (they stop
+        // "woken but paused" and continue with the lock on resume). Our equivalent: full wake -> block returns ->
+        // the svc-exit hook parks them. Skipping loses the signal (measured in v61/v62).
         if (!b || t->prio < b->prio || (t->prio == b->prio && t->wseq < b->wseq)) b = t;
     }
     return b;
 }
-static void wake(thr_t *t, int64_t res) { wait_unlink(t); t->wkind = 0; t->woke = 1; t->wres = res; pthread_cond_signal(&t->cv); }
+static void wake(thr_t *t, int64_t res) {
+    wait_unlink(t); t->wkind = 0; t->woke = 1; t->wres = res; pthread_cond_signal(&t->cv);
+}
+
+// ---------- SuspendThread / ResumeThread（0x32/0x33）真实实现 ----------
+// 真机：ThreadManagerImplByHorizon 的 Unsafe 变体直发内核（停/放目标 OS 线程）。
+// 宿主： blocked 线程挂 suspended 标志（wake 让路）；svc 中的线程延迟到出口补停；其余停在 SG_SUSPEND 处理器。
+// （sg_park / 处理器 / 安装在 svc_thread 包装前定义；见下方 svc_thread。）
+// Real device: the Horizon ThreadManager Unsafe variants go straight to the kernel. Host: blocked threads get a
+// suspended flag; mid-svc threads defer to the svc-exit hook; the rest park in the SG_SUSPEND handler.
 // 挂起直到被唤醒或超时（ns<0 无限、0 立即超时）；返回 wres 或 R_TIMEOUT
 // Suspend until woken or timed out (ns<0 infinite, 0 immediate timeout); returns wres or R_TIMEOUT
 static int64_t block_inner(thr_t *t, int kind, int64_t ns);
@@ -133,6 +167,12 @@ static int64_t block_inner(thr_t *t, int kind, int64_t ns) {
                   if (dl.tv_nsec >= 1000000000) { dl.tv_sec++; dl.tv_nsec -= 1000000000; } }
     while (!t->woke) {
         int rc;
+        // 被挂起（SuspendThread）时超时冻结：等待时钟不走、不脱队。否则限时会带着「挂起」的线程超时出队，
+        // 它会在游戏以为世界已停的时候跑客体代码、错过发给它的信号（信号按无等待者清键），恢复后死等 —— v61 实锤。
+        // While suspended, the wait is frozen: the timeout clock stops and the thread stays queued. Otherwise a
+        // timed wait expires, the thread runs guest code while the game believes the world is stopped, and the
+        // signal meant for it is consumed as "no waiters" -- deadlock on resume (measured in v61).
+        if (t->suspended) { pthread_cond_wait(&t->cv, &G); continue; }
         if (det_wait) {
             uint64_t now = guest_ns();
             if (now >= guest_deadline) { wait_unlink(t); t->wkind = 0; return R_TIMEOUT; }
@@ -188,6 +228,7 @@ static void *thread_main(void *p) {
     qos_class_t qc = QOS_CLASS_UNSPECIFIED; int rp = 0;
     pthread_get_qos_class_np(pthread_self(), &qc, &rp); t->qos = (uint32_t)qc;
     t->mport = pthread_mach_thread_np(pthread_self());
+    t->tid = (int)syscall(SYS_gettid);
     crash_thread_init();
     guest_thread_init();
     pthread_mutex_lock(&G); while (!t->started) pthread_cond_wait(&t->cv, &G); pthread_mutex_unlock(&G);
@@ -221,7 +262,7 @@ uint32_t svc_thread_main_init(void) {
     crash_set_thr_desc(thr_cur_desc);
     thr_t *t = calloc(1, sizeof *t);
     pthread_cond_init(&t->cv, NULL);
-    t->started = 1; t->prio = 44; t->core = 0; t->mask = 7; t->pt = pthread_self(); t->mport = pthread_mach_thread_np(t->pt);
+    t->started = 1; t->prio = 44; t->core = 0; t->mask = 7; t->pt = pthread_self(); t->mport = pthread_mach_thread_np(t->pt); t->tid = (int)syscall(SYS_gettid);
     pthread_mutex_lock(&G); t->handle = h_new(O_THREAD, t); t->id = g_next_id++; t->all = g_all; g_all = t; pthread_mutex_unlock(&G);
     pthread_setspecific(g_keythr, t);
     hle_trace_tag(t->handle);
@@ -441,7 +482,7 @@ static void thr_bt(thr_t *t) {
     thread_resume(t->mport);
 }
 void svc_thread_dump(void) {
-    static const char *kinds[] = {"运行/未在等", "锁", "条件变量", "地址", "同步对象"};
+    static const char *kinds[] = {"运行/未在等", "锁", "条件变量", "地址", "同步对象", "自挂起"};
     int nh = 0; for (int i = 1; i < MAX_H; i++) nh += g_h[i].type != O_FREE;
     fprintf(stderr, "[dm] 句柄表占用 %d / %d，累计建线程 %llu\n", nh, MAX_H, g_next_id - 0x51);
     for (thr_t *t = g_all; t; t = t->all) {
@@ -467,6 +508,33 @@ void svc_thread_dump(void) {
                 m ? m->name : "?", m ? t->last_lr - (uint64_t)m->base : t->last_lr);
         if (have_raw) { char hx[200]; int q = 0; for (int i = 0; i < 64; i += 4) q += snprintf(hx + q, sizeof hx - q, "%08x ", *(uint32_t *)(raw + i));
                         fprintf(stderr, "[dm]   %#x 所等对象 %#llx 起 64 字节: %s\n", t->handle, t->waddr & ~0xfull, hx); }
+        // 等待时帧链：svc 入口捕的（见 svc_thread）。主线程 50ms 轮询那种不进等待 svc 的，这里没有。
+        // Frame chain captured at the waiting SVC's entry. Threads that poll without entering a wait SVC (the
+        // main thread's 50 ms spin) have no chain here.
+        if (t->nbt > 0) { char bl[600]; int q = 0;
+            for (int k = 0; k < t->nbt && q < (int)sizeof bl - 48; k++) { module_t *bm = module_of((void *)t->bt[k]);
+                q += bm ? snprintf(bl + q, sizeof bl - q, " %s+%#llx", bm->name, t->bt[k] - (uint64_t)bm->base)
+                        : snprintf(bl + q, sizeof bl - q, " %#llx", t->bt[k]); }
+            fprintf(stderr, "[dm]   %#x 等待帧链:%s\n", t->handle, bl); }
+        if (t->nbt > 0)
+            fprintf(stderr, "[dm]   %#x 等待现场 x19=%#llx x20=%#llx x21=%#llx x22=%#llx\n", t->handle,
+                    (unsigned long long)t->wregs[0], (unsigned long long)t->wregs[1],
+                    (unsigned long long)t->wregs[2], (unsigned long long)t->wregs[3]);
+        // 内核侧真相：/proc 状态位 + wchan。R=在跑（可能客体内自旋）、S/D=睡、wchan=futex=宿主锁/condvar 里
+        // Kernel-side truth from /proc: state char + wchan. R = running (may spin in guest code), S/D = sleeping.
+        if (t->tid > 0) {
+            char pp[64]; char st = '?'; long wcv = 0;
+            snprintf(pp, sizeof pp, "/proc/self/task/%d/stat", t->tid);
+            int fd = open(pp, O_RDONLY);
+            if (fd >= 0) { char sb[512]; ssize_t r = read(fd, sb, sizeof sb - 1); close(fd);
+                if (r > 0) { sb[r] = 0; char *rp = strrchr(sb, ')');
+                    if (rp && rp[1] == ' ' && rp[2]) st = rp[2]; } }
+            snprintf(pp, sizeof pp, "/proc/self/task/%d/wchan", t->tid);
+            fd = open(pp, O_RDONLY);
+            if (fd >= 0) { char wb[64]; ssize_t r = read(fd, wb, sizeof wb - 1); close(fd);
+                if (r > 0) { wb[r] = 0; wcv = strtol(wb, NULL, 16); } }
+            fprintf(stderr, "[dm]   %#x 内核态=%c wchan=%#lx\n", t->handle, st, wcv);
+        }
         thr_bt(t);
     }
     for (int gi = 0; gi < g_ngrave; gi++) {   // 诊断：已退名单（含死因：最后 svc 号与 lr） | Diagnostic: exited roster (with cause of death: last svc number and lr)
@@ -511,9 +579,165 @@ void svc_thread_dump(void) {
 
 // DM_THRDUMP=<毫秒>：定时把全部客体线程在等什么打一遍（世界启动这类长等待现场用；不设=不开）
 // DM_THRDUMP=<ms>: periodically dump what every guest thread is waiting on (for long waits such as world start; unset = off)
+// 每第 4 个周期把「读侧安全」的取证打进去（NVN 计数 / NVN trace 末段 / 剪口计数）：
+// 「线程活着但图形链路停摆」这类现场等不来崩溃，取证就得定时送。
+// 注意 hle_hist_dump / hle_trace_dump 不能在这里调：它们的环条目被客体并发改写，计时线程读到
+// 毒值名字指针就是一次 SIGSEGV（v35 前的 22769 号 crash 实锤）；崩溃处理器在信号上下文里调它们才安全。
+// Every 4th tick emits the read-safe forensics (NVN counts / NVN trace tail / HLE counts): a "threads alive but the
+// graphics pipeline stalled" scene never crashes, so the evidence has to be delivered on a timer. hle_hist_dump /
+// hle_trace_dump must NOT be called here: their ring entries are mutated by the guest concurrently, and the timer
+// thread reads poisoned name pointers (crash 22769 proved it); only the signal-context crash handler may walk those.
 static void *thr_dump_loop(void *arg) {
     long ms = (long)(intptr_t)arg;
-    for (;;) { usleep((useconds_t)(ms * 1000)); svc_thread_dump(); }
+    extern void nvn_dump_counts(const char *);
+    extern void nvn_trace_dump(const char *, uint64_t);
+    extern void hlecount_dump_now(void);
+    // DM_SELFCRASH=<秒>：到点在计时线程上 raise(SIGSEGV)，借崩溃处理器把全套取证（调用环/近迹/NVN 计数）
+    // 落进 crash_<pid>.txt——「不崩但卡死」的现场用它换一份崩溃级证据。崩溃处理器在信号上下文里走环是安全的
+    // （v35 的 22769 号 crash 验证过这条路径）；从计时线程直接走环则会读到客体并发改写的毒值指针（同案反例）。
+    // DM_SELFCRASH=<sec>: raise(SIGSEGV) on the timer thread at the deadline so the crash handler writes a full
+    // forensic crash_<pid>.txt for a "stalled, not crashed" scene. Walking the rings from signal context is safe
+    // (crash 22769 proved this path); walking them from a plain timer thread reads poisoned pointers (same case).
+    static int64_t self_crash_s = -2;
+    if (self_crash_s == -2) { const char *e = getenv("DM_SELFCRASH"); self_crash_s = e && *e ? atoll(e) : 0; }
+    // DM_FORCEE0=<秒>：诊断开关。到点把 main 的 JThread 计数 [G+0xe0] 强制清零（主线程在 main+0x18e9450
+    // 50ms 轮询它，卡在 1 不掉）。只动这一个字，看游戏是否继续——用来证明「唯一卡点」，
+    // 不是修复；结论出来后按正当方式处理。
+    // DM_FORCEE0=<sec>: diagnostic. At the deadline force the JThread pending count [G+0xe0] to zero (the main
+    // thread polls it at main+0x18e9450; it is stuck at 1). One word only -- proves whether this is the sole
+    // blocker. Not a fix.
+    static int64_t force_e0_s = -2;
+    if (force_e0_s == -2) { const char *e = getenv("DM_FORCEE0"); force_e0_s = e && *e ? atoll(e) : 0; }
+    int e0_forced = 0;
+    // DM_FORCESEQ=<秒>：诊断。调度器自旋环（main+0x197e5f0）等 [S3→[8] 头节点 +0x18] 序号前进；
+    // 到点把该序号 +1（比 FORCEE0 安全：不动环结构，只模拟"有人推进了一格"），看 0x1024 是否出旋、游戏是否前进。
+    // DM_FORCESEQ=<sec>: diagnostic. The scheduler spin waits for the head node's +0x18 serial to advance;
+    // bump it by one at the deadline (safer than FORCEE0: no ring-structure edits) and watch whether the runner unblocks.
+    static int64_t force_seq_s = -2;
+    if (force_seq_s == -2) { const char *e = getenv("DM_FORCESEQ"); force_seq_s = e && *e ? atoll(e) : 0; }
+    int seq_forced = 0;
+    int64_t t0_s = -1;
+    for (unsigned tick = 0;; tick++) {
+        int64_t now_s = (int64_t)(time(NULL) & 0x7fffffff);
+        if (t0_s < 0) t0_s = now_s;
+        if (self_crash_s > 0 && now_s - t0_s >= self_crash_s) {
+            fprintf(stderr, "[dm] DM_SELFCRASH=%lld 到点，自取崩溃现场\n", (long long)self_crash_s);
+            fflush(stderr);
+            raise(SIGSEGV);
+        }
+        usleep((useconds_t)(ms * 1000));
+        svc_thread_dump();
+        if (tick % 4) continue;
+        fprintf(stderr, "[dm] ===== 定时取证 tick %u =====\n", tick);
+        // 定点探针：HSS 主线程在 main+0x18e9450 的等待环里轮询 P=*main[0x293a918]、G=*P，
+        // 等 [G+0xe0]==0 且 [G->b8]+8 字节 ==0。IsDone 门（main+0x15ff240）另查 main[0x293f268]→P2→G2
+        // 的 [G2+0xe0] 与 [S2+0x14]。两条链一起读，卡哪条一眼可见。客体堆就是宿主内存，空闲期读不会 fault。
+        // Targeted probe: the main thread polls P=*main[0x293a918], G=*P for [G+0xe0]==0 and [G->b8]+8==0;
+        // the IsDone gate (main+0x15ff240) also checks main[0x293f268]→P2→G2 for [G2+0xe0] and [S2+0x14].
+        {
+            uint8_t *mb = NULL;
+            for (int i = 0; i < g_nmod; i++) if (!strcmp(g_mod[i].name, "main")) { mb = g_mod[i].base; break; }
+            for (int gi2 = 0; gi2 < 3 && mb; gi2++) {
+            uint64_t slot = gi2 == 0 ? 0x293a918 : gi2 == 1 ? 0x293f268 : 0x2940228;   // G3=调度器链（0x197e900 用）
+            char tag = "123"[gi2];
+            volatile uint64_t *pp = (volatile uint64_t *)(mb + slot);
+            uint64_t P = *pp, G = P > 0x10000 ? *(volatile uint64_t *)P : 0;
+            static uint64_t s_P[3], s_G[3], s_e0[3]; static int s_said;
+            if (s_said <= gi2) s_said = gi2 + 1;
+            if ((P != s_P[gi2] || G != s_G[gi2]) && s_said > gi2 + 1 - 1 && s_P[gi2])
+                fprintf(stderr, "[dm] G探针%c 变化 P %#llx→%#llx G %#llx→%#llx\n", tag, (unsigned long long)s_P[gi2], (unsigned long long)P, (unsigned long long)s_G[gi2], (unsigned long long)G);
+            s_P[gi2] = P; s_G[gi2] = G;
+            if (G > 0x10000) {
+                uint64_t S = *(volatile uint64_t *)(G + 0xb8);
+                uint32_t e0 = *(volatile uint32_t *)(G + 0xe0);
+                if (e0 != s_e0[gi2]) { fprintf(stderr, "[dm] G探针%c pending %u→%u @tick %u\n", tag, s_e0[gi2], e0, tick); s_e0[gi2] = e0; }
+                fprintf(stderr, "[dm] G探针%c G=%#llx e0=%u d8=%u dc=%u S=%#llx S+8=%u S+0x14=%u\n",
+                        tag, (unsigned long long)G, e0,
+                        *(volatile uint32_t *)(G + 0xd8), *(volatile uint32_t *)(G + 0xdc),
+                        (unsigned long long)S, S > 0x10000 ? (unsigned)*(volatile uint8_t *)(S + 8) : 0,
+                        S > 0x10000 ? (unsigned)*(volatile uint8_t *)(S + 0x14) : 0);
+                if (gi2 == 2) {   // G3=调度器链：自旋环等头节点序号（main+0x197e5f0 读 [head+0x18]）
+                    uint64_t head = S > 0x10000 ? *(volatile uint64_t *)(S + 8) : 0;
+                    if (head > 0x10000) {
+                        uint32_t seq = *(volatile uint32_t *)(head + 0x18);
+                        fprintf(stderr, "[dm] G3头节点=%#llx 序号=%u 窗=%016llx %016llx %016llx %016llx\n",
+                                (unsigned long long)head, seq,
+                                (unsigned long long)*(volatile uint64_t *)head,
+                                (unsigned long long)*(volatile uint64_t *)(head + 8),
+                                (unsigned long long)*(volatile uint64_t *)(head + 0x10),
+                                (unsigned long long)*(volatile uint64_t *)(head + 0x20));
+                        if (force_seq_s > 0 && !seq_forced && now_s - t0_s >= force_seq_s) {
+                            *(volatile uint32_t *)(head + 0x18) = seq + 1;
+                            seq_forced = 1;
+                            fprintf(stderr, "[dm] DM_FORCESEQ 到点：头节点序号 %u→%u\n", seq, seq + 1);
+                        }
+                    } else fprintf(stderr, "[dm] G3头节点空（S=%#llx）\n", (unsigned long long)S);
+                }
+                // 作业池字段监视（每 4 拍，仅 gi2==0，放在 G 可达判断之外）：主线程泵循环(0x3d5bd0)的池在
+                // 0x606dc4b9xx 邻域；dump 0x606dc4b900..0x606dc4bb00（覆盖 0x1023 的 sem 0x606dc4b954 与
+                // 主线程 sem 0x606dc4ba38）。池头认法：+0x230 计数非零或 +0x380 队列数非零。
+                // Pool-field watch (outside the G-reachable check): dump the window covering both known semaphores.
+                if (gi2 == 0) {
+                    volatile uint64_t *wlo = (volatile uint64_t *)0x606dc4b6e0ull;
+                    char px[1200]; int pq = 0;
+                    for (int qw = 0; qw < 140 && pq < 1150; qw++) {
+                        uint64_t v = wlo[qw];
+                        pq += snprintf(px + pq, sizeof px - pq, "%llx:%llx ", (unsigned long long)(0x606dc4b6e0ull + qw * 8), (unsigned long long)v);
+                    }
+                    fprintf(stderr, "[dm] 池窗 %s\n", px);
+                }
+                // 全结构 dump(认线程句柄 0x10xx / pthread id / 环项数组)| full struct dump (spot thread handles / ring array)
+                { char hx[900]; int q = 0;
+                  for (int o = 0x20; o <= 0xb0 && q < 800; o += 8)
+                      q += snprintf(hx + q, sizeof hx - q, "%llx ", (unsigned long long)*(volatile uint64_t *)(G + o));
+                  fprintf(stderr, "[dm] G探针%c G+20..b0: %s\n", tag, hx); }
+                // G+0xa8 是栈上指针：落到哪个客体线程的栈区，就说明环主是它
+                // G+0xa8 lands on some guest thread's stack: that thread owns the ring.
+                { uint64_t sa = *(volatile uint64_t *)(G + 0xa8);
+                  if (sa > 0x100000000ull) { char nb2[32]; int matched = 0;
+                  for (thr_t *t = g_all; t; t = t->all) {
+                      if (sa <= t->stack_top && sa > t->stack_top - 0x200000) {
+                          fprintf(stderr, "[dm] G探针%c G+a8=%#llx → 线程 %#x「%s」栈顶 %#llx\n", tag, (unsigned long long)sa, t->handle, thr_name(t, nb2, sizeof nb2), (unsigned long long)t->stack_top);
+                          matched = 1; } }
+                  if (!matched) fprintf(stderr, "[dm] G探针%c G+a8=%#llx 不属于任何存活线程的栈（环主已退或从未启动）\n", tag, (unsigned long long)sa); } }
+                // 存活线程的栈范围全列一遍（配对 G+a8 / 环项栈指针用）
+                { char nb3[32];
+                  for (thr_t *t = g_all; t; t = t->all)
+                      fprintf(stderr, "[dm] 栈表 %#x「%s」%#llx-%#llx%s\n", t->handle, thr_name(t, nb3, sizeof nb3), (unsigned long long)(t->stack_top - 0x200000), (unsigned long long)t->stack_top, t->started ? "" : " 未启动"); }
+                // 环项数组候选 G+0x58 / G+0x80 / G+0x90 / G+0x98 的目标各 dump 64 字节
+                { static const int cands[] = { 0x58, 0x80, 0x90, 0x98 };
+                  for (unsigned ci = 0; ci < sizeof cands / sizeof cands[0]; ci++) {
+                      uint64_t a = *(volatile uint64_t *)(G + cands[ci]);
+                      if (a <= 0x100000000ull) continue;
+                      char hx2[300]; int q2 = 0;
+                      for (int o = 0; o < 64 && q2 < 280; o += 8) q2 += snprintf(hx2 + q2, sizeof hx2 - q2, "%llx ", (unsigned long long)*(volatile uint64_t *)(a + o));
+                      fprintf(stderr, "[dm] G探针%c G+%#x→%#llx: %s\n", tag, cands[ci], (unsigned long long)a, hx2);
+                      // 项 0 的"代码指针"（数组首 8 字节）是哪个模块的：解出积压项要调什么
+                      { module_t *im = module_of((void *)*(volatile uint64_t *)a);
+                        fprintf(stderr, "[dm] G探针%c 项0.code=%#llx → %s+%#llx（前16字节 %016llx %016llx）\n", tag,
+                                (unsigned long long)*(volatile uint64_t *)a,
+                                im ? im->name : "?", im ? *(volatile uint64_t *)a - (uint64_t)im->base : 0,
+                                (unsigned long long)*(volatile uint64_t *)(*(volatile uint64_t *)a),
+                                (unsigned long long)*(volatile uint64_t *)(*(volatile uint64_t *)a + 8)); } } }
+                if (force_e0_s > 0 && !e0_forced && now_s - t0_s >= force_e0_s) {
+                    // 两条链一起"消费"：读下标推进到写下标（=消费掉积压项），待办清零。只作诊断：
+                    // 证明积压环是唯一卡点后，再回头找正当的消费路径。
+                    // "Consume" both rings at once: advance the read index to the write index (= drain the
+                    // backlog) and zero the pending count. Diagnostic only.
+                    uint32_t d8 = *(volatile uint32_t *)(G + 0xd8), dc = *(volatile uint32_t *)(G + 0xdc);
+                    *(volatile uint32_t *)(G + 0xd8) = dc;
+                    *(volatile uint32_t *)(G + 0xe0) = 0;
+                    fprintf(stderr, "[dm] DM_FORCEE0 到点：G%u 已消费环 d8 %u→%u、e0→0\n", gi2 + 1, d8, dc);
+                    if (gi2 == 1) e0_forced = 1;
+                }
+            } else fprintf(stderr, "[dm] G探针%c P=%#llx 不可达\n", tag, (unsigned long long)P);
+            }
+        }
+        nvn_dump_counts("定时");
+        nvn_trace_dump("定时", 0);
+        hlecount_dump_now();
+        fflush(stderr);
+    }
     return NULL;
 }
 // DM_SPUR=<毫秒>：实验开关。定期给条件等待一次伪唤醒（内核允许；客体的 while 循环会重查条件）。
@@ -550,6 +774,21 @@ void spur_maybe_start(void) {
 // 同时把 stderr 改道到 $DM_CRASHDIR/thr.txt：dump 行很长，走 hilog 会被吞。
 // Also redirect stderr to $DM_CRASHDIR/thr.txt: the dump lines are long and hilog drops them.
 static _Atomic int g_td_state;
+// sp 反查线程（nvn_trace_dump 用）：栈区归属；无主 = 线程已退或栈已归还
+// Map an sp to its owning guest thread (for nvn_trace_dump): no owner = the thread exited / stack returned.
+const char *thr_at_sp(uint64_t sp) {
+    static _Thread_local char buf[80];
+    if (sp <= 0x100000000ull) return "sp无效";
+    for (thr_t *t = g_all; t; t = t->all)
+        if (t->stack_top && sp <= t->stack_top && sp > t->stack_top - 0x200000) {
+            char nb[32];
+            snprintf(buf, sizeof buf, "%#x「%s」", t->handle, thr_name(t, nb, sizeof nb));
+            return buf;
+        }
+    snprintf(buf, sizeof buf, "无主(已退)");
+    return buf;
+}
+
 void thr_dump_maybe_start(void) {
     if (atomic_load_explicit(&g_td_state, memory_order_relaxed)) return;
     int expect = 0;
@@ -567,8 +806,69 @@ void thr_dump_maybe_start(void) {
     if (!pthread_create(&th, NULL, thr_dump_loop, (void *)(intptr_t)atol(e))) pthread_detach(th);
 }
 
+// svc 中补停 + 处理器共用：设 ack、等 SG_RESUME。handler 与 svc 出口钩子都走这里。
+// Park helper shared by the signal handler and the svc-exit hook.
+static void sg_park(thr_t *me) {
+    me->susp_ack = 1;
+    sigset_t wait; sigemptyset(&wait); sigaddset(&wait, SG_RESUME);
+    while (me->suspended) sigsuspend(&wait);   // Resume: tgkill(SG_RESUME) 打断 | released by the resume signal
+}
+static void sg_suspend_handler(int sig, siginfo_t *si, void *uc_) {
+    (void)sig; (void)si; (void)uc_;
+    thr_t *me = pthread_getspecific(g_keythr);
+    if (!me) return;
+    me->susp_ack = 1;
+    if (me->suspended) sg_park(me);
+}
+static void sg_resume_handler(int sig, siginfo_t *si, void *uc_) { (void)sig; (void)si; (void)uc_; }   // sigsuspend 返回即放行 | sigsuspend returns = released
+static int sg_installed;
+static void sg_install(void) {
+    if (sg_installed) return; sg_installed = 1;
+    struct sigaction sa = {0};
+    sa.sa_sigaction = sg_suspend_handler; sa.sa_flags = SA_SIGINFO; sigemptyset(&sa.sa_mask);
+    sigaction(SG_SUSPEND, &sa, 0);
+    sa.sa_sigaction = sg_resume_handler;
+    sigaction(SG_RESUME, &sa, 0);
+}
+static int tgkill(int pid, int tid, int sig) { return syscall(SYS_tgkill, pid, tid, sig); }
+
+// svc 包装：进去置 in_svc、出来若挂着 suspended 就地补停——绝不在「svc 中途/持 G」时用信号停车
+// （v55 教训：把持 G 或持客体锁的线程停进信号处理器，全场冻结 → PreloadManager 看门狗 Break）。
+// svc wrapper: park deferred to svc exit, never mid-svc while locks are held (the v55 lesson).
+static int svc_thread_inner(int num, uint64_t *regs);
 int svc_thread(int num, uint64_t *regs) {
-    { thr_t *me = pthread_getspecific(g_keythr); if (me) { me->last_svc = num; me->last_lr = regs[30]; me->nsvc++; } }
+    thr_t *me = pthread_getspecific(g_keythr);
+    if (me) me->in_svc = 1;
+    int r = svc_thread_inner(num, regs);
+    if (me) {
+        me->in_svc = 0;
+        if (me->suspended && me->suspend_count > 0) { me->hook_parked = 1; sg_park(me); me->hook_parked = 0; }   // 补停：就地等 Resume | deferred park
+    }
+    return r;
+}
+
+static int svc_thread_inner(int num, uint64_t *regs) {
+    { thr_t *me = pthread_getspecific(g_keythr); if (me) { me->last_svc = num; me->last_lr = regs[30]; me->nsvc++;
+      // 等待族 svc：捕获客体帧链（x29 链：[fp]=下一帧 [fp+8]=返回地址）。客体栈就是宿主内存，只读不写；
+      // 帧 8 字节对齐、单调递增、步幅 < 8MiB，最多 10 帧——坏链就地截断。
+      // Waiting-family SVCs: capture the guest frame chain (x29 chain). The guest stack is host memory,
+      // read-only here; frames must be aligned, monotonic and < 8 MiB apart, up to 10 frames.
+      if (num == 0x1a || num == 0x1b || num == 0x1c || num == 0x1d) {
+          extern int dm_rd16(uint64_t, uint64_t[2]);   // hle.c：process_vm_readv 读 16 字节，EFAULT 不崩 | reads via process_vm_readv; EFAULT instead of a fault
+          uint64_t fp = regs[29]; int nb = 0;
+          me->bt[nb++] = regs[30];
+          while (fp > 0x100000000ull && nb < 10) {
+              uint64_t fr[2];
+              if (!dm_rd16(fp, fr) || fr[0] <= fp || fr[0] - fp > (8ull << 20)) break;
+              me->bt[nb++] = fr[1];
+              fp = fr[0];
+          }
+          me->nbt = nb;
+          // 等待帧链第 1 帧的调用者保存寄存器窗（x19..x22）：0x3d56b0 的 x19=作业池——
+          // PreloadManager 卡死时这里就是「它隶属的池」指针，配合池猎手定位。
+          // Callee-saved window of the first frame: x19 of 0x3d56b0 IS the job pool pointer.
+          for (int ri = 0; ri < 4; ri++) me->wregs[ri] = regs[19 + ri];
+      } } }
     if (g_flag.thr && num != 0x0B) { thr_t *me = pthread_getspecific(g_keythr); LOG("[%#x] svc %#x x0=%#llx x1=%#llx x2=%#llx x3=%#llx", me ? me->handle : 0, num, regs[0], regs[1], regs[2], regs[3]); }
     switch (num) {
     case 0x08: {  // CreateThread(→w1 句柄; x1 入口, x2 参数, x3 栈顶, w4 优先级, w5 核) | CreateThread(→w1 handle; x1 entry, x2 argument, x3 stack top, w4 priority, w5 core)
@@ -694,7 +994,14 @@ int svc_thread(int num, uint64_t *regs) {
         pthread_mutex_lock(&G);
         for (thr_t *w; (cnt <= 0 || n < cnt) && (w = pick(2, key)); n++) lock_acquire_for(w, w->waddr, w->wtag);   // 按内核顺序；转为锁等待或被唤醒后不再是 kind 2 | In kernel order; once turned into a lock wait or woken it is no longer kind 2
         int left = 0; for (thr_t *w = g_wait; w; w = w->next) if (w->wkind == 2 && w->wkey == key) { left = 1; break; }
-        if (!left) st32(key, 0);
+        // 有被挂起线程时不清键：信号可能是发给「停在信号处理器里的那个线程」的——它恢复后用户态快路径
+        // 会看到非零键并消费；这时清键就把信号弄丢，游戏在停世界协议里死等（v66 实锤：Suspend(main) 后
+        // 信号到 → 主线程已停在处理器里 → 键被清 → Resume 后主线程重睡，协议卡死）。
+        // While any thread is suspended, do NOT clear the key: the signal may belong to a thread parked in the
+        // suspend handler -- its user-mode fast path consumes the non-zero key after resume. Clearing it loses
+        // the signal and deadlocks the stop-the-world protocol (measured in v66).
+        int any_susp = 0; for (thr_t *w = g_all; w; w = w->all) if (w->suspended) { any_susp = 1; break; }
+        if (!left && !any_susp) st32(key, 0);
         { static _Atomic int ns; unsigned k = atomic_fetch_add(&ns, 1);
           if (k < 400) LOG("信号 key=%#llx 个数=%d 唤醒=%d 余等待=%d", (unsigned long long)key, cnt, n, left); }
         pthread_mutex_unlock(&G);
@@ -732,6 +1039,85 @@ int svc_thread(int num, uint64_t *regs) {
         regs[0] = (uint64_t)r; return 1;
     }
 
+    case 0x32: {  // SuspendThread(w0 线程句柄)：真停。Horizon 语义=暂停计数，自挂起则睡到 Resume | SuspendThread: real stop. Horizon = pause count; self-suspend parks until Resume
+        sg_install();
+        thr_t *t = h_get((uint32_t)regs[0], O_THREAD);
+        pthread_mutex_lock(&G);
+        int64_t r;
+        if (!t) {   // 无效句柄=注册表里没填过的槽（v59：stop-the-world 第三个成员的句柄是调用者栈上垃圾）。按「无事可做」返回成功：
+                    // 真句柄走真语义，垃圾句柄回到占位行为——否则游戏把这个失败当致命（Result=0xe401 Break）。
+                    // Invalid handle = an unfilled registry slot. Treat as no-op so the stop-the-world proceeds.
+            { static _Atomic int ns; unsigned k = atomic_fetch_add(&ns, 1);
+              if (k < 20) LOG("SuspendThread %#x → 无效句柄，按成功返回", (unsigned)(uint32_t)regs[0]); }
+            pthread_mutex_unlock(&G); regs[0] = 0; return 1;
+        }
+        else if (t->exited) { pthread_mutex_unlock(&G); regs[0] = 0; return 1; }   // 已退：无事可做 | exited: no-op
+        else if (t == cur()) {                       // 自挂起：睡在 kind 5，Resume 唤醒 | self: park on kind 5
+            t->suspend_count++;
+            if (t->suspend_count == 1) { t->suspended = 1; block(t, 5, -1); }
+            r = 0;
+        } else if (t->wkind != 0 || t->in_svc) {     // 已在等待机器或 svc 中：记标志延迟（svc 出口补停 / block 冻结）| parked or mid-svc: defer
+            t->suspend_count++;
+            t->suspended = 1;
+            r = 0;
+        } else {                                     // 在跑客体代码：懒停车——只置标志，线程走到下一个 block()/svc 出口自停。
+                                                     // 并等它真正停稳（进 block 或挂在出口钩子）再返回：游戏的下一步是给它发
+                                                     // condvar 信号，若它还在乱跑信号就落在无等待者窗口被清（v66-v68 实锤）。
+                                                     // Running guest code: lazy park, then WAIT (bounded) until the target has
+                                                     // actually parked (entered block() or the exit hook) -- the game signals
+                                                     // its condvar right after, and that signal must find it waiting.
+            t->suspend_count++;
+            t->suspended = 1;
+            for (int i = 0; i < 4000 && t->wkind == 0 && !t->hook_parked && !t->exited; i++) {
+                pthread_mutex_unlock(&G); usleep(500); pthread_mutex_lock(&G);
+            }
+            r = 0;
+        }
+        { static _Atomic int ns; unsigned k = atomic_fetch_add(&ns, 1);
+          if (k < 40) { module_t *cm = module_of((void *)regs[30]);
+              LOG("SuspendThread %#x → 槽 %#x 计数=%d%s 调用者=%s+%#llx", (unsigned)(uint32_t)regs[0],
+                  t ? t->handle : 0, t ? t->suspend_count : 0, t == cur() ? "（自）" : "",
+                  cm ? cm->name : "?", cm ? (uint64_t)regs[30] - (uint64_t)cm->base : regs[30]); } }
+        pthread_mutex_unlock(&G);
+        regs[0] = (uint64_t)r; return 1;
+    }
+    case 0x33: {  // ResumeThread：句柄在 x1（x0=ThreadType*，sdk+0x130ebc 包装实测：x0=0x60b51e13d0 x1=0x1001/0x1005）；x0 兜底
+        pthread_mutex_lock(&G);
+        thr_t *t = h_get((uint32_t)regs[1], O_THREAD);
+        if (!t) t = h_get((uint32_t)regs[0], O_THREAD);
+        if (!t || t->exited) {   // 都无效才走恢复全部兜底
+            { static _Atomic int ns; unsigned k = atomic_fetch_add(&ns, 1);
+              if (k < 20) { module_t *cm = module_of((void *)regs[30]);
+                  LOG("ResumeThread x0=%#llx x1=%#llx → 都无效（调用者 %s+%#llx）：恢复全部被挂起线程", (unsigned long long)regs[0], (unsigned long long)regs[1],
+                      cm ? cm->name : "?", cm ? (uint64_t)regs[30] - (uint64_t)cm->base : regs[30]); } }
+            int nw = 0;
+            for (thr_t *w = g_all; w; w = w->all) {
+                if (!w->suspended || w == cur()) continue;
+                w->suspended = 0; nw++;
+                if (w->wkind == 5) wake(w, 0);
+                else if (w->wkind == 0 && w->tid > 0) { static int pidr; if (!pidr) pidr = getpid(); tgkill(pidr, w->tid, SG_RESUME); }
+                // kind 1..4 冻在 block() 里的不动：它们的交接已由信号侧完整完成 | kinds 1..4 frozen in block() stay; their handoffs were completed by the signal side
+            }
+            LOG("ResumeThread 无效句柄：已恢复 %d 条被挂起线程", nw);
+            pthread_mutex_unlock(&G); regs[0] = 0; return 1;
+        }
+        if (t->suspend_count > 0) {
+            t->suspend_count--;
+            if (t->suspend_count == 0 && t->suspended) {
+                t->suspended = 0;
+                if (t->wkind == 5) wake(t, 0);            // 自挂起(kind 5)：补唤醒 | self-suspend: deliver the wake
+                else if (t->wkind == 0 && t->tid > 0) {   // 信号停的 / svc 出口补停的：放行 | signal or exit-hook parked: release
+                    static int pid2; if (!pid2) pid2 = getpid();
+                    tgkill(pid2, t->tid, SG_RESUME);
+                }
+                // kind 1..4：还冻在 block() 里的（超时已冻结）原地继续等；等到的交接已按真机语义完成 | kinds 1..4 still frozen in block() keep waiting; completed handoffs already woke them
+            }
+        }
+        { static _Atomic int ns; unsigned k = atomic_fetch_add(&ns, 1);
+          if (k < 40) LOG("ResumeThread x0=%#llx x1=%#llx → 槽 %#x 计数=%d", (unsigned long long)regs[0], (unsigned long long)regs[1], t ? t->handle : 0, t ? t->suspend_count : 0); }
+        pthread_mutex_unlock(&G);
+        regs[0] = 0; return 1;
+    }
     case 0x45: {  // CreateEvent(→w1 写端, w2 读端) | CreateEvent(→w1 write end, w2 read end)
         event_t *e = calloc(1, sizeof *e); e->refs = 2;
         pthread_mutex_lock(&G); uint32_t hw = h_new(O_EVENT_W, e), hr = h_new(O_EVENT_R, e); pthread_mutex_unlock(&G);

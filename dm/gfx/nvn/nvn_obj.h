@@ -44,8 +44,15 @@ typedef struct {
     uint8_t swz[4], swz_set, ds_mode;   // 见 tex_builder_t 同名项 | see the same-named fields in tex_builder_t
     uint64_t serial;                     // 初始化序号：回放层按它在宿主表里找 MTLTexture（游戏可能按值拷贝对象，不能存对象指针） | Initialization serial: the replay layer uses it to find the MTLTexture in the host table (the game may copy the object by value, so object pointers cannot be stored)
 } tex_t;                                                                                     FITS(tex_t, NVNtexture);
-typedef struct { uint8_t set_levels, set_layers, set_format, set_target; int32_t base_level, nlevels, min_layer, nlayers, format, target;
-                 uint8_t swz[4], swz_set, ds_mode, ds_set; } view_t;
+// 视图：前 16 字节是「真机可见前缀」。HSS 崩帧实测（main+0x614398）：Unity 栈上本地视图只有 0x10 字节
+// （sp+0x70 起，紧挨 d8 保存槽和存下来的对象指针），真机的 SetDefaults 也只写这一段，否则真机自己就崩了。
+// 所以 SetDefaults/SetLevels/SetLayers 只许碰这 16 字节；「设没设过」用哨兵编码（nlevels!=0 / nlayers!=0，
+// SetDefaults 清零即回到未设），不能放独立标志——标志写进第 16 字节起就是打穿客体栈。
+// 之后是扩展态（格式/目标/改写/深度模板模式）：只有显式调对应 Set* 的客体才会写，16B 视图的客体调不了
+// 这些（没地方写，HSS 计数为 0）；SetDefaults 不清这段与真机行为一致（复用旧视图留着脏扩展态，真机也这样）。
+typedef struct { int32_t base_level, nlevels, min_layer, nlayers;
+                 uint8_t set_format, set_target, swz[4], swz_set, ds_mode, ds_set;
+                 int32_t format, target; } view_t;
 FITS(view_t, NVNtextureView);
 
 // 采样器参数（builder 与对象共用一份）
