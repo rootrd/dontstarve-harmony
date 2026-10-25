@@ -43,6 +43,69 @@ static _Atomic uint64_t g_faults, g_preps;
 static _Atomic uint64_t g_adds_total;
 static _Atomic int g_live, g_live_peak;   // 在册的池数与峰值（内存读数行用） | number of registered pools and peak (for the memory readout line)
 void nvn_dirty_stat(int *live, int *peak, int *cap) { *live = atomic_load(&g_live); *peak = atomic_load(&g_live_peak); *cap = MAX_RANGE; }
+
+// 页→槽 平坦哈希：把「地址落在哪个已登记区间」从线性扫（每帧几千次 × 每次数百区间，实测吃掉回放大头）
+// 降为单次探针。只存 slot+1（0=空，UINT32_MAX=墓碑），插/删在 g_slot_mu 下维护，find 在缺页路径无锁读——
+// 平坦定长数组、不分配，信号上下文安全。不重叠不变式：登记的区间互不重叠（只有缓冲登记，池不登记），
+// 每页至多属于一个 live 区间 ⇒ 单槽足够。桶满（理论不上：262144 桶 ≥ 1GB 缓冲页）就跳过该页的登记，
+// find 落空按「未跟踪」走保守路径，正确性不受影响。
+// Flat page->slot hash: turns "which registered range covers this address" from a linear scan (thousands of calls
+// per frame over hundreds of ranges -- measured as a top slice of replay) into one probe. Stores slot+1 only
+// (0 = empty, UINT32_MAX = tombstone); insert/remove maintain it under g_slot_mu, find() reads it lock-free in
+// the fault path -- flat fixed array, no allocation, signal-safe. Non-overlap invariant (only buffers register,
+// pools do not) means each page belongs to at most one live range, so one slot per bucket suffices. A full bucket
+// (needs > 1 GB of tracked buffers to happen) just skips the page: find misses, the conservative "untracked"
+// path keeps correctness.
+#define DIRT_HASH_N 262144
+#define DIRT_TOMB UINT32_MAX
+static _Atomic uint32_t g_hidx[DIRT_HASH_N];
+static int g_hready;
+static inline uint32_t dirt_h(uintptr_t page_addr) {
+    uint64_t x = (uint64_t)(page_addr >> g_shift) * 0x9E3779B97F4A7C15ull;
+    return (uint32_t)(x >> 40) & (DIRT_HASH_N - 1);
+}
+// 返回命中槽（+1 口径）；未命中 0。纯读，无锁，缺页处理可用。
+// Returns the hit slot (+1 bias); 0 on miss. Read-only, lock-free, fault-path safe.
+static int dirt_find(uintptr_t a) {
+    if (!g_hready) return 0;
+    uintptr_t page = a & ~(g_pg - 1);
+    for (uint32_t q = dirt_h(page);; q = (q + 1) & (DIRT_HASH_N - 1)) {
+        uint32_t v = atomic_load_explicit(&g_hidx[q], memory_order_acquire);
+        if (!v) return 0;
+        if (v == DIRT_TOMB) continue;
+        range_t *r = &g_r[v - 1];
+        if (atomic_load_explicit(&r->live, memory_order_acquire) && a >= r->base && a < r->end) return v;
+        // 哈希碰撞到别的区间：继续探。碰撞键的页地址不同 ⇒ 只可能来自别页的同桶映射
+        // (A hash collision with another range's page: keep probing.)
+    }
+}
+static void dirt_put(uintptr_t a, int slot1) {
+    uintptr_t page = a & ~(g_pg - 1);
+    uint32_t q0 = dirt_h(page);
+    uint32_t first_tomb = DIRT_HASH_N;
+    for (uint32_t k = 0; k < 64; k++) {
+        uint32_t q = (q0 + k) & (DIRT_HASH_N - 1);
+        uint32_t v = atomic_load(&g_hidx[q]);
+        if (v == slot1) return;
+        if (v == DIRT_TOMB) { if (first_tomb == DIRT_HASH_N) first_tomb = q; continue; }   // 墓碑槽不 Dereference：槽号已失效
+        if (!v) { atomic_store(&g_hidx[first_tomb != DIRT_HASH_N ? first_tomb : q], slot1); return; }
+        // 桶里已是别的区间：页地址不同就是碰撞，继续探；连续 64 步都满（不会发生）就放弃登记
+        // Occupied by another range: keep probing; give up after 64 (practically unreachable).
+        range_t *r = &g_r[v - 1];
+        if (page >= r->base && page < r->end) return;   // 已登记过（同区间重复登记）| already registered
+    }
+}
+static void dirt_del(uintptr_t base, uintptr_t end) {
+    for (uintptr_t page = base; page < end; page += g_pg) {
+        for (uint32_t k = 0; k < 64; k++) {
+            uint32_t q = (dirt_h(page) + k) & (DIRT_HASH_N - 1);
+            uint32_t v = atomic_load(&g_hidx[q]);
+            if (!v) break;
+            if (v != DIRT_TOMB) { range_t *r = &g_r[v - 1];
+                if (r->base == base && r->end == end) { atomic_store(&g_hidx[q], DIRT_TOMB); break; } }
+        }
+    }
+}
 static _Atomic int g_overflow_logged;
 static pthread_mutex_t g_slot_mu = PTHREAD_MUTEX_INITIALIZER;   // 建池 / 销池（客体线程，可能并发）互斥选槽；缺页处理路径不碰它 | Pool creation / destruction (guest threads, possibly concurrent) pick slots under a mutex; the page-fault handling path does not touch it
 static _Atomic uint64_t g_mp_calls, g_mp_pages, g_mp_ticks;   // 本模块的 mprotect：调用次数、覆盖页数、耗时（mach 时基，缺页路径里也安全） | This module's mprotect: call count, pages covered, time spent (mach timebase, safe in the page-fault path too)
@@ -68,9 +131,8 @@ static int busy_wait(range_t *r, uintptr_t p) {
     return 1;
 }
 static range_t *find(uintptr_t a) {
-    int n = atomic_load(&g_nr);
-    for (int i = 0; i < n; i++) if (atomic_load_explicit(&g_r[i].live, memory_order_acquire) && a >= g_r[i].base && a < g_r[i].end) return &g_r[i];
-    return NULL;
+    int v = dirt_find(a);
+    return v ? &g_r[v - 1] : NULL;
 }
 static void unprotect_page(range_t *r, uintptr_t p) {   // 调用方已把状态从 PROT 改成 BUSY | The caller has already changed the state from PROT to BUSY
     mp(r->base + (p << g_shift), g_pg, PROT_READ | PROT_WRITE);
@@ -104,7 +166,8 @@ static void prep_write(void *addr, size_t len) {
 
 void nvn_dirty_add_range(const void *mem, size_t size) {
     static int inited;
-    if (!inited) { inited = 1; g_pg = (uintptr_t)getpagesize(); g_shift = __builtin_ctzl(g_pg); mach_timebase_info(&g_tb); dm_fault_hook_register(on_fault); dm_guest_write_prep_register(prep_write); }
+    if (!inited) { inited = 1; g_pg = (uintptr_t)getpagesize(); g_shift = __builtin_ctzl(g_pg); mach_timebase_info(&g_tb); dm_fault_hook_register(on_fault); dm_guest_write_prep_register(prep_write);
+                   for (unsigned i = 0; i < DIRT_HASH_N; i++) atomic_store(&g_hidx[i], 0); g_hready = 1; }
     atomic_fetch_add(&g_adds_total, 1);
     pthread_mutex_lock(&g_slot_mu);
     int n = atomic_load(&g_nr);
@@ -136,6 +199,8 @@ void nvn_dirty_add_range(const void *mem, size_t size) {
     r->base = base; r->end = end; r->state = state; r->gen = gen;
     if (slot == n) atomic_store(&g_nr, n + 1);
     atomic_store_explicit(&r->live, 1, memory_order_release);
+    { uintptr_t stop = end < (uintptr_t)mem + size ? end : (uintptr_t)mem + size;   // 只登记覆盖客体数据的页；尾页对齐补齐部分无妨（find 按 base/end 复核）
+      for (uintptr_t page = base; page < stop; page += g_pg) dirt_put(page, slot + 1); }
     pthread_mutex_unlock(&g_slot_mu);
 }
 // 池销毁：先把仍受保护的页还原成可写（池内存归还游戏后可能另作他用），再标失效
@@ -143,7 +208,10 @@ void nvn_dirty_add_range(const void *mem, size_t size) {
 void nvn_dirty_remove_range(const void *mem) {
     pthread_mutex_lock(&g_slot_mu);
     range_t *r = find((uintptr_t)mem);
-    if (r) { prep_write((void *)r->base, r->end - r->base); atomic_store_explicit(&r->live, 0, memory_order_release); atomic_fetch_sub(&g_live, 1); }
+    if (r) { prep_write((void *)r->base, r->end - r->base);
+             uintptr_t b = r->base, e = r->end;
+             atomic_store_explicit(&r->live, 0, memory_order_release); atomic_fetch_sub(&g_live, 1);
+             dirt_del(b, e); }
     pthread_mutex_unlock(&g_slot_mu);
 }
 int nvn_dirty_tracked(const void *addr, size_t len) {

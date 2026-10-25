@@ -1966,9 +1966,17 @@ static void vk_dead(const char *where)
 
 static void tex_read_arm(VkCommandBuffer cb, vktex *v, unsigned lvl, unsigned la, uint64_t stamp);   // DM_RTREAD 在提交收尾用它 | DM_RTREAD arms it at submit-close
 
+// 提交内六段拆分计时（性能攻坚证据链）：0=回放(mtl_exec,由 hle_nvn.c 喂) 1=commit 前段(pass_end/RTREAD/pkg_flush)
+// 2=vkEndCommandBuffer 3=vkQueueSubmit 4=vkWaitForFences+Reset 5=尾段(free/grave)。逐帧被 present 侧取走。
+// Six-way submit split (perf-evidence chain): drained per frame by the present side via mtl_sub_split().
+static _Atomic uint64_t g_subp[6];
+void mtl_replay_add(uint64_t ns) { atomic_fetch_add(&g_subp[0], ns); }
+void mtl_sub_split(uint64_t out[6]) { for (int i = 0; i < 6; i++) out[i] = atomic_exchange(&g_subp[i], 0); }
+
 uint64_t mtl_sub_commit(void)
 {
     if (!vk_ensure() || atomic_load(&g_dead)) return g_fence_val;
+    uint64_t sp0 = now_ns(), spT;
     // 谁在提交：命令池 g_cp 不是线程安全对象，出图和游戏若落在两个线程上，同池分配就是竞争
     // Who submits: the command pool g_cp is not thread-safe, so allocating from it on two threads (game + present) is a race.
     int tid = (int)syscall(SYS_gettid);
@@ -2012,8 +2020,10 @@ uint64_t mtl_sub_commit(void)
     if (g_skip & 256) { if (!g_cb) return ++g_fence_val;   // 位 256 = 游戏这条提交整个不上 GPU：连空缓冲都不飞（出图单独背锅时用）
         vkEndCommandBuffer(g_cb); vkFreeCommandBuffers(g_dev, g_cp, 1, &g_cb); g_cb = NULL; g_cb_tid = 0; return ++g_fence_val; }
     if (!g_in_pass && g_cb) pkg_flush();   // 没有通道收尾时也要冲刷：这批图不搬就永远停在哑图 | flush even when no pass closed - otherwise these images stay dummies forever
+    spT = now_ns(); atomic_fetch_add(&g_subp[1], spT - sp0); sp0 = spT;
     if (!g_cb) return ++g_fence_val;
     VkResult er = vkEndCommandBuffer(g_cb);
+    spT = now_ns(); atomic_fetch_add(&g_subp[2], spT - sp0); sp0 = spT;
     if (er != VK_SUCCESS) {
         // 这条缓冲根本没录成，也没有栅栏被等过：代号不许前进（前进就意味着坟场可以收尸、环可以复用）
         GRED("vkEndCommandBuffer = %{public}d (%{public}s)：这条缓冲作废", (int)er, vr(er));
@@ -2025,6 +2035,7 @@ uint64_t mtl_sub_commit(void)
     si.commandBufferCount = 1;
     si.pCommandBuffers = &g_cb;
     VkResult cr = vkQueueSubmit(g_q, 1, &si, g_fence);
+    spT = now_ns(); atomic_fetch_add(&g_subp[3], spT - sp0); sp0 = spT;
     if (cr != VK_SUCCESS) {
         // 栅栏压根没被递交出去：再等它就是无条件无限等一个永远不会 signaled 的对象。
         // 改前这里只打一行红字就继续往下等——第 49 轮那类挂死就是这个形状。
@@ -2044,6 +2055,7 @@ uint64_t mtl_sub_commit(void)
     // runs, fatal once the game and the present both do (that is rounds 49/51/57/58/59's present = -4). And g_fence had never been reset,
     // so every submit after the first reused a signaled fence.
     VkResult wr = vkWaitForFences(g_dev, 1, &g_fence, VK_TRUE, UINT64_MAX);
+    spT = now_ns(); atomic_fetch_add(&g_subp[4], spT - sp0); sp0 = spT;
     if (wr != VK_SUCCESS) {
         // 等不完就什么都不许做：命令还在这条缓冲里飞，free 它（VUID-vkFreeCommandBuffers-pCommandBuffers-00065）
         // 比慢一帧严重得多；代号也不许前进，前进在这层里等于「上面那批拷贝都落地了」。
@@ -2062,6 +2074,7 @@ uint64_t mtl_sub_commit(void)
     g_cb_tid = 0;
     g_fence_val++;
     grave_reap();   // 上一代的命令这下都跑完了：把坟场里那一代的句柄真销毁
+    atomic_fetch_add(&g_subp[5], now_ns() - sp0);
     return g_fence_val;
 }
 
@@ -3659,7 +3672,16 @@ static int arena_rewritten(const void *p, size_t n, uint32_t off)
 {
     if (!p || !g_arena_map || off > ARENA_SZ - ARENA_GUARD ||
         n > ARENA_SZ - ARENA_GUARD - off) return 1;
-    return memcmp(p, g_arena_map + off, n) != 0;
+    // 限幅比较：这条在「去重命中」路径上每笔绑定都跑（实测 ~5000 次命中/帧），整流 memcmp 是 2×字节
+    // 的纯读带宽——512KB 端的限幅仍最高 1MB×2/次 ≈ 数百 MB/帧，就是回放大头。掐头尾各 4KB（与
+    // vtx_check 同口径）：小流仍全比；大流漏检「只变中段」的改写为已知取舍（实测字形/实体流整块刷新）。
+    // Capped compare: this runs on every dedup hit (~5000/frame measured); a full memcmp is 2x the bytes of pure
+    // read bandwidth - even the 512 KB cap meant up to 1 MB x 2 per hit, hundreds of MB per frame: the bulk of
+    // replay. First and last 4 KB (same rule as vtx_check); small streams still compare in full. A rewrite confined
+    // to the middle of a large stream being missed is a known trade-off (measured streams refresh as a block).
+    if (n <= 8192u) return memcmp(p, g_arena_map + off, n) != 0;
+    if (memcmp(p, g_arena_map + off, 4096u) != 0) return 1;
+    return memcmp((const uint8_t *)p + (n - 4096u), g_arena_map + off + (n - 4096u), 4096u) != 0;
 }
 // 上一次 arena_put 走的是哪条路：1 = 去重命中（这份拷贝是更早某笔绘制留下的），0 = 这次真从客体搬的。
 // 顶点流要在命中时拿客体原字节对一遍——命中意味着「同一提交里同一块又被画了一次」，而客体完全可能在两笔
@@ -3731,6 +3753,43 @@ static uint64_t arena_put(uint64_t addr, uint64_t len, uint64_t floor_sz, uint32
 // (the next bind re-reads guest memory) and the cached descriptor set is dropped (so the bind-before-update
 // pattern - bind once, refill per frame - also re-fetches on the next draw). Without the overlap test this
 // would throw away the dedup on every single update.
+// 绑定中 uniform/ssbo 的 arena 副本登记：set_fill 每次搬入时记 (偏移, 代号, 覆盖范围)。
+// 常量更新（OP_UPDATE_UB / COPY_B2B）若被某个现役副本完整覆盖，就把新字节就地覆写进副本——
+// 描述符指向的偏移不变、GPU 按提交序读到新内容，于是不再需要「全场代号++ + 描述符全重建」。
+// 旧路径每帧几十次常量更新就把整个 arena 去重炸一遍、后续所有顶点流全部重搬：这就是回放 79ms 的主体。
+// Arena-copy ledger for bound uniforms/ssbos: set_fill records (offset, generation, range) whenever it moves one.
+// A constant update fully covered by a live copy is overwritten INTO that copy in place -- the descriptor offset is
+// unchanged and the GPU reads the new bytes in submission order, so there is no need to bump the whole arena
+// generation and rebuild every descriptor. The old path did exactly that on each of the dozens of per-frame constant
+// updates, forcing every vertex stream to re-copy: the bulk of the 79 ms replay.
+typedef struct { uint64_t gen, addr, size; uint32_t off; int has; } ubocopy_t;
+static ubocopy_t g_ubocopy[6][16], g_ssbocopy[6][16];   // 见 wr_update：绑定中 uniform/ssbo 的 arena 副本账 | see wr_update
+static void wr_update(uint64_t addr, uint64_t n, const void *src)
+{
+    int need_inv = 0, overlap = 0;
+    for (int st = 0; st < 6; st++)
+        for (int i = 0; i < 16; i++) {
+            const p_bind_buf *mir[2] = { &S.ubo[st][i], &S.ssbo[st][i] };
+            ubocopy_t *tabs[2] = { &g_ubocopy[st][i], &g_ssbocopy[st][i] };
+            for (int t = 0; t < 2; t++) {
+                uint64_t a = mir[t]->addr, z = mir[t]->size;
+                if (!a || !n || addr >= a + z || a >= addr + n) continue;
+                overlap = 1;
+                ubocopy_t *e = tabs[t];
+                if (!e->has || e->gen != g_arena_gen) continue;          // 没副本：下次填充自然搬新的 | no copy yet: the next fill moves fresh bytes
+                if (addr >= e->addr && addr + n <= e->addr + e->size &&
+                    e->off <= ARENA_SZ - ARENA_GUARD && n <= ARENA_SZ - ARENA_GUARD - e->off) {
+                    memcpy(g_arena_map + e->off + (addr - e->addr), src, (size_t)n);   // 就地覆写 | in-place
+                } else need_inv = 1;                                     // 部分覆盖旧副本：回退全场作废 | partial over an old copy: fall back
+            }
+        }
+    if (!overlap) return;
+    if (need_inv) {   // 维持旧语义兜底 | keep the old invalidate-all as the fallback
+        g_arena_gen++;
+        g_sets_valid = 0;
+    }
+    atomic_fetch_add(&g_wr_void, 1);
+}
 static void wr_invalidate(uint64_t addr, uint64_t n)
 {
     int hit = 0;
@@ -4633,16 +4692,15 @@ static void cbuf_probe(const shb_bind *b, int ei, int stage, int reg, const uint
     }
 }
 
-static int set_fill(VkDescriptorSet set, int ei, int stage)
+static int set_fill(VkWriteDescriptorSet *wr, VkDescriptorBufferInfo *bi, VkDescriptorImageInfo *ii, int *nw_out, int ei, int stage)
 {
     const shb_entry *e = &g_shb_e[ei];
-    VkWriteDescriptorSet wr[64]; VkDescriptorBufferInfo bi[64]; VkDescriptorImageInfo ii[64];
     int nb = 0, ni = 0, nw = 0;
     for (int i = 0; i < e->nb && nw < 64; i++) {
         const shb_bind *b = &g_shb_b[e->bind_off + i];
         int reg = b->nvn_reg;
         wr[nw] = (VkWriteDescriptorSet){ VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET };
-        wr[nw].dstSet = set; wr[nw].dstBinding = b->binding; wr[nw].descriptorCount = 1;
+        wr[nw].dstBinding = b->binding; wr[nw].descriptorCount = 1;
         wr[nw].descriptorType = desc_type(b->kind);
         if (b->kind == SHB_COMBINED) {
             int dim = b->vtype & 15, sh = (b->vtype & 0x10) ? 1 : 0;
@@ -4896,6 +4954,11 @@ static int set_fill(VkDescriptorSet set, int ei, int stage)
             uint32_t ao = 0;
             if (u && u->addr && arena_put(u->addr, u->size, 1024, &ao)) {
                 buf = g_arena; off = ao; range = (u->size ? u->size : 1) + 256;
+                {   // 登记这份副本供 wr_update 就地覆写常量更新 | record the copy for wr_update in-place constant writes
+                    int sreg = reg >= 0 && reg < 16 ? reg : 0;
+                    if (b->nvn_kind == SHB_N_SBUF) g_ssbocopy[stage][sreg] = (ubocopy_t){ g_arena_gen, u->addr, u->size, ao, 1 };
+                    else g_ubocopy[stage][sreg] = (ubocopy_t){ g_arena_gen, u->addr, u->size, ao, 1 };
+                }
                 if (!g_cbuf_off && (b->nvn_kind == SHB_N_CBUF || b->nvn_kind == SHB_N_UBOP)) {
                     // 有效字节数按客体这次绑多长算：不足 176 就是着色器已经在读我们补的零（截断），
                     // 比两份也只比这一段——客体在范围之外的字节属于别次绘制，拿来比必然「不一致」，那是假阳性。
@@ -4915,18 +4978,64 @@ static int set_fill(VkDescriptorSet set, int ei, int stage)
         }
         nw++;
     }
-    vkUpdateDescriptorSets(g_dev, (uint32_t)nw, wr, 0, NULL);
+    *nw_out = nw;
     return 1;
 }
 
+// 描述符集签名缓存：set_fill 的驱动写入（alloc ×2 + update）实测占回放大头（798 绘/帧里每次绑定变化都重建）。
+// 填充照跑（里面的打包重传检测是活语义），但把两阶段的 wr/bi/ii 载荷哈希成签名——上一条提交里同签名的集子
+// 直接复用，不再碰驱动。集子池每提交 reset，缓存随 g_bindc 一起作废。
+// Descriptor-set signature cache: the driver writes (2 allocs + update per rebuild, on every binding change across
+// ~798 draws/frame) measured as a top replay cost. set_fill still runs (its packaged-reupload checks are live
+// semantics), but the two stages' wr/bi/ii payloads hash into a signature; a set built with the same signature this
+// submission is reused without touching the driver. The per-submission pool reset invalidates the cache with g_bindc.
+#define SETSIG_N 1024
+static struct { uint64_t h; VkDescriptorSet s[2]; } g_setsig[SETSIG_N];
+static uint64_t setsig_hash(VkWriteDescriptorSet *wr, VkDescriptorBufferInfo *bi, VkDescriptorImageInfo *ii, int nw)
+{
+    uint64_t h = 1469598103934665603ull;
+    for (int i = 0; i < nw; i++) {
+        const uint8_t *f = (const uint8_t *)&wr[i];
+        for (size_t b = 0; b < sizeof wr[i]; b++) { if ((b >= offsetof(VkWriteDescriptorSet, dstSet) && b < offsetof(VkWriteDescriptorSet, dstSet) + 8) || (b >= offsetof(VkWriteDescriptorSet, pNext) && b < offsetof(VkWriteDescriptorSet, pNext) + 8)) continue; h = (h ^ f[b]) * 1099511628211ull; }
+        const void *payload = wr[i].pBufferInfo ? (const void *)wr[i].pBufferInfo : wr[i].pImageInfo;
+        if (payload) { const uint8_t *pf = (const uint8_t *)payload;
+            size_t pl = wr[i].pBufferInfo ? sizeof(VkDescriptorBufferInfo) : sizeof(VkDescriptorImageInfo);
+            for (size_t b = 0; b < pl; b++) { h = (h ^ pf[b]) * 1099511628211ull; } }
+    }
+    return h ? h : 1;
+}
 static int sets_rebuild(int vi, int fi)
 {
+    VkWriteDescriptorSet wr[2][64]; VkDescriptorBufferInfo bi[2][64]; VkDescriptorImageInfo ii[2][64];
+    int nw[2];
+    if (!set_fill(wr[0], bi[0], ii[0], &nw[0], vi, 0) || !set_fill(wr[1], bi[1], ii[1], &nw[1], fi, 1)) return 0;
+    uint64_t h = setsig_hash(wr[0], bi[0], ii[0], nw[0]);
+    h = h * 1099511628211ull ^ setsig_hash(wr[1], bi[1], ii[1], nw[1]);
+    h = h ? h : 1;
+    uint32_t q0 = (uint32_t)(h % SETSIG_N);
+    for (int t = 0; t < 4; t++) {
+        uint32_t q = (q0 + t) & (SETSIG_N - 1);
+        if (g_setsig[q].h == h) {   // 命中：这对集子本提交里已经建好且内容一致 | hit: this pair exists, identical content
+            g_cur_set[0] = g_setsig[q].s[0]; g_cur_set[1] = g_setsig[q].s[1];
+            g_cur_vi = vi; g_cur_fi = fi; g_sets_valid = 1;
+            g_args_dirty[0] = g_args_dirty[1] = 0;
+            return 1;
+        }
+        if (!g_setsig[q].h) break;
+    }
     VkDescriptorSet sets[2] = { NULL, NULL };
     VkDescriptorSetLayout lays[2] = { g_sho[vi].dsl, g_sho[fi].dsl };
     VkDescriptorSetAllocateInfo ai = { VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO };
     ai.descriptorPool = g_dpool; ai.descriptorSetCount = 2; ai.pSetLayouts = lays;
     if (vkAllocateDescriptorSets(g_dev, &ai, sets) != VK_SUCCESS) { atomic_fetch_add(&g_set_oom, 1); return 0; }
-    if (!set_fill(sets[0], vi, 0) || !set_fill(sets[1], fi, 1)) return 0;
+    for (int stg = 0; stg < 2; stg++)
+        for (int i = 0; i < nw[stg]; i++) wr[stg][i].dstSet = sets[stg];
+    vkUpdateDescriptorSets(g_dev, (uint32_t)nw[0], wr[0], 0, NULL);
+    vkUpdateDescriptorSets(g_dev, (uint32_t)nw[1], wr[1], 0, NULL);
+    for (int t = 0; t < 4; t++) {
+        uint32_t q = (q0 + t) & (SETSIG_N - 1);
+        if (!g_setsig[q].h) { g_setsig[q].h = h; g_setsig[q].s[0] = sets[0]; g_setsig[q].s[1] = sets[1]; break; }
+    }
     g_cur_set[0] = sets[0]; g_cur_set[1] = sets[1];
     g_cur_vi = vi; g_cur_fi = fi; g_sets_valid = 1;
     g_args_dirty[0] = g_args_dirty[1] = 0;
@@ -5035,6 +5144,12 @@ static int g_draw_ready, g_draw_fail;
 static _Atomic uint64_t g_dr_replay, g_dr_nolib, g_dr_bad, g_dr_nopipe, g_dr_over, g_dr_msaa, g_dr_nopass, g_vp_neg;
 static int g_dr_thissub, g_draw_max = 2000;
 static VkPipeline g_last_pipe;
+// 「上次已绑」缓存：一条命令缓冲内绑定是持久状态，没换就不重发（见 do_draw）。每条新命令缓冲由
+// mtl_sub_reset_draw → do_bind_cache_reset 作废——新缓冲里什么都没绑过。
+// Last-bound caches: within one command buffer bindings persist (see do_draw). mtl_sub_reset_draw drops them per
+// new command buffer, because a fresh buffer has nothing bound.
+static struct { VkDescriptorSet set0, set1; VkPipelineLayout pl; VkBuffer vb_bufs[16]; VkDeviceSize vb_offs[16]; int vb_valid; } g_bindc;
+static void do_bind_cache_reset(void) { memset(&g_bindc, 0, sizeof g_bindc); memset(g_setsig, 0, sizeof g_setsig); memset(g_ubocopy, 0, sizeof g_ubocopy); memset(g_ssbocopy, 0, sizeof g_ssbocopy); }
 static VkPipelineLayout g_last_pl;
 
 static int draw_boot(void)
@@ -5113,6 +5228,7 @@ void mtl_sub_reset_draw(void)
     g_last_pipe = NULL; g_last_pl = NULL;
     args_dirty_all();
     if (g_dpool) vkResetDescriptorPool(g_dev, g_dpool, 0);
+    do_bind_cache_reset();   // 每条新命令缓冲绑定态不延续：描述符/顶点的「上次已绑」缓存作废 | a fresh command buffer starts with no bindings: drop the last-bound caches
 }
 
 static void emit_dyn(VkCommandBuffer cb, VkExtent2D ext)
@@ -6747,7 +6863,14 @@ static void do_draw(const p_draw *dw, const p_draw_idx *di)
     if (!g_sets_valid || g_cur_vi != vi || g_cur_fi != fi || g_args_dirty[0] || g_args_dirty[1]) {
         if (!sets_rebuild(vi, fi)) { g_dr_nopipe++; return; }
     }
-    vkCmdBindDescriptorSets(g_cb, VK_PIPELINE_BIND_POINT_GRAPHICS, g_last_pl, 0, 2, g_cur_set, 0, NULL);
+    // 描述符集没换就不重绑：Vulkan 的绑定在命令缓冲里是持久状态，重绑同一对句柄纯属白付驱动调用
+    // （实测 798 绘/帧 × 每绘一次 ≈ 每帧上千次冗余驱动调用）。重建出的新句柄必然不同，自然触发重绑。
+    // Skip the descriptor bind when the sets did not change: Vulkan bindings persist in the command buffer, and
+    // re-binding identical handles is a pure driver-call tax. Rebuilt sets are new handles and rebind naturally.
+    if (!g_bindc.set0 || g_bindc.set0 != g_cur_set[0] || g_bindc.set1 != g_cur_set[1] || g_bindc.pl != g_last_pl) {
+        vkCmdBindDescriptorSets(g_cb, VK_PIPELINE_BIND_POINT_GRAPHICS, g_last_pl, 0, 2, g_cur_set, 0, NULL);
+        g_bindc.set0 = g_cur_set[0]; g_bindc.set1 = g_cur_set[1]; g_bindc.pl = g_last_pl;
+    }
     // 顶点缓冲：按管线的绑定号绑，流没搬进来的绑零缓冲（读出来是 0，不打掉设备）| vertex buffers: unstreamed bindings fall back to the zero buffer
     {
         VkBuffer bufs[16]; VkDeviceSize offs[16];
@@ -6760,7 +6883,12 @@ static void do_draw(const p_draw *dw, const p_draw_idx *di)
             uint32_t o = 0;
             if (vtx_stream((int)pl2.binding, &o)) { bufs[pl2.binding] = g_arena; offs[pl2.binding] = o; }
         }
-        vkCmdBindVertexBuffers(g_cb, 0, 16, bufs, offs);
+        // 同理：16 槽 (缓冲,偏移) 全都没变就跳过这次 vkCmdBindVertexBuffers
+        // Same rule for the 16-slot vertex bind: skip when every (buffer, offset) is unchanged.
+        if (!g_bindc.vb_valid || memcmp(g_bindc.vb_bufs, bufs, sizeof bufs) || memcmp(g_bindc.vb_offs, offs, sizeof offs)) {
+            vkCmdBindVertexBuffers(g_cb, 0, 16, bufs, offs);
+            memcpy(g_bindc.vb_bufs, bufs, sizeof bufs); memcpy(g_bindc.vb_offs, offs, sizeof offs); g_bindc.vb_valid = 1;
+        }
     }
     if (g_att_src) { sp_draw_said(vi, fi, dw, di); sp_pair_said(vi, fi, dw, di); bsp_tally(vi, fi); pk_tally(vi, fi, (uint32_t)(dw ? dw->count : di->count));
                     if (!(g_pk_tot % 20000)) pk_said();
@@ -6770,8 +6898,30 @@ static void do_draw(const p_draw *dw, const p_draw_idx *di)
     } else {
         int esz = di->itype == NVN_INDEX_TYPE_UNSIGNED_SHORT ? 2 : di->itype == NVN_INDEX_TYPE_UNSIGNED_INT ? 4 : 0;
         if (!esz || !di->count) { if (esz == 0) { static int said8; if (!said8++) GVL("[vk] 8 位索引这刀不接"); } return; }
+        // 索引缓冲去重：游戏每笔绘制都交同一份索引（顶点换、索引不变是常态），按 (地址,长度,本提交) 缓存
+        // arena 偏移，命中就不再 arena_put（那次调用是带锁的哈希查重+可能整段搬运）。
+        // Index buffer dedup: the game hands the same index data draw after draw (vertices change, indices rarely
+        // do); cache the arena offset by (address, length, submission) and skip arena_put on a hit.
+        static struct { uint64_t gen, addr, len; uint32_t off; } g_ibc[8];
         uint32_t io = 0;
-        if (!arena_put(di->ibuf, (uint64_t)di->count * esz, 0, &io)) return;
+        uint64_t ilen = (uint64_t)di->count * esz;
+        int ib_hit = 0;
+        for (int i = 0; i < 8; i++)
+            if (g_ibc[i].gen == g_arena_gen && g_ibc[i].addr == di->ibuf && g_ibc[i].len == ilen) {
+                io = g_ibc[i].off; ib_hit = 1;
+                // 同址改写闸（与顶点流同口径）：命中不是免检牌，采 4KB 比对，变了就重搬
+                // Same-address rewrite gate (same rule as vertex streams): a hit is not a free pass - sample 4 KB.
+                void *gb2 = NULL; uint64_t go2 = 0;
+                uint64_t cn = ilen < 4096 ? ilen : 4096;
+                if (cn >= 64 && mtl_addr(di->ibuf, cn, &gb2, &go2) && gb2 &&
+                    memcmp((const uint8_t *)gb2 + go2, g_arena_map + io, (size_t)cn) != 0) ib_hit = 0;
+                break;
+            }
+        if (!ib_hit) {
+            if (!arena_put(di->ibuf, ilen, 0, &io)) return;
+            for (int i = 0; i < 8; i++)
+                if (g_ibc[i].gen != g_arena_gen) { g_ibc[i].gen = g_arena_gen; g_ibc[i].addr = di->ibuf; g_ibc[i].len = ilen; g_ibc[i].off = io; break; }
+        }
         vkCmdBindIndexBuffer(g_cb, g_arena, io, esz == 2 ? VK_INDEX_TYPE_UINT16 : VK_INDEX_TYPE_UINT32);
         vkCmdDrawIndexed(g_cb, (uint32_t)di->count, di->instances > 0 ? (uint32_t)di->instances : 1,
                          0, di->base_vertex, (uint32_t)di->base_instance);
@@ -6959,7 +7109,7 @@ void mtl_exec(const uint8_t *handle)
             if (!ok) { atomic_fetch_add(&g_wrfail, 1); break; }
             dm_guest_write_prepare((uint8_t *)db + doff, (size_t)n);   // 目标池页可能正被写保护（脏页跟踪），内核式直写会 SIGSEGV / EFAULT
             memmove((uint8_t *)db + doff, (uint8_t *)sb + so, (size_t)n);
-            wr_invalidate(d, n);
+            wr_update(d, n, (const uint8_t *)sb + so);
             break; }
         case OP_UPDATE_UB: {   // 数据跟着命令走（录制时已拷进命令内存），回放时写回客体缓冲
             uint64_t d, n; memcpy(&d, body, 8); memcpy(&n, (const uint8_t *)body + 8, 8);
@@ -6976,7 +7126,7 @@ void mtl_exec(const uint8_t *handle)
             if (!ok) { atomic_fetch_add(&g_wrfail, 1); break; }
             dm_guest_write_prepare((uint8_t *)db + doff, (size_t)n);
             memcpy((uint8_t *)db + doff, (const uint8_t *)body + 16, (size_t)n);
-            wr_invalidate(d, n);
+            wr_update(d, n, (const uint8_t *)body + 16);
             break; }
         case OP_COPY_T2B: case OP_COPY_T2T:
         case OP_CLEAR_TEX: case OP_BIND_STATE: case OP_BIND_VATTR: case OP_BIND_VSTREAM:
