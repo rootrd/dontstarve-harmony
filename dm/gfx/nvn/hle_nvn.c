@@ -1869,6 +1869,9 @@ NVN(nvnQueuePresentTexture, void, NVNqueue *q, NVNwindow *w, int idx) {
         { uint64_t sp[6]; extern void mtl_sub_split(uint64_t *); mtl_sub_split(sp);
           static const char *spn[6] = { "@sub_replay", "@sub_pre", "@sub_end", "@sub_qsub", "@sub_fence", "@sub_tail" };
           for (int si = 0; si < 6; si++) trow(f, spn[si], sp[si] / 1e6); }
+        { uint64_t dp[6]; extern void mtl_ddprof_split(uint64_t *); mtl_ddprof_split(dp);
+          static const char *dpn[6] = { "@dd_pipe", "@dd_sets", "@dd_vtx", "@dd_drv", "@dd_pre", "@dd_rest" };
+          for (int si = 0; si < 6; si++) trow(f, dpn[si], (double)dp[si] / 1e6); }   // cntvct 周期 → 以 ns 计近似 | cycles, ~ns
     } else atomic_store(&g_nvn_ns, 0);
     g_acq_wait_ns = g_pq_wait_ns = 0;
     if (f >= 8) { double g = mtl_gpu_ms(f - 8); if (g >= 0) { tpush(3, g); trow(f - 8, "@gpu_ms", g); g_hr[g_hn++ % HRN] = g; }   // GPU 时间滞后 8 帧取（已完成） | GPU time is taken 8 frames late (already completed)

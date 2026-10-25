@@ -513,6 +513,7 @@ static _Atomic uint64_t g_passes, g_draws, g_clears, g_dispatches, g_copies;
 // occurrences, address-resolution failures, and how many times the arena/descriptor caches were voided because of them.
 static _Atomic uint64_t g_upd_ub, g_b2b, g_wrfail, g_wr_void;
 static _Atomic uint64_t g_ops[OP_COUNT_];
+static int g_ops_counting;   // DM_NVN_TSV_CALLS 落地后才置位（见 vk_ensure）；关着时回放零原子加 | armed once DM_NVN_TSV_CALLS has landed (see vk_ensure); zero atomics in replay while off
 
 static const char *vr(VkResult r)
 {
@@ -6831,6 +6832,14 @@ static void va_alpha_said(int vi)
     }
 }
 
+// do_draw 内部分段计时（性能攻坚：回放剩余 46ms 的最后一层拆分）。DM_DDPROF=1 才计，读 cntvct。
+// Per-draw phase timers (the last split of the remaining replay time). Gated behind DM_DDPROF=1.
+static _Atomic uint64_t g_ddp[6];   // 0=pipeline 1=sets 2=vtx 3=driver 4=pre 5=rest
+static int g_ddp_on = -1;
+#define DDP_T() (g_ddp_on == 1 ? __builtin_readcyclecounter() : 0)
+#define DDP_ADD(i, a, b) do { if (g_ddp_on == 1) atomic_fetch_add(&g_ddp[i], (b) - (a)); } while (0)
+void mtl_ddprof_split(uint64_t out[6]) { for (int i = 0; i < 6; i++) out[i] = atomic_exchange(&g_ddp[i], 0); }
+
 static void do_draw(const p_draw *dw, const p_draw_idx *di)
 {
     if (g_skip & 2048) return;
@@ -6850,7 +6859,9 @@ static void do_draw(const p_draw *dw, const p_draw_idx *di)
     if (S.ms.samples > 1) { g_dr_msaa++; sp_why(3, vi, fi, (int)S.ms.samples); return; }
     if (!sho_prep(vi) || !sho_prep(fi)) { g_dr_bad++; sp_why(4, vi, fi, 0); return; }
     if (++g_dr_thissub > g_draw_max) { g_dr_over++; sp_why(5, vi, fi, g_draw_max); return; }
+    uint64_t d0 = DDP_T();
     VkPipeline p = pipe_get(vi, fi, dw ? dw->prim : di->prim, g_p.rp, g_p.pk);
+    DDP_ADD(0, d0, DDP_T()); d0 = DDP_T();
     if (!p) { g_dr_nopipe++; sp_why(6, vi, fi, (int)(dw ? dw->prim : di->prim)); return; }
     if (g_last_pipe != p) {
         vkCmdBindPipeline(g_cb, VK_PIPELINE_BIND_POINT_GRAPHICS, p);
@@ -6861,7 +6872,10 @@ static void do_draw(const p_draw *dw, const p_draw_idx *di)
     }
     if (g_dyn_dirty) { emit_dyn(g_cb, att_min()); g_dyn_dirty = 0; atomic_fetch_add(&g_dyn_emit, 1); }
     if (!g_sets_valid || g_cur_vi != vi || g_cur_fi != fi || g_args_dirty[0] || g_args_dirty[1]) {
-        if (!sets_rebuild(vi, fi)) { g_dr_nopipe++; return; }
+        uint64_t d1 = DDP_T();
+        int ok2 = sets_rebuild(vi, fi);
+        DDP_ADD(1, d1, DDP_T()); d0 = DDP_T();
+        if (!ok2) { g_dr_nopipe++; return; }
     }
     // 描述符集没换就不重绑：Vulkan 的绑定在命令缓冲里是持久状态，重绑同一对句柄纯属白付驱动调用
     // （实测 798 绘/帧 × 每绘一次 ≈ 每帧上千次冗余驱动调用）。重建出的新句柄必然不同，自然触发重绑。
@@ -6883,6 +6897,7 @@ static void do_draw(const p_draw *dw, const p_draw_idx *di)
             uint32_t o = 0;
             if (vtx_stream((int)pl2.binding, &o)) { bufs[pl2.binding] = g_arena; offs[pl2.binding] = o; }
         }
+        DDP_ADD(2, d0, DDP_T()); d0 = DDP_T();
         // 同理：16 槽 (缓冲,偏移) 全都没变就跳过这次 vkCmdBindVertexBuffers
         // Same rule for the 16-slot vertex bind: skip when every (buffer, offset) is unchanged.
         if (!g_bindc.vb_valid || memcmp(g_bindc.vb_bufs, bufs, sizeof bufs) || memcmp(g_bindc.vb_offs, offs, sizeof offs)) {
@@ -6893,6 +6908,7 @@ static void do_draw(const p_draw *dw, const p_draw_idx *di)
     if (g_att_src) { sp_draw_said(vi, fi, dw, di); sp_pair_said(vi, fi, dw, di); bsp_tally(vi, fi); pk_tally(vi, fi, (uint32_t)(dw ? dw->count : di->count));
                     if (!(g_pk_tot % 20000)) pk_said();
                     if (S.color.blend_en & 1) va_alpha_said(vi); }   // 只查开了混合的那批：不透明的文字不是嫌疑人
+    DDP_ADD(4, d0, DDP_T()); d0 = DDP_T();
     if (dw) {
         if (dw->count) vkCmdDraw(g_cb, (uint32_t)dw->count, 1, (uint32_t)dw->first, 0);
     } else {
@@ -6929,6 +6945,7 @@ static void do_draw(const p_draw *dw, const p_draw_idx *di)
     atomic_fetch_add(&g_dr_replay, 1);
     if (g_att_src) atomic_fetch_add(&g_sp_replay, 1);
     if (g_in1_cur) atomic_fetch_add(&g_in1_draw, 1);
+    DDP_ADD(3, d0, DDP_T());
 }
 
 static void draw_stats_line(char *line, int m, int cap)
@@ -7067,8 +7084,12 @@ void mtl_exec(const uint8_t *handle)
         if (!h.size) { GRED("命令记录 size=0（op=%{public}d）：停在这条", (int)h.op); g_ret_n = top; return; }
         const uint8_t *body = p + sizeof h;
         if (h.op >= OP_COUNT_) { GRED("没见过的 op=%{public}d", (int)h.op); g_ret_n = top; return; }
-        atomic_fetch_add(&g_ops[h.op], 1);
-        if (h.op < OP_COUNT_) g_buf_ops[h.op]++;
+        // 每条 op 两次原子加 × 每帧近九千条 = 纯税：直方图只在 tsv 记账开着时才有读者
+        // Two atomic adds per op x ~9000 ops/frame is a pure tax; the histogram only has a reader with the tsv on.
+        if (g_ops_counting) {
+            atomic_fetch_add(&g_ops[h.op], 1);
+            if (h.op < OP_COUNT_) g_buf_ops[h.op]++;
+        }
         switch (h.op) {
         case OP_END:
             if (g_ret_n > top) { p = g_ret[--g_ret_n]; continue; }
@@ -7271,6 +7292,9 @@ static int vk_ensure(void)
       GVL("[vk] DM_VK_RB = %{public}d", g_rb_on); }
     { const char *s = getenv("DM_POOLWATCH"); g_poolwatch = s ? (int)strtol(s, NULL, 0) : 1;   // 打包贴图按池内容比对判脏（默认开；=0 退回只等缺页）
       GVL("[vk] DM_POOLWATCH = %{public}d", g_poolwatch); }
+    { const char *s = getenv("DM_NVN_TSV_CALLS");
+      if (s && *s && strcmp(s, "0") != 0) { g_ops_counting = 1; GVL("[vk] op 直方图开（DM_NVN_TSV_CALLS）"); } }
+    { const char *s = getenv("DM_DDPROF"); g_ddp_on = s && *s && strcmp(s, "0") != 0 ? 1 : 0; }
     g_on = vk_boot();
     if (g_on) { vk_read_limits(); probe_bc(); }   // 常量段区间上限要在建描述符前拿到 | the uniform-range caps must be measured before any descriptor is written
     GVL("[vk] NVN→Vulkan 重放层 g_on=%{public}d 链 %{public}s 表面 %{public}u x %{public}u", g_on, DMSH_CHAIN, (unsigned)w, (unsigned)h);
