@@ -70,8 +70,9 @@ Four further open accounts: the **root cause** of the lost wakeup is not fixed (
 
 1. **[docs/UNPACKING.md](docs/UNPACKING.md)** — from **a game copy you own** and **keys exported from your own console**, extract the three modules and the romfs, run the instruction-level patches, build the two romfs layers. These products are not in this repository.
 2. **[docs/BUILD-OHOS.md](docs/BUILD-OHOS.md)** — cross-compile `libdmhost.so`, drop it into the HAP project, sign, install.
-3. **[docs/DM-SWITCHES.md](docs/DM-SWITCHES.md)** — the launch switches; every diagnostic knob is documented here so you do not have to read the code.
-4. **[docs/CONTENTS.md](docs/CONTENTS.md)** — exactly what is in this repository, what is not, and why each remaining item has to be there.
+3. **[docs/RUN-TO-WORLD.md](docs/RUN-TO-WORLD.md)** — the verified path from an installed HAP to a live world: the launch parameters that are **required** (without `DM_RT_ASTC` the ground renders all black; launching from the home-screen icon turns every switch off), the two-step install for the 2.2 GB HAP, and the `@draws` scene fingerprints used to drive the menus.
+4. **[docs/DM-SWITCHES.md](docs/DM-SWITCHES.md)** — the launch switches; every diagnostic knob is documented here so you do not have to read the code.
+5. **[docs/CONTENTS.md](docs/CONTENTS.md)** — exactly what is in this repository, what is not, and why each remaining item has to be there.
 
 ## Disclaimer and licence
 
